@@ -1,0 +1,4 @@
+tools/navmeshes/
+tools/navmeshes_full/
+__pycache__/
+*.pyc
