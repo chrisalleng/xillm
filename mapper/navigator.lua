@@ -59,6 +59,8 @@ local s = {
     waypoint_skips  = 0,
     nav_check_x     = 0.0,
     nav_check_y     = 0.0,
+    extra_x         = nil,   -- optional raw target after last waypoint (e.g. zone line)
+    extra_y         = nil,
 
     -- Explore: fixed probe target (X and Y are horizontal axes)
     heading        = 0.0,
@@ -209,6 +211,8 @@ function navigator.stop()
     s.mode           = MODE_IDLE
     s.path           = nil
     s.waypoint_idx   = 1
+    s.extra_x        = nil
+    s.extra_y        = nil
     s.probe_x        = nil
     s.probe_y        = nil
     s.probe_count    = 0
@@ -222,16 +226,21 @@ function navigator.stop()
     stop_autofollow()
 end
 
-function navigator.start_navigate(path, graph_ref, on_done)
+-- extra_x, extra_y: optional raw target to drive toward after the last graph
+-- waypoint (e.g. a zone line trigger position). If set, on_done fires only when
+-- within WAYPOINT_RADIUS of the extra target, not at the last graph node.
+function navigator.start_navigate(path, graph_ref, on_done, extra_x, extra_y)
     navigator.stop()
-    if path == nil or #path == 0 then
+    if (path == nil or #path == 0) and extra_x == nil then
         if on_done then on_done('empty_path') end
         return
     end
     s.mode           = MODE_NAVIGATE
-    s.path           = path
+    s.path           = path or {}
     s.waypoint_idx   = 1
     s.waypoint_skips = 0
+    s.extra_x        = extra_x
+    s.extra_y        = extra_y
     s.graph_ref      = graph_ref
     s.on_done        = on_done
     s.stuck_frames   = 0
@@ -276,6 +285,39 @@ function navigator.tick(px, py, pz, frame_counter)
             return
         end
 
+        -- Extra-target phase: all graph waypoints have been visited; drive
+        -- directly to the raw target (e.g. the zone line trigger position).
+        -- This check MUST come before the g.nodes lookup below, because
+        -- waypoint_idx > #path means path[waypoint_idx] is nil, which would
+        -- cause the nil-node check to fire 'reached' prematurely every frame.
+        if s.waypoint_idx > #s.path then
+            if s.extra_x == nil then
+                navigator.stop()
+                if s.on_done then s.on_done('reached') end
+                return
+            end
+            -- Stuck detection still applies so we abort if the trigger is
+            -- genuinely unreachable (bad coordinates, terrain block, etc.).
+            if frame_counter % STUCK_CHECK_INTERVAL == 0 then
+                local moved = dist2d(px, py, s.nav_check_x, s.nav_check_y)
+                s.nav_check_x = px
+                s.nav_check_y = py
+                if moved >= MIN_POS_PROGRESS then
+                    s.stuck_frames = 0
+                else
+                    s.stuck_frames = s.stuck_frames + STUCK_CHECK_INTERVAL
+                end
+            end
+            if s.stuck_frames >= STUCK_FRAMES_NAV then
+                navigator.stop()
+                if s.on_done then s.on_done('stuck') end
+                return
+            end
+            drive_toward(px, py, s.extra_x, s.extra_y)
+            return
+        end
+
+        -- Normal graph-following phase.
         local target = g.nodes[s.path[s.waypoint_idx]]
         if target == nil then
             navigator.stop()
@@ -308,8 +350,13 @@ function navigator.tick(px, py, pz, frame_counter)
             s.waypoint_idx = s.waypoint_idx + 1
             s.stuck_frames = 0
             if s.waypoint_idx > #s.path then
-                navigator.stop()
-                if s.on_done then s.on_done('reached') end
+                if s.extra_x ~= nil then
+                    -- Transition to extra-target phase this frame.
+                    drive_toward(px, py, s.extra_x, s.extra_y)
+                else
+                    navigator.stop()
+                    if s.on_done then s.on_done('reached') end
+                end
                 return
             end
             target = g.nodes[s.path[s.waypoint_idx]]
@@ -323,11 +370,17 @@ function navigator.tick(px, py, pz, frame_counter)
             s.nav_check_x    = px
             s.nav_check_y    = py
             if s.waypoint_idx > #s.path then
-                navigator.stop()
-                if s.on_done then s.on_done('reached') end
+                if s.extra_x ~= nil then
+                    -- Transition to extra-target phase: drive toward trigger this frame.
+                    drive_toward(px, py, s.extra_x, s.extra_y)
+                else
+                    navigator.stop()
+                    if s.on_done then s.on_done('reached') end
+                end
                 return
+            else
+                target = g.nodes[s.path[s.waypoint_idx]]
             end
-            target = g.nodes[s.path[s.waypoint_idx]]
         end
 
         drive_toward(px, py, target.x, target.y)
