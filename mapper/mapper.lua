@@ -1,489 +1,426 @@
 --[[
 * mapper - mapper.lua
 *
-* Ashita v4 addon that autonomously explores a zone, builds a navigable node
-* graph, records NPCs and interactive objects, and can navigate the player to
-* arbitrary world coordinates using A* over the recorded graph.
+* Ashita v4 addon: thin movement client for Python navigation server.
 *
 * Commands:
-*   /mapper explore                   -- Start autonomous exploration of current zone
-*   /mapper stop                      -- Stop exploration or navigation
-*   /mapper goto <x> <z>             -- Navigate to world coordinates in current zone
-*   /mapper goto |Zone Name| [x z]   -- Navigate to another zone (cross-zone A*)
-*   /mapper save                      -- Manually save zone data to disk
-*   /mapper status                    -- Print current stats
-*   /mapper pos                       -- Print current position coordinates
-*
-* Data is persisted per zone in:
-*   <AshitaPath>/config/addons/mapper/zone_<id>.json
+*   /mapper goto <x> <y>   — request path to coordinates
+*   /mapper stop            — stop movement
+*   /mapper pos             — print current position
+*   /mapper status          — show state
 --]]
 
 addon.name    = 'mapper'
 addon.author  = 'xillm'
-addon.version = '0.38'
-addon.desc    = 'Autonomous zone mapper and navigator for FFXI'
+addon.version = '6.1'
+addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
 require('common')
-local json             = require('json')
-local graph            = require('graph')
-local entities         = require('entities')
-local navigator        = require('navigator')
-local zone_transitions = require('zone_transitions')
+
+local json  = require('json')
+local d3d8  = require('d3d8')
+local imgui = require('imgui')
 
 -------------------------------------------------------------------------------
--- Module state
+-- Config
+-------------------------------------------------------------------------------
+local WAYPOINT_RADIUS    = 1.0
+local STUCK_CHECK_FRAMES = 120
+local STUCK_MIN_PROGRESS = 0.5
+local STATUS_INTERVAL    = 30
+
+local BACKTRACK_FRAMES   = 25
+local SIDESTEP_FRAMES    = 40
+local RESUME_FRAMES      = 25
+
+-------------------------------------------------------------------------------
+-- State
 -------------------------------------------------------------------------------
 local state = {
-    zone_id   = nil,
-    data_path = nil,
-    frame     = 0,
-
-    -- Cross-zone navigation state (/mapper goto |Zone Name| x z)
-    cross_zone = {
-        active     = false,
-        route      = nil,   -- array of {from_zone,fx,fy,to_zone,tx,ty} from zone_astar
-        step       = 1,     -- index into route (1 = walking to route[1]'s zone line)
-        final_zone = nil,   -- destination zone ID
-        final_x    = nil,   -- destination coords in final zone (may be nil)
-        final_y    = nil,
-    },
+    frame       = 0,
+    zone_id     = nil,
+    data_path   = '',
+    -- Movement
+    waypoints   = nil,
+    wp_idx      = 1,
+    moving      = false,
+    goal        = nil,
+    -- Stuck detection
+    check_x     = 0,
+    check_y     = 0,
+    check_frame = 0,
+    stuck_count = 0,
+    -- Avoidance maneuver
+    avoidance   = nil,
+    -- Request/response handshake
+    pending_seq = nil,   -- sequence number of request awaiting response
+    last_seq    = 0,     -- monotonic counter
 }
 
 -------------------------------------------------------------------------------
 -- Helpers
 -------------------------------------------------------------------------------
 
-local function print_msg(msg)
-    AshitaCore:GetChatManager():QueueCommand(1, '/echo [mapper] ' .. tostring(msg))
-end
-
--------------------------------------------------------------------------------
--- Zone navmesh cache (for cross-zone route planning)
--- Stores loaded navmesh data for zones other than the current one so zone_astar
--- can use real path costs instead of Euclidean distances.
--- Values: {nodes={[id]={x,y}}, adj={[id]={{to,cost},...}}} or false (no data).
--------------------------------------------------------------------------------
-local _zone_navmesh_cache = {}
--- Coroutine for async cross-zone route planning (nil when idle).
-local _planning_coroutine = nil
--- Zone ID captured when planning started; used to detect stale results.
-local _planning_zone_id   = nil
-
-local function _load_navmesh(zone_id)
-    if _zone_navmesh_cache[zone_id] ~= nil then
-        return _zone_navmesh_cache[zone_id]
-    end
-    if state.data_path == nil or state.data_path == '' then
-        _zone_navmesh_cache[zone_id] = false
-        return false
-    end
-    local path = string.format('%sconfig/addons/mapper/zone_%d.json', state.data_path, zone_id)
-    local f = io.open(path, 'r')
-    if not f then _zone_navmesh_cache[zone_id] = false; return false end
-    local content = f:read('*all'); f:close()
-    local ok, data = pcall(json.decode, content)
-    if not ok or not data or not data.nodes then
-        _zone_navmesh_cache[zone_id] = false; return false
-    end
-    local nodes = {}
-    for _, n in ipairs(data.nodes) do nodes[n.id] = { x = n.x, y = n.y } end
-    local adj = {}
-    for _, n in ipairs(data.nodes) do adj[n.id] = {} end
-    if data.edges then
-        for _, e in ipairs(data.edges) do
-            local na, nb = nodes[e.a], nodes[e.b]
-            if na and nb then
-                local dx, dy = na.x - nb.x, na.y - nb.y
-                local c = math.sqrt(dx*dx + dy*dy)
-                table.insert(adj[e.a], { to = e.b, cost = c })
-                table.insert(adj[e.b], { to = e.a, cost = c })
-            end
-        end
-    end
-    local nm = { nodes = nodes, adj = adj }
-    _zone_navmesh_cache[zone_id] = nm
-    -- Yield after the expensive file-load so the renderer stays responsive.
-    if coroutine.running() then
-        print_msg(string.format('  navmesh zone %d (%d nodes)', zone_id, #data.nodes))
-        coroutine.yield()
-    end
-    return nm
-end
-
--- Dijkstra on a loaded navmesh; returns path cost or nil (unreachable).
--- Runs synchronously — the coroutine only yields between file loads, not
--- during individual Dijkstra iterations.
-local function _navmesh_path_cost(nm, from_x, from_y, to_x, to_y)
-    local sid, gid, bsd, bgd = nil, nil, math.huge, math.huge
-    for id, n in pairs(nm.nodes) do
-        local ds = (n.x-from_x)^2 + (n.y-from_y)^2
-        local dg = (n.x-to_x)^2   + (n.y-to_y)^2
-        if ds < bsd then bsd = ds; sid = id end
-        if dg < bgd then bgd = dg; gid = id end
-    end
-    if sid == nil or gid == nil then return nil end
-    if sid == gid then return 0 end
-    local dist, vis, open = {[sid]=0}, {}, {{id=sid, cost=0}}
-    while #open > 0 do
-        table.sort(open, function(a,b) return a.cost < b.cost end)
-        local cur = table.remove(open, 1)
-        if vis[cur.id] then goto nm_cont end
-        vis[cur.id] = true
-        if cur.id == gid then return cur.cost end
-        for _, e in ipairs(nm.adj[cur.id] or {}) do
-            local nc = cur.cost + e.cost
-            if not vis[e.to] and (dist[e.to] == nil or nc < dist[e.to]) then
-                dist[e.to] = nc
-                local found = false
-                for _, oe in ipairs(open) do
-                    if oe.id == e.to then oe.cost = nc; found = true; break end
-                end
-                if not found then table.insert(open, {id=e.to, cost=nc}) end
-            end
-        end
-        ::nm_cont::
-    end
-    return nil
-end
-
--- Returns a step_cost_fn for zone_transitions.zone_astar.
--- For the current in-memory zone: uses graph.astar (most accurate).
--- For other zones: loads saved navmesh from disk.
--- Returns nil for a step when the navmesh proves it is unreachable.
--- Falls back to Euclidean when no navmesh data is available.
-local function make_step_cost_fn()
-    return function(zone_id, from_x, from_y, exit)
-        if zone_id == state.zone_id and graph.node_count() > 0 then
-            local s = graph.nearest_node(from_x, from_y)
-            local g = graph.nearest_node(exit.fx, exit.fy)
-            if s ~= nil and g ~= nil then
-                local path = graph.astar(s, g)
-                if path == nil then return nil end
-                local cost = 0
-                for i = 2, #path do
-                    local na, nb = graph.nodes[path[i-1]], graph.nodes[path[i]]
-                    local dx, dy = na.x - nb.x, na.y - nb.y
-                    cost = cost + math.sqrt(dx*dx + dy*dy)
-                end
-                return cost
-            end
-        else
-            local nm = _load_navmesh(zone_id)
-            if nm then return _navmesh_path_cost(nm, from_x, from_y, exit.fx, exit.fy) end
-        end
-        -- No navmesh available: Euclidean fallback (cannot detect walls)
-        local dx, dy = exit.fx - from_x, exit.fy - from_y
-        return math.sqrt(dx*dx + dy*dy)
-    end
-end
-
--------------------------------------------------------------------------------
--- Helpers (continued)
--------------------------------------------------------------------------------
-
-local function get_install_path()
-    -- Try the documented v4 method first; fall back if needed.
+local function get_data_path()
     local ok, path = pcall(function()
         return AshitaCore:GetInstallPath()
     end)
-    if ok and path then return path end
-    -- Fallback: ask Ashita for the addon path and strip two levels
+    if ok and path then
+        if path:sub(-1) ~= '/' and path:sub(-1) ~= '\\' then
+            path = path .. '/'
+        end
+        return path .. 'config/addons/mapper/'
+    end
     return ''
 end
 
-local function zone_file_path(zone_id)
-    return string.format('%sconfig/addons/mapper/zone_%d.json', state.data_path, zone_id)
+local function msg(text)
+    print('\30\06[mapper]\30\01 ' .. text)
 end
 
-local function ensure_data_dir()
-    local dir = string.format('%sconfig/addons/mapper/', state.data_path)
-    -- Ashita v4 provides ashita.fs; use it if available, otherwise rely on
-    -- io.open creating the file (parent directory must exist beforehand).
-    local ok = pcall(function()
-        if ashita and ashita.fs and ashita.fs.create_directory then
-            ashita.fs.create_directory(dir)
-        end
-    end)
+local function ipc_path(filename)
+    return state.data_path .. filename
 end
 
--------------------------------------------------------------------------------
--- Persistence
--------------------------------------------------------------------------------
-
-local function save_zone(zone_id, force)
-    if zone_id == nil or zone_id == 0 then return end
-    -- Skip automatic saves when the graph is unchanged (e.g. pure navmesh navigation
-    -- with no exploration).  Explicit /mapper save passes force=true.
-    if not force and not graph.dirty then return end
-    -- Invalidate planning cache so the next route query uses fresh data.
-    _zone_navmesh_cache[zone_id] = nil
-    ensure_data_dir()
-    local data = {
-        zone_id  = zone_id,
-        nodes    = graph.serialize_nodes(),
-        edges    = graph.serialize_edges(),
-        entities = entities.serialize(zone_id),
-    }
-    local path = zone_file_path(zone_id)
-    local f = io.open(path, 'w')
-    if f then
-        f:write(json.encode(data))
-        f:close()
-    else
-        print_msg('Warning: could not write ' .. path)
+local function drive_toward(px, py, tx, ty)
+    local follow = AshitaCore:GetMemoryManager():GetAutoFollow()
+    if follow == nil then return end
+    local dx = tx - px
+    local dy = ty - py
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len > 0.01 then
+        dx = dx / len
+        dy = dy / len
     end
+    follow:SetFollowDeltaX(dx)
+    follow:SetFollowDeltaY(dy)
+    follow:SetFollowDeltaZ(0)
+    follow:SetIsAutoRunning(1)
 end
 
-local function load_zone(zone_id)
-    if zone_id == nil or zone_id == 0 then return end
-    local path = zone_file_path(zone_id)
+local function stop_autofollow()
+    local follow = AshitaCore:GetMemoryManager():GetAutoFollow()
+    if follow then follow:SetIsAutoRunning(0) end
+end
+
+local function stop_movement()
+    stop_autofollow()
+    state.moving = false
+    state.waypoints = nil
+    state.wp_idx = 1
+end
+
+local function cancel_all()
+    stop_movement()
+    state.goal = nil
+    state.pending_seq = nil
+    state.stuck_count = 0
+    state.avoidance = nil
+end
+
+local function dist2d(ax, ay, bx, by)
+    local dx = ax - bx
+    local dy = ay - by
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+-------------------------------------------------------------------------------
+-- File I/O
+-------------------------------------------------------------------------------
+
+local function read_json(path)
     local f = io.open(path, 'r')
-    if f then
-        local content = f:read('*all')
-        f:close()
-        local ok, data = pcall(json.decode, content)
-        if ok and data then
-            graph.load(data)
-            entities.load(data, zone_id)
-            print_msg(string.format('Loaded zone %d: %d nodes, %d entities',
-                zone_id, graph.node_count(), entities.count(zone_id)))
-        else
-            print_msg('Warning: could not parse zone file for zone ' .. zone_id)
-        end
-    end
+    if not f then return nil end
+    local text = f:read('*a')
+    f:close()
+    if not text or text == '' then return nil end
+    local ok, data = pcall(json.decode, text)
+    if not ok then return nil end
+    return data
 end
 
--------------------------------------------------------------------------------
--- Zone lifecycle
--------------------------------------------------------------------------------
-
-local function zone_init(zone_id)
-    if zone_id == nil or zone_id == 0 then return end
-    state.zone_id = zone_id
-    graph.reset()
-    entities.reset(zone_id)
-    load_zone(zone_id)
-end
-
--------------------------------------------------------------------------------
--- Cross-zone navigation helpers
--------------------------------------------------------------------------------
-
--- When the planned zone exit is unreachable from the player's current navmesh
--- position, scan all exits from the current zone for one that IS reachable and
--- still connects to the final destination.  Rebuilds cross_zone route and
--- starts navigation if a viable exit is found.  Returns true on success.
-local function try_reroute(start_id, px, py)
-    local czs       = state.cross_zone
-    local final     = czs.final_zone
-    local exits     = zone_transitions.get_exits(state.zone_id)
-    local best_path = nil
-    local best_exit = nil
-    local best_route= nil
-    local best_hops = math.huge
-    local best_nav  = math.huge
-
-    for _, exit in ipairs(exits) do
-        local exit_node = graph.nearest_node(exit.fx, exit.fy)
-        if exit_node ~= nil then
-            local nav_path = graph.astar(start_id, exit_node)
-            if nav_path ~= nil then
-                -- Can reach this exit.  Plan rest of journey from its landing spot.
-                local zone_route = zone_transitions.zone_astar(
-                    exit.to_zone, final, exit.tx, exit.ty, make_step_cost_fn())
-                if zone_route ~= nil then
-                    local total_hops = 1 + #zone_route
-                    if total_hops < best_hops or
-                       (total_hops == best_hops and #nav_path < best_nav) then
-                        best_hops = total_hops
-                        best_nav  = #nav_path
-                        best_path = nav_path
-                        best_exit = exit
-                        best_route = zone_route
-                    end
-                end
-            end
-        end
-    end
-
-    if best_path == nil then return false end
-
-    -- Rebuild the route: the newly chosen first hop + rest from zone_astar.
-    local new_route = { {
-        from_zone = state.zone_id,
-        fx = best_exit.fx, fy = best_exit.fy,
-        to_zone = best_exit.to_zone,
-        tx = best_exit.tx, ty = best_exit.ty,
-    } }
-    for _, t in ipairs(best_route) do
-        table.insert(new_route, t)
-    end
-    czs.route = new_route
-    czs.step  = 1
-
-    local via_name  = zone_transitions.ZONE_NAMES[best_exit.to_zone] or tostring(best_exit.to_zone)
-    local dest_name = zone_transitions.ZONE_NAMES[final] or tostring(final)
-    print_msg(string.format('Rerouting via %s -> %s (%d zone%s, %d waypoints)',
-        via_name, dest_name, best_hops, best_hops == 1 and '' or 's', #best_path))
-
-    navigator.start_navigate(best_path, graph, function(reason)
-        if reason == 'stuck' then
-            print_msg('Cross-zone navigation stuck at zone line.')
-            czs.active = false
-        end
-    end, best_exit.fx, best_exit.fy)
+local function write_json(path, data)
+    local f = io.open(path, 'w')
+    if not f then return false end
+    f:write(json.encode(data))
+    f:close()
     return true
 end
 
--- Navigate to a zone line exit within the current zone.
--- transition = { from_zone, fx, fy, to_zone, tx, ty }
-local function navigate_to_zoneline(transition, step_label)
-    if graph.node_count() == 0 then
-        print_msg('No map data for ' .. (zone_transitions.ZONE_NAMES[state.zone_id] or tostring(state.zone_id)) ..
-            '. Run /mapper explore first.')
-        state.cross_zone.active = false
-        return
+-------------------------------------------------------------------------------
+-- Navigation requests
+-------------------------------------------------------------------------------
+
+local function request_path(px, py, pz, tx, ty, obstacle)
+    state.last_seq = state.last_seq + 1
+    local seq = state.last_seq
+    local data = {
+        action  = 'goto',
+        zone_id = state.zone_id,
+        player  = { px, py, pz },
+        target  = { tx, ty, pz },
+        seq     = seq,
+    }
+    if obstacle then
+        data.new_obstacle = obstacle
     end
-    local player = GetPlayerEntity()
-    if player == nil or player.ActorPointer == 0 then
-        print_msg('Player entity not available.')
-        state.cross_zone.active = false
-        return
-    end
-    local px = player.Movement.LocalPosition.X
-    local py = player.Movement.LocalPosition.Y
-    local start_id = graph.nearest_node(px, py)
-    local line_id  = graph.nearest_node(transition.fx, transition.fy)
-    local path = (start_id ~= nil and line_id ~= nil) and graph.astar(start_id, line_id) or nil
-    if path == nil then
-        -- Planned exit unreachable from the current position; try any other
-        -- reachable exit and replan the remainder of the route from there.
-        if start_id ~= nil and try_reroute(start_id, px, py) then return end
-        -- Last resort: navmesh is sparse near the zone entry (common immediately
-        -- after zoning in).  Drive directly toward the trigger with no graph
-        -- guidance; stuck detection will abort if the path is truly blocked.
-        local to_name = zone_transitions.ZONE_NAMES[transition.to_zone] or tostring(transition.to_zone)
-        print_msg(string.format('%s: no graph path to zone line -> %s; approaching directly.',
-            step_label, to_name))
-        navigator.start_navigate({}, graph, function(reason)
-            if reason == 'stuck' then
-                print_msg('Cross-zone navigation stuck (direct zone line approach).')
-                state.cross_zone.active = false
-            end
-        end, transition.fx, transition.fy)
-        return
-    end
-    local to_name = zone_transitions.ZONE_NAMES[transition.to_zone] or tostring(transition.to_zone)
-    print_msg(string.format('%s: navigating to zone line -> %s (%d waypoints)',
-        step_label, to_name, #path))
-    -- extra_x/y = exact zone line position, so we keep walking after the last
-    -- graph node until the game zones us or we reach the trigger.
-    navigator.start_navigate(path, graph, function(reason)
-        if reason == 'stuck' then
-            print_msg('Cross-zone navigation stuck at zone line.')
-            state.cross_zone.active = false
-        end
-    end, transition.fx, transition.fy)
+    write_json(ipc_path('nav_request.json'), data)
+    state.pending_seq = seq
+    state.goal = { x = tx, y = ty }
+    msg(string.format('Requesting path to (%.0f, %.0f)... [#%d]', tx, ty, seq))
 end
 
--- Called by the zone change handler after zone_init has loaded the new zone.
-local function cross_zone_resume(new_zone_id)
-    local czs = state.cross_zone
-    if not czs.active then return end
+local function check_path_response()
+    if state.pending_seq == nil then return end
 
-    -- Find where we are in the route.  The player may have skipped a step (e.g.
-    -- walked through a different zone line than the one we aimed at) so scan
-    -- forward from the current step to find the first matching to_zone.
-    local matched_step = nil
-    for i = czs.step, #czs.route do
-        if czs.route[i].to_zone == new_zone_id then
-            matched_step = i
-            break
-        end
-    end
+    local data = read_json(ipc_path('nav_path.json'))
+    if not data then return end
 
-    if matched_step == nil then
-        -- Not on the route at all — abort cleanly.
-        czs.active = false
-        print_msg('Cross-zone navigation cancelled (unexpected zone change).')
-        return
-    end
+    -- Only accept responses matching our pending request
+    if data.seq ~= state.pending_seq then return end
 
-    czs.step = matched_step + 1
+    -- Response received — clear pending
+    state.pending_seq = nil
 
-    if czs.step > #czs.route then
-        -- Arrived in the final zone.
-        czs.active = false
-        local zone_name = zone_transitions.ZONE_NAMES[new_zone_id] or tostring(new_zone_id)
-        if czs.final_x ~= nil then
-            -- Navigate to the requested coordinates within this zone.
-            if graph.node_count() == 0 then
-                print_msg('Arrived in ' .. zone_name .. ' (no map data for final navigation).')
-                return
-            end
-            local player = GetPlayerEntity()
-            if player == nil or player.ActorPointer == 0 then
-                print_msg('Arrived in ' .. zone_name .. ' (player entity unavailable).')
-                return
-            end
-            local px = player.Movement.LocalPosition.X
-            local py = player.Movement.LocalPosition.Y
-            local start_id = graph.nearest_node(px, py)
-            local goal_id  = graph.nearest_node(czs.final_x, czs.final_y)
-            if start_id == nil or goal_id == nil then
-                print_msg('Arrived in ' .. zone_name .. ' (no graph nodes for final leg).')
-                return
-            end
-            local path = graph.astar(start_id, goal_id)
-            if path == nil then
-                print_msg('Arrived in ' .. zone_name .. ' (no path to final coords).')
-                return
-            end
-            print_msg(string.format('Arrived in %s, navigating to (%.1f, %.1f).',
-                zone_name, czs.final_x, czs.final_y))
-            navigator.start_navigate(path, graph, function(reason)
-                if reason == 'reached' then
-                    print_msg(string.format('Reached destination (%.1f, %.1f).', czs.final_x, czs.final_y))
-                elseif reason == 'stuck' then
-                    print_msg('Final leg stuck.')
-                end
-            end)
+    if (data.status == 'ok' or data.status == 'partial') and data.waypoints and #data.waypoints > 0 then
+        state.waypoints = data.waypoints
+        state.wp_idx = 1
+        state.moving = true
+        state.stuck_count = 0
+        state.check_frame = state.frame
+        if data.status == 'partial' then
+            msg(string.format('Partial path: %d waypoints (ends %.0f yalms from target).',
+                #data.waypoints, data.end_dist or 0))
         else
-            print_msg('Arrived in ' .. zone_name .. '.')
+            msg(string.format('Path received: %d waypoints.', #data.waypoints))
         end
+    elseif data.status == 'no_path' then
+        msg('No path found — destination may be unreachable.')
+        cancel_all()
+    elseif data.status == 'error' then
+        msg('Server error: ' .. (data.message or 'unknown'))
+        cancel_all()
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Obstacle avoidance
+-------------------------------------------------------------------------------
+
+local function start_avoidance(px, py)
+    local wp = state.waypoints and state.waypoints[state.wp_idx]
+    if not wp then return false end
+
+    local dx = wp[1] - px
+    local dy = wp[2] - py
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len < 0.01 then return false end
+    dx, dy = dx / len, dy / len
+
+    local side = (state.stuck_count % 2 == 0) and 1 or -1
+    state.avoidance = {
+        phase = 'backtrack',
+        frame_start = state.frame,
+        fwd_x = dx,
+        fwd_y = dy,
+        perp_x = -dy * side,
+        perp_y = dx * side,
+    }
+    msg(string.format('Obstacle detected — maneuvering (attempt %d)...', state.stuck_count))
+    return true
+end
+
+local function avoidance_tick(px, py)
+    local av = state.avoidance
+    if not av then return end
+
+    local elapsed = state.frame - av.frame_start
+
+    if av.phase == 'backtrack' then
+        if elapsed < BACKTRACK_FRAMES then
+            drive_toward(px, py, px - av.fwd_x * 5, py - av.fwd_y * 5)
+        else
+            av.phase = 'sidestep'
+            av.frame_start = state.frame
+        end
+    elseif av.phase == 'sidestep' then
+        if elapsed < SIDESTEP_FRAMES then
+            drive_toward(px, py, px + av.perp_x * 5, py + av.perp_y * 5)
+        else
+            av.phase = 'resume'
+            av.frame_start = state.frame
+        end
+    elseif av.phase == 'resume' then
+        if elapsed < RESUME_FRAMES then
+            drive_toward(px, py, px + av.fwd_x * 5, py + av.fwd_y * 5)
+        else
+            state.avoidance = nil
+            state.check_frame = state.frame
+            state.check_x = px
+            state.check_y = py
+            state.check_wp_idx = state.wp_idx
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Movement tick
+-------------------------------------------------------------------------------
+
+local function movement_tick(px, py, pz)
+    if not state.moving or not state.waypoints then return end
+
+    if state.avoidance then
+        avoidance_tick(px, py)
         return
     end
 
-    -- More legs to go: navigate to the next zone line.
-    local transition = czs.route[czs.step]
-    local step_label = string.format('Step %d/%d', czs.step, #czs.route)
-    navigate_to_zoneline(transition, step_label)
-end
-
--------------------------------------------------------------------------------
--- Explorer callbacks
--------------------------------------------------------------------------------
-
-local function on_node(x, y, z)
-    graph.try_add_node(x, y, z)
-end
-
-local function on_debug(msg)
-    print_msg('[dbg] ' .. msg)
-end
-
-local function on_explore_done(reason)
-    if reason == 'complete' then
-        print_msg('Exploration complete.')
-    elseif reason == 'stuck' then
-        print_msg('Exploration stopped: stuck.')
-    elseif reason == 'backtrack_failed' then
-        print_msg('Exploration stopped: could not backtrack.')
-    else
-        print_msg('Exploration stopped: ' .. tostring(reason))
+    local wp = state.waypoints[state.wp_idx]
+    if not wp then
+        stop_movement()
+        msg('Reached destination.')
+        state.goal = nil
+        return
     end
-    save_zone(state.zone_id)
+
+    local wx, wy = wp[1], wp[2]
+    local d = dist2d(px, py, wx, wy)
+
+    if d < WAYPOINT_RADIUS then
+        state.wp_idx = state.wp_idx + 1
+        state.check_x = px
+        state.check_y = py
+        state.check_frame = state.frame
+
+        if state.wp_idx > #state.waypoints then
+            stop_movement()
+            msg('Reached destination.')
+            state.goal = nil
+            return
+        end
+        wp = state.waypoints[state.wp_idx]
+        wx, wy = wp[1], wp[2]
+    end
+
+    drive_toward(px, py, wx, wy)
+
+    -- Stuck detection: no waypoint advancement for STUCK_CHECK_FRAMES
+    if state.frame - state.check_frame >= STUCK_CHECK_FRAMES then
+        local wp_progress = state.wp_idx - (state.check_wp_idx or state.wp_idx)
+        local pos_progress = dist2d(px, py, state.check_x, state.check_y)
+        state.check_x = px
+        state.check_y = py
+        state.check_wp_idx = state.wp_idx
+        state.check_frame = state.frame
+
+        if wp_progress < 3 and pos_progress < 3.0 then
+            state.stuck_count = state.stuck_count + 1
+
+            if state.stuck_count >= 6 then
+                msg('Cannot reach destination after multiple retries.')
+                cancel_all()
+                return
+            end
+
+            if state.stuck_count % 2 == 1 then
+                msg(string.format('Stuck (attempt %d) at wp %d/%d — trying avoidance.',
+                    state.stuck_count, state.wp_idx, #state.waypoints))
+                start_avoidance(px, py)
+            else
+                msg(string.format('Stuck (attempt %d) at wp %d/%d — reporting obstacle, repathing.',
+                    state.stuck_count, state.wp_idx, #state.waypoints))
+                local obstacle = { px, py, pz }
+                local goal = state.goal
+                stop_movement()
+                if goal then
+                    request_path(px, py, pz, goal.x, goal.y, obstacle)
+                end
+            end
+        else
+            state.stuck_count = 0
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Path overlay
+-------------------------------------------------------------------------------
+
+local draw_ok = true
+local draw_err_msg = nil
+
+local function draw_path()
+    if not draw_ok then return end
+
+    local ok, err = pcall(function()
+        local fg = imgui.GetForegroundDrawList()
+        if not fg then error('no draw list') end
+
+        if not state.moving or not state.waypoints then return end
+
+        local dev = d3d8.get_device()
+        if not dev then error('no device') end
+
+        local r1, view = dev:GetTransform(2)
+        local r2, proj = dev:GetTransform(3)
+        if r1 ~= 0 or r2 ~= 0 or not view or not proj then
+            error(string.format('transform fail v=%d p=%d', r1 or -1, r2 or -1))
+        end
+
+        local r3, vp = dev:GetViewport()
+        if r3 ~= 0 or not vp then error('viewport fail') end
+
+        local black = 0xFF000000
+        local green = 0xFF00FF00
+        local red   = 0xFF0000FF
+
+        local prev_sx, prev_sy = nil, nil
+        local wps = state.waypoints
+        local idx = state.wp_idx
+
+        for i = 1, #wps do
+            local wp = wps[i]
+            local gx, gy, gz = wp[1], wp[2], wp[3]
+            local wx, wy, wz = gx, gz, gy
+
+            local vx = wx*view._11 + wy*view._21 + wz*view._31 + view._41
+            local vy = wx*view._12 + wy*view._22 + wz*view._32 + view._42
+            local vz = wx*view._13 + wy*view._23 + wz*view._33 + view._43
+            local vw = wx*view._14 + wy*view._24 + wz*view._34 + view._44
+
+            local cx = vx*proj._11 + vy*proj._21 + vz*proj._31 + vw*proj._41
+            local cy = vx*proj._12 + vy*proj._22 + vz*proj._32 + vw*proj._42
+            local cw = vx*proj._14 + vy*proj._24 + vz*proj._34 + vw*proj._44
+
+            local sx, sy = nil, nil
+            if cw > 0.001 then
+                sx = (cx/cw * 0.5 + 0.5) * vp.Width + vp.X
+                sy = (-cy/cw * 0.5 + 0.5) * vp.Height + vp.Y
+            end
+
+            if sx and prev_sx then
+                local col = (i <= idx) and green or black
+                fg:AddLine({ prev_sx, prev_sy }, { sx, sy }, col, 2.0)
+            end
+            if sx then
+                if i == idx then
+                    fg:AddCircleFilled({ sx, sy }, 5, red)
+                end
+                prev_sx, prev_sy = sx, sy
+            else
+                prev_sx, prev_sy = nil, nil
+            end
+        end
+    end)
+
+    if not ok then
+        if not draw_err_msg or draw_err_msg ~= tostring(err) then
+            draw_err_msg = tostring(err)
+            msg('Path draw error: ' .. draw_err_msg)
+        end
+        draw_ok = false
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -491,375 +428,130 @@ end
 -------------------------------------------------------------------------------
 
 ashita.events.register('load', 'mapper_load', function()
-    state.data_path = get_install_path()
-    -- Zone ID may not be available immediately on load; zone_init will be
-    -- triggered from d3d_present once a valid zone ID is observed.
-    state.zone_id = nil
-    print_msg('Loaded. Type /mapper for help.')
+    state.data_path = get_data_path()
+    -- Delete stale response file on load so we don't process old paths
+    local f = io.open(ipc_path('nav_path.json'), 'w')
+    if f then f:write('{}') f:close() end
+    msg('Loaded v' .. addon.version .. '. /mapper goto <x> <y>')
 end)
 
 ashita.events.register('unload', 'mapper_unload', function()
-    navigator.stop()
-    save_zone(state.zone_id)
+    cancel_all()
 end)
 
 ashita.events.register('d3d_present', 'mapper_render', function()
     state.frame = state.frame + 1
 
-    local player = GetPlayerEntity()
-    if player == nil or player.ActorPointer == 0 then return end
+    local ok, player = pcall(GetPlayerEntity)
+    if not ok or player == nil then return end
+    local ok2, ptr = pcall(function() return player.ActorPointer end)
+    if not ok2 or ptr == nil or ptr == 0 then return end
 
-    -- X = east/west, Y = north/south (horizontal), Z = elevation
-    local px = player.Movement.LocalPosition.X
-    local py = player.Movement.LocalPosition.Y
-    local pz = player.Movement.LocalPosition.Z
+    local ok3, px, py, pz = pcall(function()
+        return player.Movement.LocalPosition.X,
+               player.Movement.LocalPosition.Y,
+               player.Movement.LocalPosition.Z
+    end)
+    if not ok3 then return end
 
-    -- Zone change detection (check every 5 frames; frequent so autofollow is
-    -- stopped before it carries the character far from the zone entry position)
+    -- Zone change detection
     if state.frame % 5 == 0 then
         local zone_id = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0)
-        if zone_id ~= nil and zone_id ~= 0 then
-            if zone_id ~= state.zone_id then
-                -- Zone changed: save old data, stop any active mode, load new zone
-                if state.zone_id ~= nil then
-                    save_zone(state.zone_id)
-                end
-                navigator.stop()
-                local was_cross_zone = state.cross_zone.active
-                zone_init(zone_id)
-                if was_cross_zone then
-                    cross_zone_resume(zone_id)
-                end
+        if zone_id ~= nil and zone_id ~= 0 and zone_id ~= state.zone_id then
+            if state.moving then
+                cancel_all()
+                msg('Zone changed — stopping.')
             end
+            state.zone_id = zone_id
         end
     end
 
     if state.zone_id == nil or state.zone_id == 0 then return end
 
-    -- Entity scanning (every 30 frames)
-    if state.frame % 30 == 0 then
-        entities.scan(state.zone_id, graph)
+    -- Check for path responses from server
+    if state.frame % 6 == 0 then
+        check_path_response()
     end
 
-    -- Periodic debug output while exploring (every 90 frames, ~1.5 sec)
-    if navigator.mode() == 'explore' and state.frame % 90 == 0 then
-        local probe_x, probe_y = navigator.get_probe()
-        local heading = navigator.get_heading()
-        local stuck   = navigator.get_stuck_frames()
-        local probes  = navigator.get_probe_count()
-        print_msg(string.format(
-            'pos=(%.2f, %.2f) elev=%.2f probe=(%.1f, %.1f) hdg=%.2f stuck=%d/%d probes=%d nodes=%d',
-            px, py, pz,
-            probe_x or -1, probe_y or -1,
-            heading, stuck, 180,
-            probes, graph.node_count()))
+    -- Movement execution
+    if state.moving then
+        movement_tick(px, py, pz)
     end
 
-    -- Resume async route planning one step per frame.
-    if _planning_coroutine then
-        if state.zone_id ~= _planning_zone_id then
-            -- Zone changed while planning was in progress; result is stale.
-            _planning_coroutine = nil
-            print_msg('Route planning cancelled (zone changed).')
-        else
-            local ok, err = coroutine.resume(_planning_coroutine)
-            if not ok then
-                print_msg('Route planning error: ' .. tostring(err))
-                _planning_coroutine = nil
-            elseif coroutine.status(_planning_coroutine) == 'dead' then
-                _planning_coroutine = nil
-            end
-        end
+    -- Write status for monitoring
+    if state.frame % STATUS_INTERVAL == 0 then
+        write_json(ipc_path('nav_status.json'), {
+            zone_id = state.zone_id,
+            x = px, y = py, z = pz,
+            moving = state.moving,
+            wp_idx = state.wp_idx,
+            wp_total = state.waypoints and #state.waypoints or 0,
+            pending = state.pending_seq,
+            stuck = state.stuck_count,
+        })
     end
 
-    -- Navigator/explorer tick (every frame while active)
-    navigator.tick(px, py, pz, state.frame)
+    -- Draw path overlay
+    draw_path()
 end)
 
 ashita.events.register('command', 'mapper_cmd', function(e)
     local args = e.command:args()
-    if #args == 0 or args[1]:lower() ~= '/mapper' then return end
-
+    if #args == 0 or args[1] ~= '/mapper' then return end
     e.blocked = true
 
-    local sub = args[2] and args[2]:lower() or ''
+    local cmd = args[2] and args[2]:lower() or 'help'
 
-    -- /mapper explore
-    if sub == 'explore' then
-        if state.zone_id == nil or state.zone_id == 0 then
-            print_msg('Not in a valid zone.')
+    if cmd == 'goto' then
+        if #args < 4 then
+            msg('Usage: /mapper goto <x> <y>')
             return
         end
-        local player = GetPlayerEntity()
-        if player == nil or player.ActorPointer == 0 then
-            print_msg('Player entity not available.')
-            return
-        end
-        -- Use the player's current facing as initial heading.
-        -- X = east/west, Y = north/south (horizontal), Z = elevation.
-        local heading = player.Movement.Rotation or 0.0
-        local px = player.Movement.LocalPosition.X
-        local py = player.Movement.LocalPosition.Y
-        navigator.start_explore(heading, graph, on_node, on_explore_done, on_debug, px, py)
-        print_msg('Exploration started.')
-
-    -- /mapper stop
-    elseif sub == 'stop' then
-        if navigator.is_active() or state.cross_zone.active or _planning_coroutine then
-            navigator.stop()
-            state.cross_zone.active = false
-            _planning_coroutine = nil
-            print_msg('Stopped.')
-        else
-            print_msg('Nothing active to stop.')
-        end
-
-    -- /mapper goto <x> <z>              (same-zone coordinate navigation)
-    -- /mapper goto |Zone Name| [x z]   (cross-zone navigation; coords optional)
-    elseif sub == 'goto' then
-        if state.zone_id == nil or state.zone_id == 0 then
-            print_msg('Not in a valid zone.')
-            return
-        end
-        -- Always stop whatever is currently running before starting a new goto.
-        navigator.stop()
-        state.cross_zone.active = false
-        _planning_coroutine = nil
-
-        -- Detect whether the argument is a zone name or bare coordinates.
-        -- Three forms accepted:
-        --   1. Raw autotranslate bytes: args[3] starts with \xFD
-        --   2. Pipe-wrapped display text: /mapper goto |Zone Name| [x z]
-        --   3. Plain text zone name (no spaces): /mapper goto PortBastok [x z]
-        local raw_cmd = e.command
-        local zone_arg, rest_args
-
-        if args[3] ~= nil and args[3]:byte(1) == 0xFD then
-            -- Raw autotranslate sequence from in-game autotranslate UI
-            zone_arg  = args[3]
-            rest_args = table.concat(args, ' ', 4)
-        else
-            -- Pipe-wrapped: |Zone Name| may contain spaces, so match raw cmd
-            zone_arg, rest_args = raw_cmd:match('/mapper%s+goto%s+|([^|]+)|%s*(.*)')
-            if zone_arg == nil then
-                -- Plain single-word zone name (only if not a number)
-                if args[3] ~= nil and tonumber(args[3]) == nil then
-                    zone_arg  = args[3]
-                    rest_args = table.concat(args, ' ', 4)
-                end
-            end
-        end
-
-        if zone_arg ~= nil then
-            -- ---- Cross-zone goto ----
-            local target_zone = zone_transitions.resolve_zone(zone_arg)
-            if target_zone == nil then
-                print_msg('Unknown zone: ' .. zone_arg)
-                return
-            end
-            local tx, tz
-            local coords = { rest_args:match('(%-?%d+%.?%d*)%s+(%-?%d+%.?%d*)') }
-            if #coords == 2 then
-                tx = tonumber(coords[1])
-                tz = tonumber(coords[2])
-            end
-
-            if target_zone == state.zone_id then
-                -- Same zone: normal A* navigation to coords (if provided).
-                if tx == nil then
-                    print_msg('Already in ' .. (zone_transitions.ZONE_NAMES[target_zone] or tostring(target_zone)) .. '.')
-                    return
-                end
-                if graph.node_count() == 0 then
-                    print_msg('No map data for this zone. Run /mapper explore first.')
-                    return
-                end
-                local player = GetPlayerEntity()
-                if player == nil or player.ActorPointer == 0 then
-                    print_msg('Player entity not available.')
-                    return
-                end
-                local px = player.Movement.LocalPosition.X
-                local py = player.Movement.LocalPosition.Y
-                local start_id = graph.nearest_node(px, py)
-                local goal_id  = graph.nearest_node(tx, tz)
-                if start_id == nil or goal_id == nil then
-                    print_msg('No graph nodes available.')
-                    return
-                end
-                local path = graph.astar(start_id, goal_id)
-                if path == nil then
-                    print_msg('No path found to that location.')
-                    return
-                end
-                navigator.start_navigate(path, graph, function(reason)
-                    if reason == 'reached' then
-                        print_msg(string.format('Reached (%.1f, %.1f).', tx, tz))
-                    elseif reason == 'stuck' then
-                        print_msg('Navigation aborted: stuck.')
-                    end
-                end)
-                print_msg(string.format('Navigating to (%.1f, %.1f) via %d waypoints.', tx, tz, #path))
-                return
-            end
-
-            -- Different zone: plan route asynchronously so the client doesn't
-            -- freeze while navmesh files are loaded and Dijkstra runs.
-            local player = GetPlayerEntity()
-            local px_start, py_start = 0, 0
-            if player ~= nil and player.ActorPointer ~= 0 then
-                px_start = player.Movement.LocalPosition.X
-                py_start = player.Movement.LocalPosition.Y
-            end
-
-            local dest_name    = zone_transitions.ZONE_NAMES[target_zone] or tostring(target_zone)
-            local start_zone   = state.zone_id
-            local cost_fn      = make_step_cost_fn()
-            -- Capture tx/tz for the coroutine closure (may be nil).
-            local final_x, final_y = tx, tz
-
-            print_msg('Planning route to ' .. dest_name .. '...')
-            _planning_zone_id   = start_zone
-            _planning_coroutine = coroutine.create(function()
-                local route = zone_transitions.zone_astar(
-                    start_zone, target_zone, px_start, py_start, cost_fn)
-
-                -- Discard stale results if the player zoned during planning.
-                if state.zone_id ~= start_zone then return end
-
-                if route == nil or #route == 0 then
-                    print_msg('No zone transition path found to ' .. dest_name .. '.')
-                    return
-                end
-
-                state.cross_zone.active     = true
-                state.cross_zone.route      = route
-                state.cross_zone.step       = 1
-                state.cross_zone.final_zone = target_zone
-                state.cross_zone.final_x    = final_x
-                state.cross_zone.final_y    = final_y
-
-                print_msg(string.format('Cross-zone route to %s (id=%d): %d zone%s.',
-                    dest_name, target_zone, #route, #route == 1 and '' or 's'))
-                navigate_to_zoneline(route[1], string.format('Step 1/%d', #route))
-            end)
-            return
-        end
-
-        -- ---- Same-zone coordinate goto (original behavior) ----
         local tx = tonumber(args[3])
-        local tz = tonumber(args[4])
-        if tx == nil or tz == nil then
-            print_msg('Usage: /mapper goto <x> <z>  OR  /mapper goto |Zone Name| [x z]')
+        local ty = tonumber(args[4])
+        if not tx or not ty then
+            msg('Invalid coordinates.')
             return
-        end
-        if graph.node_count() == 0 then
-            print_msg('No map data for this zone. Run /mapper explore first.')
-            return
-        end
-        local player = GetPlayerEntity()
-        if player == nil or player.ActorPointer == 0 then
-            print_msg('Player entity not available.')
-            return
-        end
-        local px = player.Movement.LocalPosition.X
-        local py = player.Movement.LocalPosition.Y
-        local start_id = graph.nearest_node(px, py)
-        local goal_id  = graph.nearest_node(tx, tz)
-        if start_id == nil or goal_id == nil then
-            print_msg('No graph nodes available.')
-            return
-        end
-        local path = graph.astar(start_id, goal_id)
-        if path == nil then
-            print_msg('No path found to that location.')
-            return
-        end
-        navigator.start_navigate(path, graph, function(reason)
-            if reason == 'reached' then
-                print_msg(string.format('Reached destination (%.1f, %.1f).', tx, tz))
-            elseif reason == 'stuck' then
-                print_msg('Navigation aborted: stuck.')
-            else
-                print_msg('Navigation ended: ' .. tostring(reason))
-            end
-        end)
-        print_msg(string.format('Navigating to (%.1f, %.1f) via %d waypoints.',
-            tx, tz, #path))
-
-    -- /mapper save
-    elseif sub == 'save' then
-        if state.zone_id == nil or state.zone_id == 0 then
-            print_msg('Not in a valid zone.')
-            return
-        end
-        save_zone(state.zone_id, true)
-        print_msg(string.format('Saved zone %d (%d nodes, %d entities).',
-            state.zone_id, graph.node_count(), entities.count(state.zone_id)))
-
-    -- /mapper status
-    elseif sub == 'status' then
-        local mode_str = navigator.mode()
-        local nodes    = graph.node_count()
-        local edges    = graph.edge_count()
-        local ents     = entities.count(state.zone_id)
-        local zone_name = zone_transitions.ZONE_NAMES[state.zone_id] or tostring(state.zone_id)
-        print_msg(string.format(
-            'Zone: %s (%s) | Mode: %s | Nodes: %d | Edges: %d | Entities: %d',
-            zone_name, tostring(state.zone_id), mode_str, nodes, edges, ents))
-        if state.cross_zone.active then
-            local czs = state.cross_zone
-            local dest = zone_transitions.ZONE_NAMES[czs.final_zone] or tostring(czs.final_zone)
-            print_msg(string.format('Cross-zone: step %d/%d -> %s', czs.step, #czs.route, dest))
         end
 
-    -- /mapper pos
-    elseif sub == 'pos' then
-        local player = GetPlayerEntity()
-        if player == nil or player.ActorPointer == 0 then
-            print_msg('Player entity not available.')
+        local ok, player = pcall(GetPlayerEntity)
+        if not ok or not player then
+            msg('Cannot get player position.')
             return
         end
         local px = player.Movement.LocalPosition.X
         local py = player.Movement.LocalPosition.Y
         local pz = player.Movement.LocalPosition.Z
-        print_msg(string.format('pos=(%.3f, %.3f) elev=%.3f', px, py, pz))
 
-    -- /mapper exits  (debug: list zone exits for current zone with expected positions)
-    elseif sub == 'exits' then
-        local exits = zone_transitions.get_exits(state.zone_id)
-        if #exits == 0 then
-            print_msg('No exits recorded for zone ' .. tostring(state.zone_id))
+        cancel_all()
+        request_path(px, py, pz, tx, ty)
+
+    elseif cmd == 'stop' then
+        cancel_all()
+        msg('Stopped.')
+
+    elseif cmd == 'pos' then
+        local ok, player = pcall(GetPlayerEntity)
+        if ok and player then
+            local px = player.Movement.LocalPosition.X
+            local py = player.Movement.LocalPosition.Y
+            local pz = player.Movement.LocalPosition.Z
+            msg(string.format('pos=(%.3f, %.3f) elev=%.3f zone=%s',
+                px, py, pz, tostring(state.zone_id)))
+        end
+
+    elseif cmd == 'status' then
+        if state.pending_seq then
+            msg(string.format('Waiting for path response [#%d]...', state.pending_seq))
+        elseif state.moving then
+            msg(string.format('Moving: waypoint %d/%d, stuck=%d',
+                state.wp_idx, state.waypoints and #state.waypoints or 0,
+                state.stuck_count))
         else
-            local zone_name = zone_transitions.ZONE_NAMES[state.zone_id] or tostring(state.zone_id)
-            print_msg(string.format('Exits from %s (%d):', zone_name, state.zone_id))
-            for i, ex in ipairs(exits) do
-                local dest = zone_transitions.ZONE_NAMES[ex.to_zone] or tostring(ex.to_zone)
-                local nn = graph.nearest_node(ex.fx, ex.fy)
-                local nn_dist = 'no graph'
-                if nn then
-                    local n = graph.nodes[nn]
-                    local dx = n.x - ex.fx
-                    local dy = n.y - ex.fy
-                    nn_dist = string.format('%.1f yalms', math.sqrt(dx*dx + dy*dy))
-                end
-                print_msg(string.format('  %d) -> %s(%d) at (%.1f, %.1f)  nearest node: %s',
-                    i, dest, ex.to_zone, ex.fx, ex.fy, nn_dist))
-            end
+            msg('Idle.')
         end
 
-    -- /mapper rawcmd (debug: print hex bytes of remainder)
-    elseif sub == 'rawcmd' then
-        local raw = e.command
-        local hex = {}
-        for i = 1, #raw do
-            table.insert(hex, string.format('%02X', raw:byte(i)))
-        end
-        print_msg('raw: ' .. table.concat(hex, ' '))
-        print_msg('str: ' .. raw)
-
-    -- /mapper (no subcommand) → help
     else
-        print_msg('Commands: explore | stop | goto <x> <z> | goto |Zone| [x z] | save | status | pos')
+        msg('Commands: goto <x> <y> | stop | pos | status')
     end
 end)

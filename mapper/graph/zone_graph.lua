@@ -1,28 +1,46 @@
 --[[
-* mapper - graph.lua
-* Node/edge graph data structure and A* pathfinding.
+* nav - graph/zone_graph.lua
+*
+* Per-zone discovered traversal graph.
+* Enhanced from the original graph.lua; interface is backward-compatible with
+* movement_bridge.lua which expects:
+*   g.nodes[id].{x, y, z}
+*   g.adjacency[id] = {neighbor_id, ...}
+*   g.nearest_node(x, y)
+*   g.get_frontier(min_neighbors)
+*   g.astar(start_id, goal_id)
+*
+* Additions over graph.lua:
+*   - Per-edge confidence scores (float 0.0–1.0)
+*   - Confidence-weighted A* cost (lower confidence = higher cost)
+*   - Frontier scoring helpers used by graph/frontier.lua
 --]]
 
 local graph = {}
 
 -- Node list: array of { id, x, y, z }
-graph.nodes = {}
+graph.nodes     = {}
 -- Adjacency list: graph.adjacency[node_id] = { neighbor_id, ... }
 graph.adjacency = {}
+-- Per-edge confidence: graph.confidence[a][b] = 0.0..1.0
+-- Initialized to 0.5 (neutral); increases with successful traversal.
+graph.confidence = {}
 -- ID of the most recently added node (for edge-chaining during exploration)
 graph.last_node_id = nil
--- True only when exploration has added new nodes since the last load/reset.
--- Navmesh-loaded graphs start clean; we only write back if the player explored.
+-- True when exploration has added new nodes/edges since the last save.
 graph.dirty = false
+graph._edge_count = 0
 
 -------------------------------------------------------------------------------
 -- Reset all graph state (called on zone change)
 -------------------------------------------------------------------------------
 function graph.reset()
-    graph.nodes = {}
-    graph.adjacency = {}
+    graph.nodes      = {}
+    graph.adjacency  = {}
+    graph.confidence = {}
     graph.last_node_id = nil
     graph.dirty = false
+    graph._edge_count = 0
 end
 
 -------------------------------------------------------------------------------
@@ -30,18 +48,19 @@ end
 -- x = LocalPosition.X (east/west)
 -- y = LocalPosition.Y (north/south)
 -- z = LocalPosition.Z (elevation)
--- Horizontal distance calculations use x and y only.
 -- Returns the new node's id.
 -------------------------------------------------------------------------------
 function graph.add_node(x, y, z)
     local id = #graph.nodes + 1
-    graph.nodes[id] = { id = id, x = x, y = y, z = z }
-    graph.adjacency[id] = {}
+    graph.nodes[id]      = { id = id, x = x, y = y, z = z }
+    graph.adjacency[id]  = {}
+    graph.confidence[id] = {}
     return id
 end
 
 -------------------------------------------------------------------------------
 -- Add a bidirectional edge between two node IDs (deduplicates).
+-- Initial confidence = 0.5 (neutral / unconfirmed).
 -------------------------------------------------------------------------------
 function graph.add_edge(a, b)
     if a == b then return end
@@ -53,22 +72,28 @@ function graph.add_edge(a, b)
         return false
     end
 
+    local added = false
     if not has_edge(a, b) then
-        graph.adjacency[a] = graph.adjacency[a] or {}
+        graph.adjacency[a]  = graph.adjacency[a]  or {}
+        graph.confidence[a] = graph.confidence[a] or {}
         table.insert(graph.adjacency[a], b)
+        graph.confidence[a][b] = graph.confidence[a][b] or 0.5
+        added = true
     end
     if not has_edge(b, a) then
-        graph.adjacency[b] = graph.adjacency[b] or {}
+        graph.adjacency[b]  = graph.adjacency[b]  or {}
+        graph.confidence[b] = graph.confidence[b] or {}
         table.insert(graph.adjacency[b], a)
+        graph.confidence[b][a] = graph.confidence[b][a] or 0.5
     end
+    if added then graph._edge_count = graph._edge_count + 1 end
 end
 
 -------------------------------------------------------------------------------
 -- Sample current position; add a node if far enough from the last one.
--- Connects the new node to graph.last_node_id automatically.
 -- Returns the new or existing last node id.
 -------------------------------------------------------------------------------
-local NODE_DIST2 = 4.0  -- 2 yalm threshold squared (horizontal: x and y)
+local NODE_DIST2 = 4.0  -- 2 yalm threshold squared
 
 function graph.try_add_node(x, y, z)
     if graph.last_node_id == nil then
@@ -79,7 +104,7 @@ function graph.try_add_node(x, y, z)
 
     local last = graph.nodes[graph.last_node_id]
     local dx = x - last.x
-    local dy = y - last.y   -- north/south axis
+    local dy = y - last.y
     if (dx * dx + dy * dy) >= NODE_DIST2 then
         local new_id = graph.add_node(x, y, z)
         graph.add_edge(graph.last_node_id, new_id)
@@ -93,7 +118,6 @@ end
 
 -------------------------------------------------------------------------------
 -- Find the nearest node to horizontal position (x, y).
--- x = LocalPosition.X (east/west), y = LocalPosition.Y (north/south)
 -- Returns node_id or nil if graph is empty.
 -------------------------------------------------------------------------------
 function graph.nearest_node(x, y)
@@ -126,9 +150,12 @@ function graph.get_frontier(min_neighbors)
 end
 
 -------------------------------------------------------------------------------
--- A* pathfinding. Returns an array of node IDs [start..goal] or nil.
+-- A* pathfinding over the discovered graph.
+-- When use_confidence is true the edge cost is scaled by (2 - confidence)
+-- so low-confidence edges are treated as longer / less preferred.
+-- Returns an array of node IDs [start..goal] or nil.
 -------------------------------------------------------------------------------
-function graph.astar(start_id, goal_id)
+function graph.astar(start_id, goal_id, use_confidence)
     if start_id == nil or goal_id == nil then return nil end
     if start_id == goal_id then return { start_id } end
     if graph.nodes[goal_id] == nil then return nil end
@@ -138,26 +165,24 @@ function graph.astar(start_id, goal_id)
     local function heuristic(node_id)
         local n = graph.nodes[node_id]
         local dx = n.x - goal.x
-        local dy = n.y - goal.y   -- north/south axis
+        local dy = n.y - goal.y
         return math.sqrt(dx * dx + dy * dy)
     end
 
-    local open = {}         -- array of { id, g, f }
+    local open      = {}
     local came_from = {}
-    local g_score = {}
-    local closed = {}
+    local g_score   = {}
+    local closed    = {}
 
     g_score[start_id] = 0
     table.insert(open, { id = start_id, g = 0, f = heuristic(start_id) })
 
     while #open > 0 do
-        -- Pop the entry with the lowest f score
         table.sort(open, function(a, b) return a.f < b.f end)
         local current = table.remove(open, 1)
-        local cur_id = current.id
+        local cur_id  = current.id
 
         if cur_id == goal_id then
-            -- Reconstruct path
             local path = {}
             local c = goal_id
             while c ~= nil do
@@ -175,7 +200,15 @@ function graph.astar(start_id, goal_id)
                 local nb_node  = graph.nodes[nb_id]
                 local dx = nb_node.x - cur_node.x
                 local dy = nb_node.y - cur_node.y
-                local edge_cost = math.sqrt(dx * dx + dy * dy)
+                local base_cost = math.sqrt(dx * dx + dy * dy)
+
+                -- Apply confidence penalty: low-confidence edges cost more.
+                local conf = 0.5
+                if use_confidence and graph.confidence[cur_id] then
+                    conf = graph.confidence[cur_id][nb_id] or 0.5
+                end
+                local edge_cost = base_cost * (2.0 - conf)
+
                 local tentative_g = current.g + edge_cost
 
                 if g_score[nb_id] == nil or tentative_g < g_score[nb_id] then
@@ -183,7 +216,6 @@ function graph.astar(start_id, goal_id)
                     g_score[nb_id]   = tentative_g
                     local f = tentative_g + heuristic(nb_id)
 
-                    -- Update or insert in open set
                     local found = false
                     for _, entry in ipairs(open) do
                         if entry.id == nb_id then
@@ -201,16 +233,11 @@ function graph.astar(start_id, goal_id)
         end
     end
 
-    return nil  -- No path found
+    return nil
 end
 
 -------------------------------------------------------------------------------
 -- Path simplification via Douglas-Peucker.
--- Removes intermediate waypoints that lie within `tolerance` yalms of the
--- straight line between their neighbours.  Call this on the raw A* result
--- before handing it to the navigator to eliminate redundant micro-waypoints
--- on straight or near-straight segments.
--- Returns a new (shorter) array of node IDs with the same endpoints.
 -------------------------------------------------------------------------------
 local function _pt_line_dist(px, py, ax, ay, bx, by)
     local dx, dy = bx - ax, by - ay
@@ -254,16 +281,51 @@ function graph.simplify_path(path, tolerance)
     _dp_simplify(path, 1, #path, tolerance, graph.nodes, keep)
     local result = {}
     for i = 1, #path do
-        if keep[i] then
-            table.insert(result, path[i])
-        end
+        if keep[i] then table.insert(result, path[i]) end
     end
     return result
 end
 
 -------------------------------------------------------------------------------
--- Serialize nodes array for JSON export
+-- Confidence management
 -------------------------------------------------------------------------------
+
+-- Record a successful traversal of edge (a→b); raises confidence toward 1.0.
+function graph.record_success(a, b)
+    if not graph.confidence[a] then return end
+    local c = graph.confidence[a][b] or 0.5
+    graph.confidence[a][b] = math.min(1.0, c + 0.1)
+    if graph.confidence[b] then
+        local cr = graph.confidence[b][a] or 0.5
+        graph.confidence[b][a] = math.min(1.0, cr + 0.1)
+    end
+    graph.dirty = true
+end
+
+-- Record a failed traversal; lowers confidence toward 0.0.
+function graph.record_failure(a, b)
+    if not graph.confidence[a] then return end
+    local c = graph.confidence[a][b] or 0.5
+    graph.confidence[a][b] = math.max(0.0, c - 0.2)
+    if graph.confidence[b] then
+        local cr = graph.confidence[b][a] or 0.5
+        graph.confidence[b][a] = math.max(0.0, cr - 0.2)
+    end
+    graph.dirty = true
+end
+
+-- Returns true when confidence is so low the edge should be temporarily skipped.
+function graph.is_edge_suppressed(a, b, threshold)
+    threshold = threshold or 0.1
+    if not graph.confidence[a] then return false end
+    local c = graph.confidence[a][b] or 0.5
+    return c < threshold
+end
+
+-------------------------------------------------------------------------------
+-- Serialization
+-------------------------------------------------------------------------------
+
 function graph.serialize_nodes()
     local out = {}
     for _, n in ipairs(graph.nodes) do
@@ -272,53 +334,52 @@ function graph.serialize_nodes()
     return out
 end
 
--------------------------------------------------------------------------------
--- Serialize edges as a flat list { a, b } for JSON export (each pair once)
--------------------------------------------------------------------------------
 function graph.serialize_edges()
-    local out = {}
+    local out  = {}
     local seen = {}
     for a, neighbors in pairs(graph.adjacency) do
         for _, b in ipairs(neighbors) do
             local key = math.min(a, b) .. '_' .. math.max(a, b)
             if not seen[key] then
                 seen[key] = true
-                table.insert(out, { a = a, b = b })
+                local conf = (graph.confidence[a] and graph.confidence[a][b]) or 0.5
+                table.insert(out, { a = a, b = b, conf = conf })
             end
         end
     end
     return out
 end
 
--------------------------------------------------------------------------------
--- Load graph data from a deserialized JSON table
--------------------------------------------------------------------------------
 function graph.load(data)
     graph.reset()
     if data.nodes then
         for _, n in ipairs(data.nodes) do
-            graph.nodes[n.id] = { id = n.id, x = n.x, y = n.y, z = n.z }
-            graph.adjacency[n.id] = graph.adjacency[n.id] or {}
+            graph.nodes[n.id]      = { id = n.id, x = n.x, y = n.y, z = n.z }
+            graph.adjacency[n.id]  = graph.adjacency[n.id]  or {}
+            graph.confidence[n.id] = graph.confidence[n.id] or {}
         end
     end
     if data.edges then
         for _, e in ipairs(data.edges) do
             graph.add_edge(e.a, e.b)
+            -- Restore persisted confidence if available.
+            if e.conf then
+                graph.confidence[e.a] = graph.confidence[e.a] or {}
+                graph.confidence[e.b] = graph.confidence[e.b] or {}
+                graph.confidence[e.a][e.b] = e.conf
+                graph.confidence[e.b][e.a] = e.conf
+            end
         end
     end
-    -- last_node_id stays nil; explorer will attach to nearest node on resume
+    -- last_node_id stays nil; explorer will attach to nearest node on resume.
 end
 
--------------------------------------------------------------------------------
--- Count helpers
--------------------------------------------------------------------------------
 function graph.node_count()
     return #graph.nodes
 end
 
 function graph.edge_count()
-    local edges = graph.serialize_edges()
-    return #edges
+    return graph._edge_count
 end
 
 return graph

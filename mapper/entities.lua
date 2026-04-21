@@ -1,197 +1,185 @@
 --[[
 * mapper - entities.lua
-* Entity scanning, cross-session identity matching, and deduplication.
-* Tracks NPCs (type 2) and interactive objects/doors (type 5).
+* Entity tracking: records mob positions, wander ranges, and time-of-day visibility.
+* Keyed by ServerId (unique per spawn point). Ignores claimed and dead entities.
 --]]
+
+local D = require('core.debug')
 
 local entities = {}
 
--- Per-zone persistent records: entities.zone_records[zone_id] = { entity_record, ... }
 entities.zone_records = {}
--- Session-local index by ServerId for O(1) in-session updates
-entities.session_index = {}
 
 local ENTITY_TYPES = { [2] = true, [5] = true }
-local MATCH_RADIUS = 10.0   -- yalms; within this distance = same entity cross-session
-local TIE_RADIUS   = 0.1    -- yalms; equidistant tie → keep both records
+local VANA_EPOCH = 1009810800
 
--------------------------------------------------------------------------------
--- Reset session state (but keep loaded zone records intact across resets
--- triggered by zone change, which calls load() after reset()).
--------------------------------------------------------------------------------
+local function get_vana_hour()
+    local vana_secs = (os.time() - VANA_EPOCH) * 25
+    return math.floor(vana_secs / 3600) % 24
+end
+
+local function should_track(entity)
+    local ok_s, status = pcall(function() return entity.Status end)
+    if ok_s and status ~= nil and status ~= 0 and status ~= 1 then return false end
+    local ok_c, claim = pcall(function() return entity.ClaimServerId end)
+    if ok_c and claim ~= nil and claim ~= 0 then return false end
+    return true
+end
+
 function entities.reset(zone_id)
-    entities.session_index = {}
     if zone_id then
         entities.zone_records[zone_id] = entities.zone_records[zone_id] or {}
     end
 end
 
--------------------------------------------------------------------------------
--- Build a stable UID from zone, entity name, and the nearest graph node id.
--- The nearest node acts as a spatial anchor that survives minor coord drift.
--------------------------------------------------------------------------------
-local function make_uid(zone_id, name, nearest_node_id)
-    return string.format('zone_%d:%s:%d', zone_id, name, nearest_node_id or 0)
-end
-
--------------------------------------------------------------------------------
--- Find the best cross-session match for a candidate in zone_id's record list.
--- Returns the matching record, or nil if none found within MATCH_RADIUS.
--------------------------------------------------------------------------------
-local function find_match(zone_id, candidate)
-    local records = entities.zone_records[zone_id]
-    if records == nil then return nil end
-
-    local best_rec, best_dist = nil, math.huge
-    for _, rec in ipairs(records) do
-        if rec.name == candidate.name and rec.type == candidate.type then
-            local dx = rec.x - candidate.x
-            local dy = rec.y - candidate.y   -- north/south axis
-            local dist = math.sqrt(dx * dx + dy * dy)
-            if dist <= MATCH_RADIUS then
-                if dist < best_dist - TIE_RADIUS then
-                    best_rec  = rec
-                    best_dist = dist
-                elseif dist <= best_dist + TIE_RADIUS then
-                    -- True tie: return nil so both records coexist
-                    best_rec = nil
-                end
-            end
-        end
-    end
-    return best_rec
-end
-
--------------------------------------------------------------------------------
--- Create a new entity record and insert it into the zone's record list.
--------------------------------------------------------------------------------
-local function create_record(zone_id, candidate, nearest_node_id)
-    local uid = make_uid(zone_id, candidate.name, nearest_node_id)
-    local rec = {
-        uid          = uid,
-        name         = candidate.name,
-        type         = candidate.type,
-        server_id    = candidate.server_id,
-        x            = candidate.x,
-        y            = candidate.y,
-        z            = candidate.z,
-        nearest_node = nearest_node_id,
-        zone_id      = zone_id,
-    }
-    entities.zone_records[zone_id] = entities.zone_records[zone_id] or {}
-    table.insert(entities.zone_records[zone_id], rec)
-    return rec
-end
-
--------------------------------------------------------------------------------
--- Scan all entity slots and update/create records.
--- graph_ref is the graph module (used to find nearest_node for new records).
--------------------------------------------------------------------------------
-function entities.scan(zone_id, graph_ref)
+function entities.scan(zone_id)
     if zone_id == nil or zone_id == 0 then return end
 
-    for index = 0, 2303 do
-        local e = GetEntity(index)
-        if e ~= nil and e.ActorPointer ~= 0 then
-            local name = e.Name
-            if name ~= nil and name ~= '' and ENTITY_TYPES[e.Type] then
-                local candidate = {
-                    name      = name,
-                    type      = e.Type,
-                    server_id = e.ServerId,
-                    x         = e.Movement.LocalPosition.X,
-                    y         = e.Movement.LocalPosition.Y,
-                    z         = e.Movement.LocalPosition.Z,
-                }
+    local hour = get_vana_hour()
+    local records = entities.zone_records[zone_id]
+    if records == nil then
+        entities.zone_records[zone_id] = {}
+        records = entities.zone_records[zone_id]
+    end
 
-                local existing = entities.session_index[e.ServerId]
-                if existing then
-                    -- Fast path: same session, just update position
-                    existing.x = candidate.x
-                    existing.y = candidate.y
-                    existing.z = candidate.z
-                else
-                    -- Cross-session match attempt
-                    local match = find_match(zone_id, candidate)
-                    if match then
-                        match.server_id = candidate.server_id
-                        match.x = candidate.x
-                        match.y = candidate.y
-                        match.z = candidate.z
-                        entities.session_index[candidate.server_id] = match
-                    else
-                        -- New entity
-                        local nearest_node = nil
-                        if graph_ref then
-                            nearest_node = graph_ref.nearest_node(candidate.x, candidate.z)
-                        end
-                        local rec = create_record(zone_id, candidate, nearest_node)
-                        entities.session_index[candidate.server_id] = rec
-                    end
-                end
+    for index = 0, 2303 do
+        local ok_e, e = pcall(GetEntity, index)
+        if ok_e and e ~= nil then
+        local ok_ptr, ptr = pcall(function() return e.ActorPointer end)
+        if ok_ptr and ptr ~= nil and ptr ~= 0 then
+        pcall(function()
+            if e.ActorPointer == 0 then return end
+            local name = e.Name
+            if name == nil or name == '' then return end
+            if not ENTITY_TYPES[e.Type] then return end
+            if not should_track(e) then return end
+
+            local sid = e.ServerId
+            local x = e.Movement.LocalPosition.X
+            local y = e.Movement.LocalPosition.Y
+            local z = e.Movement.LocalPosition.Z
+
+            local rec = records[sid]
+            if rec == nil then
+                rec = {
+                    server_id = sid,
+                    name = name,
+                    type = e.Type,
+                    center_x = x, center_y = y, center_z = z,
+                    wander_radius = 0,
+                    min_x = x, max_x = x,
+                    min_y = y, max_y = y,
+                    tod_hours = {},
+                    sightings = 0,
+                }
+                records[sid] = rec
             end
+
+            if x < rec.min_x then rec.min_x = x end
+            if x > rec.max_x then rec.max_x = x end
+            if y < rec.min_y then rec.min_y = y end
+            if y > rec.max_y then rec.max_y = y end
+
+            rec.center_x = (rec.min_x + rec.max_x) / 2
+            rec.center_y = (rec.min_y + rec.max_y) / 2
+            rec.center_z = z
+
+            local dx = x - rec.center_x
+            local dy = y - rec.center_y
+            local dist = math.sqrt(dx * dx + dy * dy)
+            if dist > rec.wander_radius then
+                rec.wander_radius = dist
+            end
+
+            if hour ~= nil then
+                rec.tod_hours[hour] = true
+            end
+
+            rec.sightings = rec.sightings + 1
+            rec.name = name
+        end)
+        end
         end
     end
 end
 
--------------------------------------------------------------------------------
--- Serialize all entity records for a zone into a plain table for JSON export
--------------------------------------------------------------------------------
 function entities.serialize(zone_id)
-    local out = {}
     local records = entities.zone_records[zone_id]
-    if records == nil then return out end
-    for _, rec in ipairs(records) do
-        table.insert(out, {
-            uid          = rec.uid,
-            name         = rec.name,
-            type         = rec.type,
-            server_id    = rec.server_id,
-            x            = rec.x,
-            y            = rec.y,
-            z            = rec.z,
-            nearest_node = rec.nearest_node,
-            zone_id      = rec.zone_id,
-        })
+    if records == nil then return nil end
+    local out = {}
+    for sid, rec in pairs(records) do
+        local tod = {}
+        for h, _ in pairs(rec.tod_hours) do tod[#tod + 1] = h end
+        table.sort(tod)
+        out[tostring(sid)] = {
+            server_id = rec.server_id,
+            name = rec.name,
+            type = rec.type,
+            center_x = rec.center_x,
+            center_y = rec.center_y,
+            center_z = rec.center_z,
+            wander_radius = rec.wander_radius,
+            min_x = rec.min_x, max_x = rec.max_x,
+            min_y = rec.min_y, max_y = rec.max_y,
+            tod_hours = tod,
+            sightings = rec.sightings,
+        }
     end
     return out
 end
 
--------------------------------------------------------------------------------
--- Load entity records from a deserialized JSON data table
--------------------------------------------------------------------------------
 function entities.load(data, zone_id)
     entities.zone_records[zone_id] = {}
-    if data.entities == nil then return end
-    for _, rec in ipairs(data.entities) do
-        table.insert(entities.zone_records[zone_id], {
-            uid          = rec.uid,
-            name         = rec.name,
-            type         = rec.type,
-            server_id    = rec.server_id or 0,
-            x            = rec.x,
-            y            = rec.y,
-            z            = rec.z,
-            nearest_node = rec.nearest_node,
-            zone_id      = rec.zone_id,
-        })
+    if data == nil then return end
+    if data[1] ~= nil then return end
+
+    local records = entities.zone_records[zone_id]
+    for sid_str, rec in pairs(data) do
+        local sid = tonumber(sid_str) or rec.server_id
+        if sid then
+            local tod_set = {}
+            if rec.tod_hours then
+                for _, h in ipairs(rec.tod_hours) do
+                    tod_set[tonumber(h) or h] = true
+                end
+            end
+            records[sid] = {
+                server_id = sid,
+                name = rec.name or '',
+                type = rec.type or 2,
+                center_x = rec.center_x or 0,
+                center_y = rec.center_y or 0,
+                center_z = rec.center_z or 0,
+                wander_radius = rec.wander_radius or 0,
+                min_x = rec.min_x or rec.center_x or 0,
+                max_x = rec.max_x or rec.center_x or 0,
+                min_y = rec.min_y or rec.center_y or 0,
+                max_y = rec.max_y or rec.center_y or 0,
+                tod_hours = tod_set,
+                sightings = rec.sightings or 0,
+            }
+        end
+    end
+    local n = 0
+    for _ in pairs(records) do n = n + 1 end
+    if n > 0 then
+        D.dbg(string.format('Loaded %d entity records for zone %d.', n, zone_id))
     end
 end
 
--------------------------------------------------------------------------------
--- Count of known entities for a zone
--------------------------------------------------------------------------------
 function entities.count(zone_id)
     if zone_id == nil then
-        -- Sum across all zones
         local total = 0
         for _, records in pairs(entities.zone_records) do
-            total = total + #records
+            for _ in pairs(records) do total = total + 1 end
         end
         return total
     end
     local records = entities.zone_records[zone_id]
-    return records and #records or 0
+    if records == nil then return 0 end
+    local n = 0
+    for _ in pairs(records) do n = n + 1 end
+    return n
 end
 
 return entities
