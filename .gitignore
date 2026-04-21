@@ -1,4 +1,4 @@
-tools/navmeshes/
-tools/navmeshes_full/
 __pycache__/
 *.pyc
+navserver/recast_wrapper/build/
+mapper/data/obstacles/
