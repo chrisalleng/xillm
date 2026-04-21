@@ -289,8 +289,10 @@ class NavServer:
             print(f'Error handling request: {e}')
             self.write_response({'status': 'error', 'message': str(e), 'timestamp': time.time()})
 
+    VERSION = '.1'
+
     def run(self):
-        print(f'Nav server started. Watching {REQUEST_FILE}')
+        print(f'Nav server v{self.VERSION} started. Watching {REQUEST_FILE}')
         print(f'Collision data: {COLLISION_DIR}')
         try:
             while True:

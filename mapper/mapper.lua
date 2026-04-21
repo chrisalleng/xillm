@@ -12,7 +12,7 @@
 
 addon.name    = 'mapper'
 addon.author  = 'xillm'
-addon.version = '6.1'
+addon.version = '.1'
 addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
