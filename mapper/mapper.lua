@@ -4,19 +4,19 @@
 * Ashita v4 addon: thin movement client for Python navigation server.
 *
 * Commands:
-*   /mapper goto <x> <y>              — navigate to coordinates
-*   /mapper goto <x> <y> <zone name>  — cross-zone navigation
-*   /mapper goto <zone name>           — navigate to zone
-*   /mapper goto "entity name"         — navigate to known entity
-*   /mapper find "entity name"         — search zone for entity
-*   /mapper stop                       — stop movement/search
-*   /mapper pos                        — print current position
-*   /mapper status                     — show state + entity count
+*   /mapper goto <x> <y>              - navigate to coordinates
+*   /mapper goto <x> <y> <zone name>  - cross-zone navigation
+*   /mapper goto <zone name>           - navigate to zone
+*   /mapper goto "entity name"         - navigate to known entity
+*   /mapper find "entity name"         - search zone for entity
+*   /mapper stop                       - stop movement/search
+*   /mapper pos                        - print current position
+*   /mapper status                     - show state + entity count
 --]]
 
 addon.name    = 'mapper'
 addon.author  = 'xillm'
-addon.version = '.8'
+addon.version = '.9'
 addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
@@ -243,7 +243,7 @@ local function check_path_response()
     -- Only accept responses matching our pending request
     if data.seq ~= state.pending_seq then return end
 
-    -- Response received — clear pending
+    -- Response received - clear pending
     state.pending_seq = nil
 
     -- Handle cross_zone_goto response
@@ -315,14 +315,14 @@ local function check_path_response()
             msg(string.format('Path received: %d waypoints.', #data.waypoints))
         end
     elseif data.status == 'partial' and state.search and (data.end_dist or 0) > 30 then
-        msg(string.format('Search point unreachable (%.0fy short) — skipping.', data.end_dist or 0))
+        msg(string.format('Search point unreachable (%.0fy short) - skipping.', data.end_dist or 0))
         stop_movement()
         state.pending_seq = nil
     elseif data.status == 'no_path' then
         if state.search then
-            msg('Search point unreachable — skipping.')
+            msg('Search point unreachable - skipping.')
         else
-            msg('No path found — destination may be unreachable.')
+            msg('No path found - destination may be unreachable.')
             cancel_all()
         end
     elseif data.status == 'error' then
@@ -354,7 +354,7 @@ local function start_avoidance(px, py)
         perp_x = -dy * side,
         perp_y = dx * side,
     }
-    msg(string.format('Obstacle detected — maneuvering (attempt %d)...', state.stuck_count))
+    msg(string.format('Obstacle detected - maneuvering (attempt %d)...', state.stuck_count))
     return true
 end
 
@@ -450,7 +450,7 @@ local function movement_tick(px, py, pz)
             state.stuck_count = state.stuck_count + 1
 
             if state.search and state.stuck_count >= 2 then
-                msg('Search point stuck — skipping.')
+                msg('Search point stuck - skipping.')
                 stop_movement()
                 state.stuck_count = 0
                 state.goal = nil
@@ -464,11 +464,11 @@ local function movement_tick(px, py, pz)
             end
 
             if state.stuck_count % 2 == 1 then
-                msg(string.format('Stuck (attempt %d) at wp %d/%d — trying avoidance.',
+                msg(string.format('Stuck (attempt %d) at wp %d/%d - trying avoidance.',
                     state.stuck_count, state.wp_idx, #state.waypoints))
                 start_avoidance(px, py)
             else
-                msg(string.format('Stuck (attempt %d) at wp %d/%d — reporting obstacle, repathing.',
+                msg(string.format('Stuck (attempt %d) at wp %d/%d - reporting obstacle, repathing.',
                     state.stuck_count, state.wp_idx, #state.waypoints))
                 local obstacle = { px, py, pz }
                 local goal = state.goal
@@ -641,7 +641,7 @@ ashita.events.register('d3d_present', 'mapper_render', function()
                 else
                     r.replans = (r.replans or 0) + 1
                     if r.replans > 3 then
-                        msg('Route failed after multiple re-plans — giving up.')
+                        msg('Route failed after multiple re-plans - giving up.')
                         state.route = nil
                     else
                         local prev_zone = state.zone_id
@@ -671,7 +671,7 @@ ashita.events.register('d3d_present', 'mapper_render', function()
                 end
             elseif state.moving or state.search then
                 cancel_all()
-                msg('Zone changed — stopping.')
+                msg('Zone changed - stopping.')
             end
 
             state.zone_id = zone_id
@@ -716,7 +716,7 @@ ashita.events.register('d3d_present', 'mapper_render', function()
     if state.route and not state.moving and not state.pending_seq then
         local r = state.route
         if r.seg_idx > #r.segments then
-            msg(string.format('Route complete — arrived in %s.',
+            msg(string.format('Route complete - arrived in %s.',
                 get_zone_name(state.zone_id)))
             state.route = nil
         end
@@ -734,7 +734,7 @@ ashita.events.register('d3d_present', 'mapper_render', function()
             if s.wp_idx > #s.waypoints then
                 local name = s.target_name
                 state.search = nil
-                msg(string.format('Search complete — "%s" not found in zone.', name))
+                msg(string.format('Search complete - "%s" not found in zone.', name))
             else
                 local wp = s.waypoints[s.wp_idx]
                 s.wp_idx = s.wp_idx + 1

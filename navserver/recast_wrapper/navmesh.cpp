@@ -473,7 +473,8 @@ static std::vector<std::tuple<float,float,float>> find_path(
     std::shared_ptr<NavMeshData> mesh,
     std::tuple<float,float,float> start,
     std::tuple<float,float,float> end,
-    int max_polys = 2048)
+    int max_polys = 2048,
+    int exclude_flags = 2)
 {
     if (!mesh || !mesh->navQuery)
         throw std::runtime_error("Invalid navmesh");
@@ -484,12 +485,18 @@ static std::vector<std::tuple<float,float,float>> find_path(
 
     dtQueryFilter filter;
     filter.setIncludeFlags(0xFFFF);
-    filter.setExcludeFlags(0);
+    filter.setExcludeFlags(static_cast<unsigned short>(exclude_flags));
 
     dtPolyRef startRef, endRef;
     float startNearest[3], endNearest[3];
 
     mesh->navQuery->findNearestPoly(spos, extents, &filter, &startRef, startNearest);
+    if (!startRef && exclude_flags != 0) {
+        dtQueryFilter permissive;
+        permissive.setIncludeFlags(0xFFFF);
+        permissive.setExcludeFlags(0);
+        mesh->navQuery->findNearestPoly(spos, extents, &permissive, &startRef, startNearest);
+    }
     mesh->navQuery->findNearestPoly(epos, extents, &filter, &endRef, endNearest);
 
     if (!startRef || !endRef)
@@ -553,6 +560,72 @@ static std::vector<std::tuple<float,float,float>> get_poly_centers(
     return centers;
 }
 
+static int mark_polys_blocked(
+    std::shared_ptr<NavMeshData> mesh,
+    std::tuple<float,float,float> center,
+    float radius)
+{
+    if (!mesh || !mesh->navQuery || !mesh->navMesh)
+        throw std::runtime_error("Invalid navmesh");
+
+    float pos[3] = { std::get<0>(center), std::get<1>(center), std::get<2>(center) };
+    float halfExtents[3] = { radius, 100.0f, radius };
+
+    dtQueryFilter filter;
+    filter.setIncludeFlags(0xFFFF);
+    filter.setExcludeFlags(0);
+
+    const int MAX_POLYS = 512;
+    dtPolyRef polys[MAX_POLYS];
+    int polyCount = 0;
+
+    mesh->navQuery->queryPolygons(pos, halfExtents, &filter, polys, &polyCount, MAX_POLYS);
+
+    int blocked = 0;
+    float radiusSq = radius * radius;
+
+    for (int i = 0; i < polyCount; i++) {
+        float closest[3];
+        bool posOverPoly;
+        dtStatus status = mesh->navQuery->closestPointOnPoly(polys[i], pos, closest, &posOverPoly);
+        if (dtStatusFailed(status))
+            continue;
+
+        float dx = closest[0] - pos[0];
+        float dz = closest[2] - pos[2];
+        if (dx * dx + dz * dz <= radiusSq) {
+            mesh->navMesh->setPolyFlags(polys[i], 1 | 2);
+            blocked++;
+        }
+    }
+    return blocked;
+}
+
+static int clear_blocked(std::shared_ptr<NavMeshData> mesh)
+{
+    if (!mesh || !mesh->navMesh)
+        throw std::runtime_error("Invalid navmesh");
+
+    int cleared = 0;
+    const dtNavMesh* nav = mesh->navMesh;
+    for (int i = 0; i < nav->getMaxTiles(); i++) {
+        const dtMeshTile* tile = nav->getTile(i);
+        if (!tile || !tile->header) continue;
+        dtPolyRef base = nav->getPolyRefBase(tile);
+        for (int j = 0; j < tile->header->polyCount; j++) {
+            unsigned short flags;
+            dtPolyRef ref = base | (dtPolyRef)j;
+            if (dtStatusSucceed(mesh->navMesh->getPolyFlags(ref, &flags))) {
+                if (flags & 2) {
+                    mesh->navMesh->setPolyFlags(ref, 1);
+                    cleared++;
+                }
+            }
+        }
+    }
+    return cleared;
+}
+
 PYBIND11_MODULE(navmesh, m) {
     m.doc() = "Recast/Detour navmesh builder and pathfinder for FFXI";
 
@@ -587,5 +660,14 @@ PYBIND11_MODULE(navmesh, m) {
     m.def("find_path", &find_path,
           "Find path between two points",
           py::arg("mesh"), py::arg("start"), py::arg("end"),
-          py::arg("max_polys") = 2048);
+          py::arg("max_polys") = 2048,
+          py::arg("exclude_flags") = 2);
+
+    m.def("mark_polys_blocked", &mark_polys_blocked,
+          "Mark navmesh polygons near a point as blocked",
+          py::arg("mesh"), py::arg("center"), py::arg("radius"));
+
+    m.def("clear_blocked", &clear_blocked,
+          "Clear all blocked polygon flags",
+          py::arg("mesh"));
 }

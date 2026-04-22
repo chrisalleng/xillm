@@ -28,6 +28,7 @@ IPC_DIR = Path('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/map
 REQUEST_FILE = IPC_DIR / 'nav_request.json'
 PATH_FILE = IPC_DIR / 'nav_path.json'
 POLL_INTERVAL = 0.1
+OBSTACLE_BLOCK_RADIUS = 2.0
 
 
 from collections import deque
@@ -120,7 +121,7 @@ class NavServer:
                     reach[(i, j)] = 0.0
                     continue
                 end_rc = self.game_to_recast(t_to['x'], t_to['y'], 0)
-                path = navmesh.find_path(mesh, start_rc, end_rc)
+                path = navmesh.find_path(mesh, start_rc, end_rc, exclude_flags=0)
                 if path:
                     last = self.recast_to_game(path[-1][0], path[-1][1], path[-1][2])
                     dx = last[0] - t_to['x']
@@ -152,7 +153,7 @@ class NavServer:
         reachable = []
         for i, t in enumerate(trans):
             end_rc = self.game_to_recast(t['x'], t['y'], 0)
-            path = navmesh.find_path(mesh, start_rc, end_rc)
+            path = navmesh.find_path(mesh, start_rc, end_rc, exclude_flags=0)
             if path:
                 last = self.recast_to_game(path[-1][0], path[-1][1], path[-1][2])
                 dx = last[0] - t['x']
@@ -383,6 +384,7 @@ class NavServer:
             settings.tile_size = 1024
             self.meshes[zone_id] = navmesh.build_navmesh(verts, tris, settings)
             print(f'  Built in {time.time()-t0:.1f}s')
+            self._apply_obstacle_blocking(zone_id, self.meshes[zone_id])
         return self.meshes[zone_id]
 
     def load_obstacles(self, zone_id: int):
@@ -408,6 +410,22 @@ class NavServer:
         obstacles.append([round(x, 1), round(y, 1), round(z, 1)])
         self.save_obstacles(zone_id)
         print(f'  Stored obstacle at ({x:.1f}, {y:.1f}) for zone {zone_id} ({len(obstacles)} total)')
+        if zone_id in self.meshes:
+            center_rc = self.game_to_recast(x, y, z)
+            n = navmesh.mark_polys_blocked(self.meshes[zone_id], center_rc, OBSTACLE_BLOCK_RADIUS)
+            if n > 0:
+                print(f'  Blocked {n} polys near new obstacle')
+
+    def _apply_obstacle_blocking(self, zone_id: int, mesh):
+        obstacles = self.load_obstacles(zone_id)
+        if not obstacles:
+            return
+        total = 0
+        for obs in obstacles:
+            center_rc = self.game_to_recast(obs[0], obs[1], obs[2])
+            total += navmesh.mark_polys_blocked(mesh, center_rc, OBSTACLE_BLOCK_RADIUS)
+        if total > 0:
+            print(f'  Blocked {total} polys for {len(obstacles)} obstacles in zone {zone_id}')
 
     def game_to_recast(self, x, y, z):
         """Ashita coords → Recast coords. Ashita.Y=-MZB.y, Ashita.Z=-MZB.z."""
