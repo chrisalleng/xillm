@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 navserver/recast_wrapper/build/
 mapper/data/obstacles/
+mapper/data/collision/

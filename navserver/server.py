@@ -23,10 +23,15 @@ sys.stdout.reconfigure(line_buffering=True)
 
 COLLISION_DIR = SCRIPT_DIR.parent / 'mapper' / 'data' / 'collision'
 OBSTACLE_DIR = SCRIPT_DIR.parent / 'mapper' / 'data' / 'obstacles'
+TRANSITIONS_FILE = SCRIPT_DIR.parent / 'mapper' / 'data' / 'zone_transitions.json'
 IPC_DIR = Path('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/mapper')
 REQUEST_FILE = IPC_DIR / 'nav_request.json'
 PATH_FILE = IPC_DIR / 'nav_path.json'
 POLL_INTERVAL = 0.1
+
+
+from collections import deque
+import heapq
 
 
 class NavServer:
@@ -34,6 +39,275 @@ class NavServer:
         self.meshes: dict[int, object] = {}
         self.obstacles: dict[int, list] = {}
         self.last_request_mtime = 0
+        self.zone_names: dict[int, str] = {}
+        self.name_to_zone: dict[str, int] = {}
+        self.transitions: dict[int, list] = {}
+        self.reachability: dict[int, dict] = {}
+        self._load_transitions()
+
+    def _load_transitions(self):
+        if not TRANSITIONS_FILE.exists():
+            print(f'Warning: {TRANSITIONS_FILE} not found')
+            return
+        with open(TRANSITIONS_FILE) as f:
+            data = json.load(f)
+        for zid_str, name in data.get('names', {}).items():
+            zid = int(zid_str)
+            self.zone_names[zid] = name
+            self.name_to_zone[name.lower()] = zid
+        for zid_str, trans_list in data.get('transitions', {}).items():
+            for t in trans_list:
+                t['y'] = -t['y']
+            self.transitions[int(zid_str)] = trans_list
+        print(f'Loaded {len(self.zone_names)} zone names, '
+              f'{sum(len(v) for v in self.transitions.values())} transitions')
+
+    def resolve_zone_name(self, name: str):
+        name_lower = name.lower()
+        if name_lower in self.name_to_zone:
+            return self.name_to_zone[name_lower]
+        for full_name, zid in self.name_to_zone.items():
+            if name_lower in full_name:
+                return zid
+        return None
+
+    def _find_arrival_transition(self, from_zone: int, from_trans: dict, to_zone: int):
+        """Find the transition in to_zone that leads back to from_zone, closest to from_trans position."""
+        to_trans = self.transitions.get(to_zone, [])
+        best = None
+        best_dist = float('inf')
+        for i, t in enumerate(to_trans):
+            if t['to'] == from_zone:
+                dx = t['x'] - from_trans['x']
+                dy = t['y'] - from_trans['y']
+                d = dx*dx + dy*dy
+                if d < best_dist:
+                    best_dist = d
+                    best = i
+        return best
+
+    @staticmethod
+    def _path_length(path):
+        total = 0.0
+        for k in range(1, len(path)):
+            dx = path[k][0] - path[k-1][0]
+            dy = path[k][1] - path[k-1][1]
+            dz = path[k][2] - path[k-1][2]
+            total += (dx*dx + dy*dy + dz*dz) ** 0.5
+        return total
+
+    def _build_reachability(self, zone_id: int):
+        """Build reachability map: (i,j) -> distance or None if unreachable."""
+        if zone_id in self.reachability:
+            return self.reachability[zone_id]
+
+        trans = self.transitions.get(zone_id, [])
+        if not trans:
+            self.reachability[zone_id] = {}
+            return self.reachability[zone_id]
+
+        try:
+            mesh = self.get_mesh(zone_id)
+        except FileNotFoundError:
+            self.reachability[zone_id] = {}
+            return self.reachability[zone_id]
+
+        reach = {}
+        for i, t_from in enumerate(trans):
+            start_rc = self.game_to_recast(t_from['x'], t_from['y'], 0)
+            for j, t_to in enumerate(trans):
+                if i == j:
+                    reach[(i, j)] = 0.0
+                    continue
+                end_rc = self.game_to_recast(t_to['x'], t_to['y'], 0)
+                path = navmesh.find_path(mesh, start_rc, end_rc)
+                if path:
+                    last = self.recast_to_game(path[-1][0], path[-1][1], path[-1][2])
+                    dx = last[0] - t_to['x']
+                    dy = last[1] - t_to['y']
+                    if (dx*dx + dy*dy) ** 0.5 < 30.0:
+                        reach[(i, j)] = self._path_length(path)
+                    else:
+                        reach[(i, j)] = None
+                else:
+                    reach[(i, j)] = None
+
+        self.reachability[zone_id] = reach
+        reachable = sum(1 for v in reach.values() if v is not None)
+        print(f'  Zone {zone_id} reachability: {reachable}/{len(reach)} pairs connected')
+        return reach
+
+    def _player_reachable_transitions(self, zone_id: int, player_pos: tuple):
+        """Find which transitions the player can reach. Returns [(trans_idx, distance), ...]."""
+        trans = self.transitions.get(zone_id, [])
+        if not trans:
+            return []
+
+        try:
+            mesh = self.get_mesh(zone_id)
+        except FileNotFoundError:
+            return []
+
+        start_rc = self.game_to_recast(*player_pos)
+        reachable = []
+        for i, t in enumerate(trans):
+            end_rc = self.game_to_recast(t['x'], t['y'], 0)
+            path = navmesh.find_path(mesh, start_rc, end_rc)
+            if path:
+                last = self.recast_to_game(path[-1][0], path[-1][1], path[-1][2])
+                dx = last[0] - t['x']
+                dy = last[1] - t['y']
+                if (dx*dx + dy*dy) ** 0.5 < 30.0:
+                    reachable.append((i, self._path_length(path)))
+        return reachable
+
+    def plan_cross_zone(self, from_zone: int, player_pos: tuple, to_zone: int, target_pos=None, avoid_zones=None):
+        if from_zone == to_zone:
+            return None
+
+        player_reachable = self._player_reachable_transitions(from_zone, player_pos)
+        if not player_reachable:
+            return None
+
+        if avoid_zones:
+            trans = self.transitions.get(from_zone, [])
+            player_reachable = [
+                (i, d) for i, d in player_reachable
+                if trans[i]['to'] not in avoid_zones
+            ]
+            if not player_reachable:
+                return None
+
+        # Dijkstra on transition-level graph, weighted by walking distance
+        # Nodes are (zone_id, trans_idx) tuples
+        dist = {}
+        prev = {}
+        heap = []
+        seq = 0
+
+        for i, path_dist in player_reachable:
+            node = (from_zone, i)
+            dist[node] = path_dist
+            prev[node] = None
+            heapq.heappush(heap, (path_dist, seq, from_zone, i))
+            seq += 1
+
+        goal_node = None
+        while heap:
+            cost, _, zone, tidx = heapq.heappop(heap)
+            node = (zone, tidx)
+            if cost > dist.get(node, float('inf')):
+                continue
+
+            trans_list = self.transitions.get(zone, [])
+            if not trans_list or tidx >= len(trans_list):
+                continue
+            t = trans_list[tidx]
+
+            if t['to'] == to_zone:
+                goal_node = node
+                break
+
+            next_zone = t['to']
+            arrival_idx = self._find_arrival_transition(zone, t, next_zone)
+            if arrival_idx is None:
+                continue
+
+            arrival_node = (next_zone, arrival_idx)
+            if cost < dist.get(arrival_node, float('inf')):
+                dist[arrival_node] = cost
+                prev[arrival_node] = node
+                heapq.heappush(heap, (cost, seq, next_zone, arrival_idx))
+                seq += 1
+
+            reach = self._build_reachability(next_zone)
+            next_trans = self.transitions.get(next_zone, [])
+            for j in range(len(next_trans)):
+                if j == arrival_idx:
+                    continue
+                edge_dist = reach.get((arrival_idx, j))
+                if edge_dist is not None:
+                    neighbor = (next_zone, j)
+                    new_cost = cost + edge_dist
+                    if new_cost < dist.get(neighbor, float('inf')):
+                        dist[neighbor] = new_cost
+                        prev[neighbor] = arrival_node
+                        heapq.heappush(heap, (new_cost, seq, next_zone, j))
+                        seq += 1
+
+        if goal_node is None:
+            return None
+
+        path = []
+        node = goal_node
+        while node is not None:
+            path.append(node)
+            node = prev.get(node)
+        path.reverse()
+
+        total_cost = dist.get(goal_node, 0)
+        print(f'  Route cost: {total_cost:.0f}y walking distance')
+
+        route = []
+        prev_zone = from_zone
+        for i, (zone, tidx) in enumerate(path):
+            t = self.transitions[zone][tidx]
+            if t['to'] == prev_zone and i > 0:
+                prev_zone = zone
+                continue
+            route.append({
+                'zone_id': zone,
+                'target': [round(t['x'], 1), round(t['y'], 1), 0],
+                'is_transition': True,
+                'next_zone': t['to'],
+            })
+            prev_zone = zone
+
+        if target_pos:
+            route.append({
+                'zone_id': to_zone,
+                'target': [round(target_pos[0], 1), round(target_pos[1], 1), round(target_pos[2], 1)],
+                'is_transition': False,
+            })
+
+        return route
+
+    def _avoid_transitions(self, waypoints, zone_id, target_pos=None):
+        """Push waypoints away from zone transition points to prevent accidental zoning.
+        If target_pos given, skip the transition closest to the target."""
+        trans = self.transitions.get(zone_id, [])
+        if not trans:
+            return waypoints
+
+        skip_idx = None
+        if target_pos:
+            best_d = float('inf')
+            for i, t in enumerate(trans):
+                d = (t['x'] - target_pos[0])**2 + (t['y'] - target_pos[1])**2
+                if d < best_d:
+                    best_d = d
+                    skip_idx = i
+
+        AVOID_RADIUS = 40.0
+        PUSH_DIST = 50.0
+
+        for i, t in enumerate(trans):
+            if i == skip_idx:
+                continue
+            tx, ty = t['x'], t['y']
+            new_wps = []
+            for wp in waypoints:
+                dx = wp[0] - tx
+                dy = wp[1] - ty
+                d = (dx*dx + dy*dy) ** 0.5
+                if d < AVOID_RADIUS and d > 0.01:
+                    nx, ny = dx / d, dy / d
+                    new_wps.append([round(tx + nx * PUSH_DIST, 2), round(ty + ny * PUSH_DIST, 2), wp[2]])
+                else:
+                    new_wps.append(wp)
+            waypoints = new_wps
+
+        return waypoints
 
     def load_collision(self, zone_id: int):
         path = COLLISION_DIR / f'{zone_id}.json'
@@ -43,8 +317,21 @@ class NavServer:
         with open(path) as f:
             data = json.load(f)
 
-        verts_raw = np.array(data['vertices'], dtype=np.float32)
+        verts_raw = np.array(data['vertices'], dtype=np.float64)
         tris = np.array(data['triangles'], dtype=np.int32)
+
+        valid = np.all(np.abs(verts_raw) < 100000, axis=1)
+        if not np.all(valid):
+            bad = int(np.sum(~valid))
+            print(f'  Warning: filtering {bad}/{len(verts_raw)} corrupt vertices in zone {zone_id}')
+            good_idx = np.where(valid)[0]
+            remap = np.full(len(verts_raw), -1, dtype=np.int32)
+            remap[good_idx] = np.arange(len(good_idx), dtype=np.int32)
+            verts_raw = verts_raw[valid]
+            tri_valid = np.all(remap[tris] >= 0, axis=1)
+            tris = remap[tris[tri_valid]]
+
+        verts_raw = verts_raw.astype(np.float32)
 
         # MZB → Recast (Y-up): (MZB.x, MZB.z, -MZB.y)
         verts = np.column_stack([
@@ -64,16 +351,23 @@ class NavServer:
             print(f'Building navmesh for zone {zone_id}...')
             t0 = time.time()
             verts, tris = self.load_collision(zone_id)
-            settings = navmesh.NavSettings()
-            settings.cell_size = 0.20
-            settings.cell_height = 0.12
-            settings.agent_radius = 1.5
-            settings.agent_max_slope = 40.0
-            settings.agent_max_climb = 1.0
-            settings.region_min_size = 2
-            settings.region_merge_size = 20
-            self.meshes[zone_id] = navmesh.build_navmesh(verts, tris, settings)
-            print(f'  Built in {time.time()-t0:.1f}s')
+            for cell_size in [0.20, 0.35, 0.50, 0.80]:
+                settings = navmesh.NavSettings()
+                settings.cell_size = cell_size
+                settings.cell_height = 0.12
+                settings.agent_radius = 1.5
+                settings.agent_max_slope = 40.0
+                settings.agent_max_climb = 1.0
+                settings.region_min_size = 2
+                settings.region_merge_size = 20
+                try:
+                    self.meshes[zone_id] = navmesh.build_navmesh(verts, tris, settings)
+                    print(f'  Built in {time.time()-t0:.1f}s (cell={cell_size})')
+                    break
+                except RuntimeError:
+                    print(f'  cell_size={cell_size} failed, retrying coarser...')
+            else:
+                raise RuntimeError(f'Failed to build navmesh for zone {zone_id} at any cell size')
         return self.meshes[zone_id]
 
     def load_obstacles(self, zone_id: int):
@@ -101,14 +395,11 @@ class NavServer:
         print(f'  Stored obstacle at ({x:.1f}, {y:.1f}) for zone {zone_id} ({len(obstacles)} total)')
 
     def game_to_recast(self, x, y, z):
-        """Game coords → Recast coords. Game: (x, y, z) where z=elevation. Recast: Y-up."""
-        # game.x = MZB.x, game.y = -MZB.y, game.z = -MZB.z
-        # Recast = (MZB.x, MZB.z, -MZB.y) = (game.x, -game.z, game.y)
+        """Ashita coords → Recast coords. Ashita.Y=-MZB.y, Ashita.Z=-MZB.z."""
         return (x, -z, y)
 
     def recast_to_game(self, rx, ry, rz):
-        """Recast coords → Game coords."""
-        # Inverse: game.x = recast.x, game.y = recast.z, game.z = -recast.y
+        """Recast coords → Ashita coords."""
         return (rx, rz, -ry)
 
     def _path_to_waypoints(self, path_rc, max_segment=1.0):
@@ -169,7 +460,7 @@ class NavServer:
 
         return waypoints
 
-    def find_path(self, zone_id, start_game, end_game):
+    def find_path(self, zone_id, start_game, end_game, avoid_zone_exits=True):
         mesh = self.get_mesh(zone_id)
         start_rc = self.game_to_recast(*start_game)
         end_rc = self.game_to_recast(*end_game)
@@ -198,7 +489,90 @@ class NavServer:
                 if best_dist < 5.0:
                     break
 
-        return self._avoid_obstacles(best, zone_id)
+        best = self._avoid_obstacles(best, zone_id)
+        if avoid_zone_exits:
+            best = self._avoid_transitions(best, zone_id, target_pos=end_game)
+        return best
+
+    def generate_search_points(self, zone_id: int, player_game: list, entity_positions: list = None) -> list:
+        mesh = self.get_mesh(zone_id)
+        centers = navmesh.get_poly_centers(mesh)
+
+        game_points = []
+        for c in centers:
+            gx, gy, gz = self.recast_to_game(c[0], c[1], c[2])
+            game_points.append([gx, gy, gz])
+
+        if not game_points:
+            return []
+
+        SPACING = 80.0
+        SPACING_SQ = SPACING * SPACING
+        covered = [False] * len(game_points)
+        search_points = []
+
+        px, py = player_game[0], player_game[1]
+        indices = sorted(range(len(game_points)),
+                         key=lambda i: (game_points[i][0]-px)**2 + (game_points[i][1]-py)**2)
+
+        for i in indices:
+            if covered[i]:
+                continue
+            pt = game_points[i]
+            search_points.append([round(pt[0], 1), round(pt[1], 1), round(pt[2], 1)])
+            for j in range(len(game_points)):
+                if not covered[j]:
+                    dx = game_points[j][0] - pt[0]
+                    dy = game_points[j][1] - pt[1]
+                    if dx*dx + dy*dy < SPACING_SQ:
+                        covered[j] = True
+
+        entity_near = []
+        entity_far = []
+        ENTITY_RADIUS_SQ = 150.0 ** 2
+        ent_pos = entity_positions or []
+
+        for sp in search_points:
+            near = False
+            for ep in ent_pos:
+                dx = sp[0] - ep[0]
+                dy = sp[1] - ep[1]
+                if dx*dx + dy*dy < ENTITY_RADIUS_SQ:
+                    near = True
+                    break
+            if near:
+                entity_near.append(sp)
+            else:
+                entity_far.append(sp)
+
+        ordered_unsearched = self._order_search_points(entity_far, px, py)
+        ordered_searched = self._order_search_points(entity_near, px, py)
+        print(f'  Search: {len(ordered_unsearched)} unsearched, {len(ordered_searched)} already covered')
+        return ordered_unsearched + ordered_searched
+
+    def _order_search_points(self, points: list, start_x: float, start_y: float) -> list:
+        if len(points) <= 1:
+            return points
+
+        remaining = list(range(len(points)))
+        ordered = []
+        cx, cy = start_x, start_y
+
+        while remaining:
+            best_idx = None
+            best_dist = float('inf')
+            for i, pi in enumerate(remaining):
+                dx = points[pi][0] - cx
+                dy = points[pi][1] - cy
+                d = dx*dx + dy*dy
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+            pi = remaining.pop(best_idx)
+            ordered.append(points[pi])
+            cx, cy = points[pi][0], points[pi][1]
+
+        return ordered
 
     def handle_request(self, req):
         action = req.get('action')
@@ -218,7 +592,7 @@ class NavServer:
                 waypoints = self.find_path(
                     zone_id,
                     (player[0], player[1], player[2]),
-                    (target[0], target[1], target[2])
+                    (target[0], target[1], target[2]),
                 )
 
                 if not waypoints:
@@ -247,6 +621,81 @@ class NavServer:
             except Exception as e:
                 print(f'  Error: {e}')
                 self.write_response({'status': 'error', 'message': str(e), 'zone_id': zone_id, 'seq': seq})
+
+        elif action == 'search_points':
+            print(f'[#{seq}] search_points zone={zone_id}')
+            try:
+                player = req.get('player', [0, 0, 0])
+                ent_pos = req.get('entity_positions', [])
+                waypoints = self.generate_search_points(zone_id, player, ent_pos)
+                self.write_response({
+                    'action': 'search_points',
+                    'status': 'ok',
+                    'zone_id': zone_id,
+                    'waypoints': waypoints,
+                    'seq': seq,
+                })
+                print(f'  Generated {len(waypoints)} search points')
+            except Exception as e:
+                print(f'  Error: {e}')
+                self.write_response({'action': 'search_points', 'status': 'error', 'message': str(e), 'seq': seq})
+
+        elif action == 'cross_zone_goto':
+            target_zone = req.get('target_zone')
+            player = req['player']
+            target = req.get('target')
+            avoid_zones = req.get('avoid_zones')
+            print(f'[#{seq}] cross_zone_goto zone={zone_id} -> {target_zone}'
+                  f' ({self.zone_names.get(target_zone, "?")})'
+                  f'{" avoid=" + str(avoid_zones) if avoid_zones else ""}')
+
+            try:
+                if zone_id == target_zone:
+                    if target:
+                        self.handle_request({
+                            'action': 'goto', 'zone_id': zone_id,
+                            'player': player, 'target': target, 'seq': seq,
+                        })
+                    else:
+                        self.write_response({
+                            'action': 'cross_zone_goto', 'status': 'already_there',
+                            'zone_id': zone_id, 'seq': seq,
+                        })
+                        print(f'  Already in target zone')
+                    return
+
+                route = self.plan_cross_zone(
+                    zone_id, tuple(player), target_zone,
+                    tuple(target) if target else None,
+                    avoid_zones=set(avoid_zones) if avoid_zones else None)
+
+                if not route:
+                    self.write_response({
+                        'action': 'cross_zone_goto', 'status': 'no_route',
+                        'zone_id': zone_id, 'seq': seq,
+                    })
+                    print(f'  No route found')
+                    return
+
+                zone_path = ' → '.join(
+                    self.zone_names.get(s['zone_id'], str(s['zone_id']))
+                    for s in route)
+                print(f'  Route: {zone_path} ({len(route)} segments)')
+
+                self.write_response({
+                    'action': 'cross_zone_goto',
+                    'status': 'ok',
+                    'route': route,
+                    'zone_id': zone_id,
+                    'seq': seq,
+                })
+            except Exception as e:
+                print(f'  Error: {e}')
+                import traceback; traceback.print_exc()
+                self.write_response({
+                    'action': 'cross_zone_goto', 'status': 'error',
+                    'message': str(e), 'seq': seq,
+                })
 
         elif action == 'report_obstacle':
             pos = req.get('position', [0, 0, 0])
@@ -289,7 +738,7 @@ class NavServer:
             print(f'Error handling request: {e}')
             self.write_response({'status': 'error', 'message': str(e), 'timestamp': time.time()})
 
-    VERSION = '.1'
+    VERSION = '.8'
 
     def run(self):
         print(f'Nav server v{self.VERSION} started. Watching {REQUEST_FILE}')
