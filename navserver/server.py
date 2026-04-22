@@ -59,6 +59,8 @@ class NavServer:
         for zid_str, trans_list in data.get('transitions', {}).items():
             for t in trans_list:
                 t['y'] = -t['y']
+                if 'z' not in t:
+                    t['z'] = 0.0
             self.transitions[int(zid_str)] = trans_list
         print(f'Loaded {len(self.zone_names)} zone names, '
               f'{sum(len(v) for v in self.transitions.values())} transitions')
@@ -115,13 +117,13 @@ class NavServer:
 
         reach = {}
         for i, t_from in enumerate(trans):
-            start_rc = self.game_to_recast(t_from['x'], t_from['y'], 0)
+            src = self.game_to_recast(t_from['x'], t_from['y'], t_from['z'])
             for j, t_to in enumerate(trans):
                 if i == j:
                     reach[(i, j)] = 0.0
                     continue
-                end_rc = self.game_to_recast(t_to['x'], t_to['y'], 0)
-                path = navmesh.find_path(mesh, start_rc, end_rc, exclude_flags=0)
+                dst = self.game_to_recast(t_to['x'], t_to['y'], t_to['z'])
+                path = navmesh.find_path(mesh, src, dst, exclude_flags=0)
                 if path:
                     last = self.recast_to_game(path[-1][0], path[-1][1], path[-1][2])
                     dx = last[0] - t_to['x']
@@ -152,7 +154,7 @@ class NavServer:
         start_rc = self.game_to_recast(*player_pos)
         reachable = []
         for i, t in enumerate(trans):
-            end_rc = self.game_to_recast(t['x'], t['y'], 0)
+            end_rc = self.game_to_recast(t['x'], t['y'], t['z'])
             path = navmesh.find_path(mesh, start_rc, end_rc, exclude_flags=0)
             if path:
                 last = self.recast_to_game(path[-1][0], path[-1][1], path[-1][2])

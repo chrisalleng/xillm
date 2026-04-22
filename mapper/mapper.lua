@@ -16,7 +16,7 @@
 
 addon.name    = 'mapper'
 addon.author  = 'xillm'
-addon.version = '.9'
+addon.version = '.10'
 addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
@@ -633,7 +633,6 @@ ashita.events.register('d3d_present', 'mapper_render', function()
                         state.route = nil
                     else
                         r.needs_path = true
-                        r.zone_entry_frame = state.frame
                     end
                 elseif zone_id == r.target_zone then
                     msg(string.format('Arrived in %s!', get_zone_name(zone_id)))
@@ -696,19 +695,8 @@ ashita.events.register('d3d_present', 'mapper_render', function()
         local r = state.route
         local seg = r.segments[r.seg_idx]
         if seg and seg.target then
-            -- After zoning, drive toward target for 90 frames before requesting navmesh path
-            -- This moves the player away from the zone boundary to avoid bounce-back
-            if r.zone_entry_frame then
-                drive_toward(px, py, seg.target[1], seg.target[2])
-                if state.frame - r.zone_entry_frame >= 90 then
-                    r.zone_entry_frame = nil
-                    r.needs_path = false
-                    request_path(px, py, pz, seg.target[1], seg.target[2])
-                end
-            else
-                r.needs_path = false
-                request_path(px, py, pz, seg.target[1], seg.target[2])
-            end
+            r.needs_path = false
+            request_path(px, py, pz, seg.target[1], seg.target[2])
         end
     end
 
