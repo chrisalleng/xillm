@@ -288,21 +288,30 @@ class NavServer:
                     best_d = d
                     skip_idx = i
 
-        AVOID_RADIUS = 40.0
-        PUSH_DIST = 50.0
+        AVOID_RADIUS = 10.0
+        PUSH_DIST = 12.0
 
         for i, t in enumerate(trans):
             if i == skip_idx:
                 continue
             tx, ty = t['x'], t['y']
             new_wps = []
-            for wp in waypoints:
+            for j, wp in enumerate(waypoints):
                 dx = wp[0] - tx
                 dy = wp[1] - ty
                 d = (dx*dx + dy*dy) ** 0.5
                 if d < AVOID_RADIUS and d > 0.01:
-                    nx, ny = dx / d, dy / d
-                    new_wps.append([round(tx + nx * PUSH_DIST, 2), round(ty + ny * PUSH_DIST, 2), wp[2]])
+                    moving_away = False
+                    if j + 1 < len(waypoints):
+                        nxt = waypoints[j + 1]
+                        d_next = ((nxt[0] - tx)**2 + (nxt[1] - ty)**2) ** 0.5
+                        if d_next > d:
+                            moving_away = True
+                    if moving_away:
+                        new_wps.append(wp)
+                    else:
+                        nx, ny = dx / d, dy / d
+                        new_wps.append([round(tx + nx * PUSH_DIST, 2), round(ty + ny * PUSH_DIST, 2), wp[2]])
                 else:
                     new_wps.append(wp)
             waypoints = new_wps
@@ -331,6 +340,18 @@ class NavServer:
             tri_valid = np.all(remap[tris] >= 0, axis=1)
             tris = remap[tris[tri_valid]]
 
+        # Strip orphaned vertices that bloat the bounding box
+        referenced = set(tris.flatten().tolist())
+        orphaned = np.array([i not in referenced for i in range(len(verts_raw))], dtype=bool)
+        if orphaned.any():
+            keep = ~orphaned
+            n_orphaned = int(orphaned.sum())
+            print(f'  Stripping {n_orphaned} orphaned vertices in zone {zone_id}')
+            remap = np.full(len(verts_raw), -1, dtype=np.int32)
+            remap[np.where(keep)[0]] = np.arange(int(keep.sum()), dtype=np.int32)
+            verts_raw = verts_raw[keep]
+            tris = remap[tris]
+
         verts_raw = verts_raw.astype(np.float32)
 
         # MZB → Recast (Y-up): (MZB.x, MZB.z, -MZB.y)
@@ -351,23 +372,17 @@ class NavServer:
             print(f'Building navmesh for zone {zone_id}...')
             t0 = time.time()
             verts, tris = self.load_collision(zone_id)
-            for cell_size in [0.20, 0.35, 0.50, 0.80]:
-                settings = navmesh.NavSettings()
-                settings.cell_size = cell_size
-                settings.cell_height = 0.12
-                settings.agent_radius = 1.5
-                settings.agent_max_slope = 40.0
-                settings.agent_max_climb = 1.0
-                settings.region_min_size = 2
-                settings.region_merge_size = 20
-                try:
-                    self.meshes[zone_id] = navmesh.build_navmesh(verts, tris, settings)
-                    print(f'  Built in {time.time()-t0:.1f}s (cell={cell_size})')
-                    break
-                except RuntimeError:
-                    print(f'  cell_size={cell_size} failed, retrying coarser...')
-            else:
-                raise RuntimeError(f'Failed to build navmesh for zone {zone_id} at any cell size')
+            settings = navmesh.NavSettings()
+            settings.cell_size = 0.20
+            settings.cell_height = 0.12
+            settings.agent_radius = 1.5
+            settings.agent_max_slope = 40.0
+            settings.agent_max_climb = 1.0
+            settings.region_min_size = 2
+            settings.region_merge_size = 20
+            settings.tile_size = 1024
+            self.meshes[zone_id] = navmesh.build_navmesh(verts, tris, settings)
+            print(f'  Built in {time.time()-t0:.1f}s')
         return self.meshes[zone_id]
 
     def load_obstacles(self, zone_id: int):
@@ -492,6 +507,14 @@ class NavServer:
         best = self._avoid_obstacles(best, zone_id)
         if avoid_zone_exits:
             best = self._avoid_transitions(best, zone_id, target_pos=end_game)
+
+        if best:
+            last = best[-1]
+            dx = last[0] - end_game[0]
+            dy = last[1] - end_game[1]
+            if (dx*dx + dy*dy) ** 0.5 < 15.0:
+                best.append([round(end_game[0], 2), round(end_game[1], 2), last[2]])
+
         return best
 
     def generate_search_points(self, zone_id: int, player_game: list, entity_positions: list = None) -> list:

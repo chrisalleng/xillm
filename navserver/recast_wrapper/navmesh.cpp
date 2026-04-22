@@ -5,7 +5,9 @@
  *   build_navmesh(verts, tris, settings) → opaque handle
  *   find_path(handle, start, end) → list of (x,y,z) waypoints
  *
- * Matches FFXI NavMesh Builder Recast parameters.
+ * Supports solo (monolithic) and tiled navmesh builds.
+ * Tiled mode processes geometry in spatial tiles with bounded memory per tile,
+ * enabling large outdoor zones that would OOM as a single heightfield.
  */
 
 #include <pybind11/pybind11.h>
@@ -21,8 +23,22 @@
 #include <stdexcept>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 namespace py = pybind11;
+
+static unsigned int nextPow2(unsigned int v) {
+    v--;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    v++;
+    return v;
+}
+
+static unsigned int ilog2(unsigned int v) {
+    unsigned int r = 0;
+    while (v >>= 1) r++;
+    return r;
+}
 
 struct NavMeshData {
     dtNavMesh* navMesh = nullptr;
@@ -54,126 +70,96 @@ struct NavSettings {
     int tileSize = 0;  // 0 = solo mesh (no tiling)
 };
 
-static std::shared_ptr<NavMeshData> build_navmesh(
-    py::array_t<float> verts_arr,
-    py::array_t<int> tris_arr,
-    const NavSettings& settings)
-{
-    auto verts_info = verts_arr.request();
-    auto tris_info = tris_arr.request();
-
-    if (verts_info.ndim != 2 || verts_info.shape[1] != 3)
-        throw std::runtime_error("verts must be Nx3 float array");
-    if (tris_info.ndim != 2 || tris_info.shape[1] != 3)
-        throw std::runtime_error("tris must be Mx3 int array");
-
-    int nverts = (int)verts_info.shape[0];
-    int ntris = (int)tris_info.shape[0];
-    const float* verts = static_cast<const float*>(verts_info.ptr);
-    const int* tris = static_cast<const int*>(tris_info.ptr);
-
-    // Compute bounding box
-    float bmin[3] = { verts[0], verts[1], verts[2] };
-    float bmax[3] = { verts[0], verts[1], verts[2] };
-    for (int i = 0; i < nverts; i++) {
-        for (int j = 0; j < 3; j++) {
-            float v = verts[i*3+j];
-            if (v < bmin[j]) bmin[j] = v;
-            if (v > bmax[j]) bmax[j] = v;
-        }
-    }
-
-    // Recast config
-    rcConfig cfg;
+static void fillRcConfig(rcConfig& cfg, const NavSettings& s, int borderSize = 0) {
     memset(&cfg, 0, sizeof(cfg));
-    cfg.cs = settings.cellSize;
-    cfg.ch = settings.cellHeight;
-    cfg.walkableSlopeAngle = settings.agentMaxSlope;
-    cfg.walkableHeight = (int)ceilf(settings.agentHeight / cfg.ch);
-    cfg.walkableClimb = (int)floorf(settings.agentMaxClimb / cfg.ch);
-    cfg.walkableRadius = (int)ceilf(settings.agentRadius / cfg.cs);
-    cfg.maxEdgeLen = (int)(settings.edgeMaxLen / cfg.cs);
-    cfg.maxSimplificationError = settings.edgeMaxError;
-    cfg.minRegionArea = settings.regionMinSize * settings.regionMinSize;
-    cfg.mergeRegionArea = settings.regionMergeSize * settings.regionMergeSize;
-    cfg.maxVertsPerPoly = (int)settings.vertsPerPoly;
-    cfg.detailSampleDist = settings.detailSampleDist < 0.9f ? 0 : cfg.cs * settings.detailSampleDist;
-    cfg.detailSampleMaxError = cfg.ch * settings.detailSampleMaxError;
+    cfg.cs = s.cellSize;
+    cfg.ch = s.cellHeight;
+    cfg.walkableSlopeAngle = s.agentMaxSlope;
+    cfg.walkableHeight = (int)ceilf(s.agentHeight / cfg.ch);
+    cfg.walkableClimb = (int)floorf(s.agentMaxClimb / cfg.ch);
+    cfg.walkableRadius = (int)ceilf(s.agentRadius / cfg.cs);
+    cfg.maxEdgeLen = (int)(s.edgeMaxLen / cfg.cs);
+    cfg.maxSimplificationError = s.edgeMaxError;
+    cfg.minRegionArea = s.regionMinSize * s.regionMinSize;
+    cfg.mergeRegionArea = s.regionMergeSize * s.regionMergeSize;
+    cfg.maxVertsPerPoly = (int)s.vertsPerPoly;
+    cfg.detailSampleDist = s.detailSampleDist < 0.9f ? 0 : cfg.cs * s.detailSampleDist;
+    cfg.detailSampleMaxError = cfg.ch * s.detailSampleMaxError;
+    cfg.tileSize = s.tileSize;
+    cfg.borderSize = borderSize;
+}
 
-    rcVcopy(cfg.bmin, bmin);
-    rcVcopy(cfg.bmax, bmax);
-    rcCalcGridSize(cfg.bmin, cfg.bmax, cfg.cs, &cfg.width, &cfg.height);
+// Build Recast pipeline from heightfield through detail mesh, returning true on success.
+// On failure, all intermediate allocations are freed and false is returned.
+static bool buildTilePipeline(
+    rcContext& ctx, const rcConfig& cfg,
+    const float* verts, int nverts,
+    const int* tris, int ntris,
+    rcPolyMesh*& pmesh, rcPolyMeshDetail*& dmesh)
+{
+    pmesh = nullptr;
+    dmesh = nullptr;
 
-    rcContext ctx(false);
-
-    // Step 1: heightfield
     rcHeightfield* solid = rcAllocHeightfield();
     if (!solid || !rcCreateHeightfield(&ctx, *solid, cfg.width, cfg.height,
                                         cfg.bmin, cfg.bmax, cfg.cs, cfg.ch)) {
         rcFreeHeightField(solid);
-        throw std::runtime_error("Failed to create heightfield");
+        return false;
     }
 
-    // Rasterize triangles
     std::vector<unsigned char> triAreas(ntris, 0);
     rcMarkWalkableTriangles(&ctx, cfg.walkableSlopeAngle,
                             verts, nverts, tris, ntris, triAreas.data());
     if (!rcRasterizeTriangles(&ctx, verts, nverts, tris, triAreas.data(),
                                ntris, *solid, cfg.walkableClimb)) {
         rcFreeHeightField(solid);
-        throw std::runtime_error("Failed to rasterize triangles");
+        return false;
     }
 
-    // Step 2: filter walkable surfaces
     rcFilterLowHangingWalkableObstacles(&ctx, cfg.walkableClimb, *solid);
     rcFilterLedgeSpans(&ctx, cfg.walkableHeight, cfg.walkableClimb, *solid);
     rcFilterWalkableLowHeightSpans(&ctx, cfg.walkableHeight, *solid);
 
-    // Step 3: compact heightfield
     rcCompactHeightfield* chf = rcAllocCompactHeightfield();
     if (!chf || !rcBuildCompactHeightfield(&ctx, cfg.walkableHeight, cfg.walkableClimb,
                                             *solid, *chf)) {
         rcFreeHeightField(solid);
         rcFreeCompactHeightfield(chf);
-        throw std::runtime_error("Failed to build compact heightfield");
+        return false;
     }
     rcFreeHeightField(solid);
 
-    // Step 4: erode walkable area
     if (!rcErodeWalkableArea(&ctx, cfg.walkableRadius, *chf)) {
         rcFreeCompactHeightfield(chf);
-        throw std::runtime_error("Failed to erode walkable area");
+        return false;
     }
 
-    // Step 5: build regions
     if (!rcBuildDistanceField(&ctx, *chf)) {
         rcFreeCompactHeightfield(chf);
-        throw std::runtime_error("Failed to build distance field");
+        return false;
     }
-    if (!rcBuildRegions(&ctx, *chf, 0, cfg.minRegionArea, cfg.mergeRegionArea)) {
+    if (!rcBuildRegions(&ctx, *chf, cfg.borderSize, cfg.minRegionArea, cfg.mergeRegionArea)) {
         rcFreeCompactHeightfield(chf);
-        throw std::runtime_error("Failed to build regions");
+        return false;
     }
 
-    // Step 6: contours
     rcContourSet* cset = rcAllocContourSet();
     if (!cset || !rcBuildContours(&ctx, *chf, cfg.maxSimplificationError, cfg.maxEdgeLen, *cset)) {
         rcFreeCompactHeightfield(chf);
         rcFreeContourSet(cset);
-        throw std::runtime_error("Failed to build contours");
+        return false;
     }
 
-    // Step 7: poly mesh
-    rcPolyMesh* pmesh = rcAllocPolyMesh();
+    pmesh = rcAllocPolyMesh();
     if (!pmesh || !rcBuildPolyMesh(&ctx, *cset, cfg.maxVertsPerPoly, *pmesh)) {
         rcFreeCompactHeightfield(chf);
         rcFreeContourSet(cset);
         rcFreePolyMesh(pmesh);
-        throw std::runtime_error("Failed to build poly mesh");
+        pmesh = nullptr;
+        return false;
     }
 
-    // Step 8: detail mesh
-    rcPolyMeshDetail* dmesh = rcAllocPolyMeshDetail();
+    dmesh = rcAllocPolyMeshDetail();
     if (!dmesh || !rcBuildPolyMeshDetail(&ctx, *pmesh, *chf,
                                           cfg.detailSampleDist,
                                           cfg.detailSampleMaxError, *dmesh)) {
@@ -181,17 +167,39 @@ static std::shared_ptr<NavMeshData> build_navmesh(
         rcFreeContourSet(cset);
         rcFreePolyMesh(pmesh);
         rcFreePolyMeshDetail(dmesh);
-        throw std::runtime_error("Failed to build detail mesh");
+        pmesh = nullptr;
+        dmesh = nullptr;
+        return false;
     }
 
     rcFreeCompactHeightfield(chf);
     rcFreeContourSet(cset);
 
-    for (int i = 0; i < pmesh->npolys; i++) {
+    for (int i = 0; i < pmesh->npolys; i++)
         pmesh->flags[i] = 1;
-    }
 
-    // Build Detour navmesh data
+    return true;
+}
+
+static std::shared_ptr<NavMeshData> build_solo(
+    const float* verts, int nverts,
+    const int* tris, int ntris,
+    const float* bmin, const float* bmax,
+    const NavSettings& settings)
+{
+    rcConfig cfg;
+    fillRcConfig(cfg, settings);
+    rcVcopy(cfg.bmin, bmin);
+    rcVcopy(cfg.bmax, bmax);
+    rcCalcGridSize(cfg.bmin, cfg.bmax, cfg.cs, &cfg.width, &cfg.height);
+
+    rcContext ctx(false);
+    rcPolyMesh* pmesh = nullptr;
+    rcPolyMeshDetail* dmesh = nullptr;
+
+    if (!buildTilePipeline(ctx, cfg, verts, nverts, tris, ntris, pmesh, dmesh))
+        throw std::runtime_error("Failed to build solo navmesh");
+
     dtNavMeshCreateParams params;
     memset(&params, 0, sizeof(params));
     params.verts = pmesh->verts;
@@ -226,7 +234,6 @@ static std::shared_ptr<NavMeshData> build_navmesh(
     rcFreePolyMesh(pmesh);
     rcFreePolyMeshDetail(dmesh);
 
-    // Create Detour navmesh
     auto result = std::make_shared<NavMeshData>();
     result->navMesh = dtAllocNavMesh();
     if (!result->navMesh) {
@@ -242,21 +249,231 @@ static std::shared_ptr<NavMeshData> build_navmesh(
     result->navData = navData;
     result->navDataSize = navDataSize;
 
-    // Create query object
     result->navQuery = dtAllocNavMeshQuery();
     status = result->navQuery->init(result->navMesh, 2048);
-    if (dtStatusFailed(status)) {
+    if (dtStatusFailed(status))
         throw std::runtime_error("Failed to init navmesh query");
-    }
 
     return result;
+}
+
+static std::shared_ptr<NavMeshData> build_tiled(
+    const float* verts, int nverts,
+    const int* tris, int ntris,
+    const float* bmin, const float* bmax,
+    const NavSettings& settings)
+{
+    const int ts = settings.tileSize;
+    const float tcs = ts * settings.cellSize;
+
+    int gw, gh;
+    rcCalcGridSize(bmin, bmax, settings.cellSize, &gw, &gh);
+    const int tw = (gw + ts - 1) / ts;
+    const int th = (gh + ts - 1) / ts;
+
+    const int walkableRadius = (int)ceilf(settings.agentRadius / settings.cellSize);
+    const int borderSize = walkableRadius + 3;
+    const float borderPad = borderSize * settings.cellSize;
+
+    // Pre-bucket triangles by tile (including border overlap)
+    std::vector<std::vector<int>> tileTris(tw * th);
+    for (int i = 0; i < ntris; i++) {
+        float txMin = verts[tris[i*3]*3], txMax = txMin;
+        float tzMin = verts[tris[i*3]*3+2], tzMax = tzMin;
+        for (int j = 1; j < 3; j++) {
+            float vx = verts[tris[i*3+j]*3];
+            float vz = verts[tris[i*3+j]*3+2];
+            if (vx < txMin) txMin = vx; if (vx > txMax) txMax = vx;
+            if (vz < tzMin) tzMin = vz; if (vz > tzMax) tzMax = vz;
+        }
+
+        int minTx = std::max(0, (int)floorf((txMin - bmin[0] - borderPad) / tcs));
+        int maxTx = std::min(tw - 1, (int)floorf((txMax - bmin[0] + borderPad) / tcs));
+        int minTy = std::max(0, (int)floorf((tzMin - bmin[2] - borderPad) / tcs));
+        int maxTy = std::min(th - 1, (int)floorf((tzMax - bmin[2] + borderPad) / tcs));
+
+        for (int ty = minTy; ty <= maxTy; ty++)
+            for (int tx = minTx; tx <= maxTx; tx++)
+                tileTris[ty * tw + tx].push_back(i);
+    }
+
+    int nonEmpty = 0;
+    for (auto& t : tileTris) if (!t.empty()) nonEmpty++;
+    printf("Tiled navmesh: %dx%d grid, %d non-empty tiles, tile=%d cells (%.1f units)\n",
+           tw, th, nonEmpty, ts, tcs);
+
+    // Compute max polys per tile respecting Detour's 32-bit poly ref.
+    // Detour requires at least 10 salt bits: tileBits + polyBits <= 22.
+    int maxPolysPerTile = 1024;
+    {
+        unsigned int tb = ilog2(nextPow2((unsigned int)(tw * th)));
+        unsigned int pb = ilog2(nextPow2((unsigned int)maxPolysPerTile));
+        while (tb + pb > 22 && pb > 4) {
+            pb--;
+            maxPolysPerTile = 1 << pb;
+        }
+    }
+
+    dtNavMeshParams navParams;
+    memset(&navParams, 0, sizeof(navParams));
+    rcVcopy(navParams.orig, bmin);
+    navParams.tileWidth = tcs;
+    navParams.tileHeight = tcs;
+    navParams.maxTiles = tw * th;
+    navParams.maxPolys = maxPolysPerTile;
+
+    auto result = std::make_shared<NavMeshData>();
+    result->navMesh = dtAllocNavMesh();
+    if (!result->navMesh)
+        throw std::runtime_error("Failed to allocate navmesh");
+
+    dtStatus status = result->navMesh->init(&navParams);
+    if (dtStatusFailed(status))
+        throw std::runtime_error("Failed to init tiled navmesh");
+
+    rcContext ctx(false);
+    int tilesBuilt = 0;
+
+    for (int y = 0; y < th; y++) {
+        for (int x = 0; x < tw; x++) {
+            auto& triList = tileTris[y * tw + x];
+            if (triList.empty()) continue;
+
+            // Tile bounds with border padding
+            float tileBmin[3], tileBmax[3];
+            tileBmin[0] = bmin[0] + x * tcs - borderPad;
+            tileBmin[1] = bmin[1];
+            tileBmin[2] = bmin[2] + y * tcs - borderPad;
+            tileBmax[0] = bmin[0] + (x + 1) * tcs + borderPad;
+            tileBmax[1] = bmax[1];
+            tileBmax[2] = bmin[2] + (y + 1) * tcs + borderPad;
+
+            rcConfig cfg;
+            fillRcConfig(cfg, settings, borderSize);
+            cfg.width = ts + borderSize * 2;
+            cfg.height = ts + borderSize * 2;
+            rcVcopy(cfg.bmin, tileBmin);
+            rcVcopy(cfg.bmax, tileBmax);
+
+            // Build triangle subset for this tile
+            int nTileTris = (int)triList.size();
+            std::vector<int> tileTriData(nTileTris * 3);
+            for (int i = 0; i < nTileTris; i++) {
+                int ti = triList[i];
+                tileTriData[i*3+0] = tris[ti*3+0];
+                tileTriData[i*3+1] = tris[ti*3+1];
+                tileTriData[i*3+2] = tris[ti*3+2];
+            }
+
+            rcPolyMesh* pmesh = nullptr;
+            rcPolyMeshDetail* dmesh = nullptr;
+            if (!buildTilePipeline(ctx, cfg, verts, nverts,
+                                   tileTriData.data(), nTileTris,
+                                   pmesh, dmesh))
+                continue;
+
+            if (pmesh->nverts == 0 || pmesh->npolys == 0) {
+                rcFreePolyMesh(pmesh);
+                rcFreePolyMeshDetail(dmesh);
+                continue;
+            }
+
+            dtNavMeshCreateParams params;
+            memset(&params, 0, sizeof(params));
+            params.verts = pmesh->verts;
+            params.vertCount = pmesh->nverts;
+            params.polys = pmesh->polys;
+            params.polyAreas = pmesh->areas;
+            params.polyFlags = pmesh->flags;
+            params.polyCount = pmesh->npolys;
+            params.nvp = pmesh->nvp;
+            params.detailMeshes = dmesh->meshes;
+            params.detailVerts = dmesh->verts;
+            params.detailVertsCount = dmesh->nverts;
+            params.detailTris = dmesh->tris;
+            params.detailTriCount = dmesh->ntris;
+            params.walkableHeight = settings.agentHeight;
+            params.walkableRadius = settings.agentRadius;
+            params.walkableClimb = settings.agentMaxClimb;
+            rcVcopy(params.bmin, pmesh->bmin);
+            rcVcopy(params.bmax, pmesh->bmax);
+            params.cs = cfg.cs;
+            params.ch = cfg.ch;
+            params.buildBvTree = true;
+            params.tileX = x;
+            params.tileY = y;
+            params.tileLayer = 0;
+
+            unsigned char* navData = nullptr;
+            int navDataSize = 0;
+            if (dtCreateNavMeshData(&params, &navData, &navDataSize)) {
+                result->navMesh->addTile(navData, navDataSize, DT_TILE_FREE_DATA, 0, nullptr);
+                tilesBuilt++;
+            }
+
+            rcFreePolyMesh(pmesh);
+            rcFreePolyMeshDetail(dmesh);
+        }
+
+        if (th > 10 && (y + 1) % (th / 10) == 0)
+            printf("  tile row %d/%d (%d tiles built)\n", y + 1, th, tilesBuilt);
+    }
+
+    printf("Built %d tiles\n", tilesBuilt);
+
+    if (tilesBuilt == 0)
+        throw std::runtime_error("No tiles built - zone has no walkable geometry");
+
+    result->navQuery = dtAllocNavMeshQuery();
+    status = result->navQuery->init(result->navMesh, 65535);
+    if (dtStatusFailed(status))
+        throw std::runtime_error("Failed to init navmesh query");
+
+    return result;
+}
+
+static std::shared_ptr<NavMeshData> build_navmesh(
+    py::array_t<float> verts_arr,
+    py::array_t<int> tris_arr,
+    const NavSettings& settings)
+{
+    auto verts_info = verts_arr.request();
+    auto tris_info = tris_arr.request();
+
+    if (verts_info.ndim != 2 || verts_info.shape[1] != 3)
+        throw std::runtime_error("verts must be Nx3 float array");
+    if (tris_info.ndim != 2 || tris_info.shape[1] != 3)
+        throw std::runtime_error("tris must be Mx3 int array");
+
+    int nverts = (int)verts_info.shape[0];
+    int ntris = (int)tris_info.shape[0];
+    const float* verts = static_cast<const float*>(verts_info.ptr);
+    const int* tris = static_cast<const int*>(tris_info.ptr);
+
+    float bmin[3] = { verts[0], verts[1], verts[2] };
+    float bmax[3] = { verts[0], verts[1], verts[2] };
+    for (int i = 0; i < nverts; i++) {
+        for (int j = 0; j < 3; j++) {
+            float v = verts[i*3+j];
+            if (v < bmin[j]) bmin[j] = v;
+            if (v > bmax[j]) bmax[j] = v;
+        }
+    }
+
+    if (settings.tileSize <= 0) {
+        return build_solo(verts, nverts, tris, ntris, bmin, bmax, settings);
+    }
+
+    // Release GIL for the potentially long tiled build
+    py::gil_scoped_release release;
+    return build_tiled(verts, nverts, tris, ntris, bmin, bmax, settings);
 }
 
 static std::vector<std::tuple<float,float,float>> find_path(
     std::shared_ptr<NavMeshData> mesh,
     std::tuple<float,float,float> start,
     std::tuple<float,float,float> end,
-    int max_polys = 256)
+    int max_polys = 2048)
 {
     if (!mesh || !mesh->navQuery)
         throw std::runtime_error("Invalid navmesh");
@@ -287,16 +504,16 @@ static std::vector<std::tuple<float,float,float>> find_path(
     if (npolys == 0)
         return {};
 
-    const int maxStraight = 256;
-    float straightPath[maxStraight * 3];
-    unsigned char straightPathFlags[maxStraight];
-    dtPolyRef straightPathPolys[maxStraight];
+    const int maxStraight = 2048;
+    std::vector<float> straightPath(maxStraight * 3);
+    std::vector<unsigned char> straightPathFlags(maxStraight);
+    std::vector<dtPolyRef> straightPathPolys(maxStraight);
     int nstraightPath = 0;
 
     mesh->navQuery->findStraightPath(startNearest, endNearest,
                                       polys.data(), npolys,
-                                      straightPath, straightPathFlags,
-                                      straightPathPolys,
+                                      straightPath.data(), straightPathFlags.data(),
+                                      straightPathPolys.data(),
                                       &nstraightPath, maxStraight);
 
     std::vector<std::tuple<float,float,float>> result;
@@ -353,7 +570,8 @@ PYBIND11_MODULE(navmesh, m) {
         .def_readwrite("edge_max_error", &NavSettings::edgeMaxError)
         .def_readwrite("verts_per_poly", &NavSettings::vertsPerPoly)
         .def_readwrite("detail_sample_dist", &NavSettings::detailSampleDist)
-        .def_readwrite("detail_sample_max_error", &NavSettings::detailSampleMaxError);
+        .def_readwrite("detail_sample_max_error", &NavSettings::detailSampleMaxError)
+        .def_readwrite("tile_size", &NavSettings::tileSize);
 
     py::class_<NavMeshData, std::shared_ptr<NavMeshData>>(m, "NavMeshData");
 
@@ -369,5 +587,5 @@ PYBIND11_MODULE(navmesh, m) {
     m.def("find_path", &find_path,
           "Find path between two points",
           py::arg("mesh"), py::arg("start"), py::arg("end"),
-          py::arg("max_polys") = 256);
+          py::arg("max_polys") = 2048);
 }
