@@ -23,6 +23,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 COLLISION_DIR = SCRIPT_DIR.parent / 'mapper' / 'data' / 'collision'
 OBSTACLE_DIR = SCRIPT_DIR.parent / 'mapper' / 'data' / 'obstacles'
+DROPOFF_DIR = SCRIPT_DIR.parent / 'mapper' / 'data' / 'dropoffs'
 TRANSITIONS_FILE = SCRIPT_DIR.parent / 'mapper' / 'data' / 'zone_transitions.json'
 IPC_DIR = Path('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/mapper')
 REQUEST_FILE = IPC_DIR / 'nav_request.json'
@@ -58,7 +59,6 @@ class NavServer:
             self.name_to_zone[name.lower()] = zid
         for zid_str, trans_list in data.get('transitions', {}).items():
             for t in trans_list:
-                t['y'] = -t['y']
                 if 'z' not in t:
                     t['z'] = 0.0
             self.transitions[int(zid_str)] = trans_list
@@ -357,22 +357,20 @@ class NavServer:
 
         verts_raw = verts_raw.astype(np.float32)
 
-        # JSON storage convention (see extract_collision.py) → Recast Y-up.
-        # V = (engine.X, -engine.Z, engine.Y)  ⟹  Recast = (V.x, V.z, -V.y)
-        #                                     = (engine.X, engine.Y, engine.Z)
+        # JSON vertices are in Ashita convention (X=EW, Y=NS, Z=elev, with
+        # Z down-positive). Recast wants its Y axis to be "physical up" for
+        # walkability filtering, so we swap Y↔Z and negate Z: the sole
+        # coordinate transformation in the entire pipeline.
+        # See ashita_to_recast() below — this is the vectorised form.
         verts = np.column_stack([
-            verts_raw[:, 0],
-            verts_raw[:, 2],
-            -verts_raw[:, 1]
+            verts_raw[:, 0],       # Recast.x = Ashita.X
+            -verts_raw[:, 2],      # Recast.y = -Ashita.Z  (physical up)
+            verts_raw[:, 1],       # Recast.z = Ashita.Y
         ]).astype(np.float32)
 
-        # Fix winding order: the -V.y flip above inverts handedness, so the
-        # MZB-native triangle winding is reversed in Recast space. Swap indices
-        # 1 and 2 so walkable triangles have +Y normals.
-        tris_fixed = tris.copy()
-        tris_fixed[:, 1], tris_fixed[:, 2] = tris[:, 2].copy(), tris[:, 1].copy()
-
-        return verts, tris_fixed
+        # The (x, y, z) → (x, -z, y) transform has positive determinant, so
+        # triangle winding is preserved — no index swap needed.
+        return verts, tris
 
 
     # Per-zone NavSettings overrides. Keys match navmesh.NavSettings field
@@ -407,10 +405,58 @@ class NavServer:
             for k, v in overrides.items():
                 setattr(settings, k, v)
                 print(f'  Override {k}={v}')
-            self.meshes[zone_id] = navmesh.build_navmesh(verts, tris, settings)
+            dropoffs = self._load_dropoffs(zone_id)
+            self.meshes[zone_id] = navmesh.build_navmesh(
+                verts, tris, settings,
+                off_mesh_connections=dropoffs,
+            )
             print(f'  Built in {time.time()-t0:.1f}s')
             self._apply_obstacle_blocking(zone_id, self.meshes[zone_id])
         return self.meshes[zone_id]
+
+    def _load_dropoffs(self, zone_id: int):
+        """Read mapper/data/dropoffs/<zone_id>.json and return a list of
+        off-mesh connections in Recast space, suitable for
+        navmesh.build_navmesh(). Applies the overrides block: 'added' entries
+        are appended and 'removed' entries (matched by approximate start XY)
+        are filtered from the auto-detected set."""
+        path = DROPOFF_DIR / f'{zone_id}.json'
+        if not path.exists():
+            return []
+        with open(path) as f:
+            data = json.load(f)
+        auto = data.get('connections', []) or []
+        overrides = data.get('overrides', {}) or {}
+        removed = overrides.get('removed', []) or []
+        added = overrides.get('added', []) or []
+
+        def matches_removed(c):
+            sx, sy = c['start'][0], c['start'][1]
+            for r in removed:
+                rsx, rsy = r['start'][0], r['start'][1]
+                if abs(rsx - sx) < 1.0 and abs(rsy - sy) < 1.0:
+                    return True
+            return False
+
+        merged = [c for c in auto if not matches_removed(c)] + added
+
+        # Convert from runtime Ashita to Recast space.
+        out = []
+        for c in merged:
+            s_game = c['start']; e_game = c['end']
+            s_rc = self.game_to_recast(s_game[0], s_game[1], s_game[2])
+            e_rc = self.game_to_recast(e_game[0], e_game[1], e_game[2])
+            out.append({
+                'start': s_rc,
+                'end': e_rc,
+                'radius': float(c.get('radius', 0.75)),
+                'bidir': bool(c.get('bidir', False)),
+                'area': int(c.get('area', 2)),
+                'flags': int(c.get('flags', 1)),
+            })
+        if out:
+            print(f'  Loaded {len(out)} drop-off connection(s)')
+        return out
 
     def load_obstacles(self, zone_id: int):
         if zone_id not in self.obstacles:
@@ -453,13 +499,14 @@ class NavServer:
             print(f'  Blocked {total} polys for {len(obstacles)} obstacles in zone {zone_id}')
 
     def game_to_recast(self, x, y, z):
-        """Runtime Ashita LocalPosition → Recast. See ~/.claude/skills/ffxi-coordinates
-        for the full coord-system contract. The -z/y shuffle pairs with
-        load_collision's -V.y (which un-flips the storage convention) so
-        terrain and player land in the same Recast space."""
+        """Ashita LocalPosition (X=EW, Y=NS, Z=elev down-positive) → Recast
+        (Y-up with floor normals pointing +Y). Swap Y↔Z and negate Z. This
+        is the ONLY coordinate transformation in the server — everything
+        else uses Ashita directly."""
         return (x, -z, y)
 
     def recast_to_game(self, rx, ry, rz):
+        """Inverse of game_to_recast. Recast (x, y, z) → Ashita (x, z, -y)."""
         return (rx, rz, -ry)
 
     def _path_to_waypoints(self, path_rc, max_segment=1.0):

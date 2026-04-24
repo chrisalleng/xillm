@@ -16,7 +16,7 @@
 
 addon.name    = 'mapper'
 addon.author  = 'xillm'
-addon.version = '.26'
+addon.version = '.27'
 addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
@@ -71,6 +71,10 @@ local state = {
     instances     = nil,
     draw_objects  = false,
     object_range  = 50.0,  -- yalms; only draw instances whose center is within this radius
+    -- Drop-off connection overlay (debug): list of { start, end, radius, bidir, source }
+    dropoffs      = nil,
+    draw_dropoffs = false,
+    dropoff_range = 80.0,  -- yalms; only draw connections whose midpoint is within this radius
     -- Recording mode: captures player positions for offline comparison vs navmesh
     record_active = false,
     record_path   = nil,   -- list of { x, y, z, frame }
@@ -310,6 +314,35 @@ local function load_instances(zone_id)
     if data and data.instances then
         state.instances = data.instances
         msg(string.format('Loaded %d object instances for zone %d.', #data.instances, zone_id))
+    end
+end
+
+local function load_dropoffs(zone_id)
+    state.dropoffs = nil
+    if not zone_id or zone_id == 0 then return end
+    local data = read_json(ipc_path('dropoffs/' .. zone_id .. '.json'))
+    if data and data.connections then
+        -- Apply overrides: strip auto entries that appear in overrides.removed
+        -- (matched on start XY within 1y), append overrides.added.
+        local overrides = data.overrides or {}
+        local removed = overrides.removed or {}
+        local added = overrides.added or {}
+        local function is_removed(c)
+            local sx, sy = c.start[1], c.start[2]
+            for _, r in ipairs(removed) do
+                if math.abs(r.start[1] - sx) < 1.0 and math.abs(r.start[2] - sy) < 1.0 then
+                    return true
+                end
+            end
+            return false
+        end
+        local out = {}
+        for _, c in ipairs(data.connections) do
+            if not is_removed(c) then table.insert(out, c) end
+        end
+        for _, c in ipairs(added) do table.insert(out, c) end
+        state.dropoffs = out
+        msg(string.format('Loaded %d drop-off connections for zone %d.', #out, zone_id))
     end
 end
 
@@ -717,6 +750,106 @@ local function draw_object_boxes(px, py, pz)
     end
 end
 
+local function draw_dropoff_arrows(px, py, pz)
+    if not draw_ok then return end
+    if not state.draw_dropoffs then return end
+    if not state.dropoffs then return end
+
+    local ok, err = pcall(function()
+        local fg = imgui.GetForegroundDrawList()
+        if not fg then return end
+        local dev = d3d8.get_device()
+        if not dev then return end
+        local r1, view = dev:GetTransform(2)
+        local r2, proj = dev:GetTransform(3)
+        if r1 ~= 0 or r2 ~= 0 or not view or not proj then return end
+        local v11, v12, v13, v14 = view._11, view._12, view._13, view._14
+        local v21, v22, v23, v24 = view._21, view._22, view._23, view._24
+        local v31, v32, v33, v34 = view._31, view._32, view._33, view._34
+        local v41, v42, v43, v44 = view._41, view._42, view._43, view._44
+        local p11, p12, p14 = proj._11, proj._12, proj._14
+        local p21, p22, p24 = proj._21, proj._22, proj._24
+        local p31, p32, p34 = proj._31, proj._32, proj._34
+        local p41, p42, p44 = proj._41, proj._42, proj._44
+        if not (v11 and v12 and v13 and v14 and v21 and v22 and v23 and v24
+                and v31 and v32 and v33 and v34 and v41 and v42 and v43 and v44
+                and p11 and p12 and p14 and p21 and p22 and p24
+                and p31 and p32 and p34 and p41 and p42 and p44) then
+            return
+        end
+        local r3, vp = dev:GetViewport()
+        if r3 ~= 0 or not vp or type(vp.Width) ~= 'number' or type(vp.Height) ~= 'number' then
+            return
+        end
+        local vp_w, vp_h, vp_x, vp_y = vp.Width, vp.Height, vp.X or 0, vp.Y or 0
+
+        local function project(gx, gy, gz)
+            local wx, wy, wz = gx, gz, gy
+            local vx = wx*v11 + wy*v21 + wz*v31 + v41
+            local vy = wx*v12 + wy*v22 + wz*v32 + v42
+            local vz = wx*v13 + wy*v23 + wz*v33 + v43
+            local vw = wx*v14 + wy*v24 + wz*v34 + v44
+            local cx = vx*p11 + vy*p21 + vz*p31 + vw*p41
+            local cy = vx*p12 + vy*p22 + vz*p32 + vw*p42
+            local cw = vx*p14 + vy*p24 + vz*p34 + vw*p44
+            if cw <= 0.001 then return nil, nil end
+            return (cx/cw * 0.5 + 0.5) * vp_w + vp_x,
+                   (-cy/cw * 0.5 + 0.5) * vp_h + vp_y
+        end
+
+        -- Green line along the connection, red arrowhead at the landing end.
+        local green = 0xFF00FF00
+        local red   = 0xFF0000FF
+        local range    = state.dropoff_range or 80.0
+        local range_sq = range * range
+        local shown = 0
+        for i = 1, #state.dropoffs do
+            local c = state.dropoffs[i]
+            local s = c.start
+            local e = c["end"]
+            if s and e then
+                local mx = (s[1] + e[1]) * 0.5
+                local my = (s[2] + e[2]) * 0.5
+                local dx, dy = mx - px, my - py
+                if dx*dx + dy*dy <= range_sq then
+                    local sx, sy = project(s[1], s[2], s[3])
+                    local ex, ey = project(e[1], e[2], e[3])
+                    if sx and ex then
+                        fg:AddLine({ sx, sy }, { ex, ey }, green, 2.0)
+                        -- Arrowhead: perpendicular short lines from ex,ey
+                        -- toward sx,sy direction.
+                        local vx, vy = sx - ex, sy - ey
+                        local vl = math.sqrt(vx*vx + vy*vy)
+                        if vl > 4.0 then
+                            local k = 10.0 / vl
+                            local ux, uy = vx * k, vy * k
+                            -- perpendicular
+                            local nxx, nyy = -uy * 0.5, ux * 0.5
+                            fg:AddLine({ ex, ey }, { ex + ux + nxx, ey + uy + nyy }, red, 2.0)
+                            fg:AddLine({ ex, ey }, { ex + ux - nxx, ey + uy - nyy }, red, 2.0)
+                        end
+                        -- Label with drop height at start.
+                        local drop = s[3] - e[3]
+                        if sx then
+                            fg:AddText({ sx + 4, sy - 10 }, green,
+                                       string.format('%.1fy', drop))
+                        end
+                        shown = shown + 1
+                    end
+                end
+            end
+        end
+    end)
+
+    if not ok then
+        if not draw_err_msg or draw_err_msg ~= tostring(err) then
+            draw_err_msg = tostring(err)
+            msg('Drop-off draw error: ' .. draw_err_msg)
+        end
+        draw_ok = false
+    end
+end
+
 -- Project a single world-space point (game coords: X east-west, Y north-south,
 -- Z elevation) into screen space. Returns sx, sy or nil if off-screen/behind camera.
 local function project_point(gx, gy, gz, view, proj, vp)
@@ -746,6 +879,7 @@ ashita.events.register('load', 'mapper_load', function()
         state.zone_id = zone_id
         load_entities(zone_id)
         load_instances(zone_id)
+        load_dropoffs(zone_id)
     end
     msg('Loaded v' .. addon.version .. '. /mapper goto <x> <y> [zone] | goto <zone> | find "name"')
 end)
@@ -848,6 +982,7 @@ ashita.events.register('d3d_present', 'mapper_render', function()
             state.zone_id = zone_id
             load_entities(zone_id)
             load_instances(zone_id)
+            load_dropoffs(zone_id)
         end
     end
 
@@ -945,6 +1080,7 @@ ashita.events.register('d3d_present', 'mapper_render', function()
     -- Draw overlays
     draw_path()
     draw_object_boxes(px, py, pz)
+    draw_dropoff_arrows(px, py, pz)
 end)
 
 ashita.events.register('command', 'mapper_cmd', function(e)
@@ -1205,6 +1341,51 @@ ashita.events.register('command', 'mapper_cmd', function(e)
             msg(string.format('Object boxes: %s (zone=%d, %d instances, range=%.0f yalms)',
                 state.draw_objects and 'ON' or 'OFF',
                 state.zone_id or 0, n, state.object_range or 0))
+        end
+
+    elseif cmd == 'dropoffs' then
+        local sub = args[3] and args[3]:lower()
+        if sub == 'on' then
+            state.draw_dropoffs = true
+        elseif sub == 'off' then
+            state.draw_dropoffs = false
+        elseif sub == 'range' and args[4] then
+            local r = tonumber(args[4])
+            if r and r > 0 then state.dropoff_range = r end
+        elseif sub == 'reload' then
+            load_dropoffs(state.zone_id)
+        elseif sub == 'near' then
+            local px, py, pz = get_player_pos()
+            if not px or not state.dropoffs then
+                msg('No player pos or no drop-offs loaded.')
+                return
+            end
+            local ranked = {}
+            for _, c in ipairs(state.dropoffs) do
+                local mx = (c.start[1] + c["end"][1]) * 0.5
+                local my = (c.start[2] + c["end"][2]) * 0.5
+                local dx, dy = mx - px, my - py
+                table.insert(ranked, {
+                    d = math.sqrt(dx*dx + dy*dy), c = c,
+                })
+            end
+            table.sort(ranked, function(a, b) return a.d < b.d end)
+            msg(string.format('Player (%.1f,%.1f,%.1f) — 5 nearest drop-offs:', px, py, pz))
+            for k = 1, math.min(5, #ranked) do
+                local r = ranked[k]
+                local c = r.c
+                msg(string.format('  %.1fy  start=(%.1f,%.1f,%.1f)  end=(%.1f,%.1f,%.1f)  drop=%.1fy',
+                    r.d, c.start[1], c.start[2], c.start[3],
+                    c["end"][1], c["end"][2], c["end"][3], c.start[3] - c["end"][3]))
+            end
+        else
+            state.draw_dropoffs = not state.draw_dropoffs
+        end
+        if sub ~= 'near' then
+            local n = state.dropoffs and #state.dropoffs or 0
+            msg(string.format('Drop-offs: %s (zone=%d, %d connections, range=%.0f yalms)',
+                state.draw_dropoffs and 'ON' or 'OFF',
+                state.zone_id or 0, n, state.dropoff_range or 0))
         end
 
     elseif cmd == 'refresh' then

@@ -327,15 +327,14 @@ def _parse_grid_mesh(data, visentryoffset, geometryoffset, all_vertices, all_tri
         vy = -(m[1] * lx + m[5] * ly + m[9]  * lz + m[13] * w)
         # vz = tz = m[2]*lx + m[6]*ly + m[10]*lz + m[14] (already computed)
 
-        # JSON vertex storage convention:
-        #   V.x = engine.X        (matches runtime Ashita.X, no flip)
-        #   V.y = -engine.Z       (SIGN-FLIPPED vs runtime Ashita.Y)
-        #   V.z = engine.Y        (matches runtime Ashita.Z = elevation)
-        # The Y flip is cancelled by load_collision (Recast.Z = -V.y) plus
-        # the server's _load_transitions (t['y'] = -t['y']) plus
-        # game_to_recast (Recast.Z = Ashita.y). Net: Recast sees consistent
-        # coords for terrain, transitions, and player.
-        all_vertices.append((vx, -tz, vy))
+        # Emit vertices in Ashita LocalPosition convention:
+        #   Ashita.X = engine.X      → vx
+        #   Ashita.Y = engine.Z      → tz
+        #   Ashita.Z = engine.Y      → -vy   (vy was pre-negated at line 327)
+        # Ashita.Z is DOWN-POSITIVE (higher numeric Z = lower physical
+        # elevation), matching what FFXI's client reports via
+        # player.Movement.LocalPosition.Z and the server console `!pos`.
+        all_vertices.append((vx, tz, -vy))
 
     # Collect triangle indices
     # Each triangle entry is 4 × uint16: [iv2, iv1, iv0, in0] or [iv0, iv1, iv2, in0]
@@ -502,7 +501,12 @@ def parse_mmb(data: bytes):
         pos += 16
         pieces = struct.unpack_from('<i', data, pos)[0]
         pos += 4
-        pos += 24  # bbox: 6 floats
+        # Header bbox: 6 floats. For standard models this is the combined-AABB
+        # of the submesh geometry and we can skip it. For zero-submesh models
+        # (hitwall_*, and other invisible collision boxes) this bbox IS the
+        # collision volume — no submeshes follow.
+        header_bbox = struct.unpack_from('<6f', data, pos)
+        pos += 24
         offset_block_header = struct.unpack_from('<I', data, pos)[0]
         pos += 4
 
@@ -608,6 +612,37 @@ def parse_mmb(data: bytes):
 
                 all_models.append({'vertices': vertices, 'indices': indices})
 
+        # If no submeshes were parsed (hitwall_* invisible colliders), synthesize
+        # a single box submesh from the header bbox. The MMB header stores the
+        # bbox as 6 floats; across assets the field order is (x0, y_a, z0, x1,
+        # y_b, z1) — the two Y fields can appear in either min/max or max/min
+        # order, so we normalize by taking min/max independently.
+        if not all_models and pieces == 0 and header_bbox:
+            b = header_bbox
+            xmn, xmx = (b[0], b[3]) if b[0] <= b[3] else (b[3], b[0])
+            ymn, ymx = (b[1], b[4]) if b[1] <= b[4] else (b[4], b[1])
+            zmn, zmx = (b[2], b[5]) if b[2] <= b[5] else (b[5], b[2])
+            box_verts = [
+                (xmn, ymn, zmn), (xmx, ymn, zmn),
+                (xmn, ymx, zmn), (xmx, ymx, zmn),
+                (xmn, ymn, zmx), (xmx, ymn, zmx),
+                (xmn, ymx, zmx), (xmx, ymx, zmx),
+            ]
+            # 12 triangles forming the 6 faces of the box. The windings here
+            # are consistent outward-facing; the wall-triangle filter in
+            # build_collision_json only keeps vertical faces anyway (the top
+            # and bottom horizontals would be dropped, leaving the 4 side
+            # walls that actually block the player).
+            box_tris = [
+                (0, 1, 2), (1, 3, 2),   # -Z face
+                (5, 4, 6), (5, 6, 7),   # +Z face
+                (4, 0, 6), (0, 2, 6),   # -X face
+                (1, 5, 3), (5, 7, 3),   # +X face
+                (0, 4, 1), (4, 5, 1),   # -Y face
+                (2, 3, 6), (3, 7, 6),   # +Y face
+            ]
+            all_models.append({'vertices': box_verts, 'indices': box_tris})
+
         return {'imgID': img_id, 'models': all_models}
     except (struct.error, IndexError, ValueError):
         return None
@@ -682,16 +717,17 @@ def instance_matrix(inst):
 
 
 def apply_instance_transform(verts, m):
-    """Transform MMB local vertices by the MZB instance matrix, emit in the
-    same storage convention as parse_mzb: (engine.X, -engine.Z, engine.Y).
-    See parse_mzb for why Y is sign-flipped in storage."""
+    """Transform MMB local vertices by the MZB instance matrix, emit in
+    Ashita LocalPosition convention (same as _parse_grid_mesh): X=EW, Y=NS,
+    Z=elevation (down-positive). engine.Y is also down-positive — higher
+    numeric Y is physically lower — so Ashita.Z = engine.Y directly."""
     m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23 = m
     out = []
     for x, y, z in verts:
-        wx = m00 * x + m01 * y + m02 * z + m03
-        wy = m10 * x + m11 * y + m12 * z + m13
-        wz = m20 * x + m21 * y + m22 * z + m23
-        out.append((wx, -wz, -wy))
+        wx = m00 * x + m01 * y + m02 * z + m03   # engine.X = Ashita.X
+        wy = m10 * x + m11 * y + m12 * z + m13   # engine.Y = Ashita.Z
+        wz = m20 * x + m21 * y + m22 * z + m23   # engine.Z = Ashita.Y
+        out.append((wx, wz, wy))                 # (Ashita.X, Ashita.Y, Ashita.Z)
     return out
 
 
@@ -748,6 +784,7 @@ def build_collision_json(zone_id, vertices, triangle_indices, terrain_count=None
     compact_tris  = []
     if terrain_count is None:
         terrain_count = len(triangle_indices)
+    emitted_terrain_count = 0  # count of terrain tris that survived the filter
 
     for tri_i, (i0, i1, i2) in enumerate(triangle_indices):
         # Validate raw indices
@@ -758,14 +795,13 @@ def build_collision_json(zone_id, vertices, triangle_indices, terrain_count=None
         v0, v1, v2 = vertices[i0], vertices[i1], vertices[i2]
 
         if tri_i < terrain_count:
-            # Walkable-only filter. Additionally, ~half of MZB terrain
-            # triangles come out with the WRONG winding: in storage coords
-            # (V.z = -runtime.Z), a correctly-wound walkable floor has
-            # signed normal.z NEGATIVE (because storage flips runtime +Z up).
-            # Triangles with positive storage normal.z are the inverted half;
-            # without fixing them, Recast sees them as ceilings after
-            # load_collision's winding swap and the navmesh ends up with
-            # holes in otherwise-walkable terrain.
+            # Walkable-only filter, plus canonical winding. MZB terrain
+            # triangles come out with mixed winding: about half have their
+            # normal pointing "up" physically (−Ashita.Z direction, since Z
+            # is down-positive) and half point "down". The |snz| ≥ 0.707
+            # check keeps near-horizontal triangles regardless of winding;
+            # then we canonicalize them to snz < 0 so all walkable floors
+            # have consistent orientation by the time Recast sees them.
             snz = _triangle_signed_normal_z(v0, v1, v2)
             if abs(snz) < WALKABLE_NORMAL_Z:
                 continue
@@ -781,6 +817,8 @@ def build_collision_json(zone_id, vertices, triangle_indices, terrain_count=None
                 compact_verts.append(list(key))
             tri_idxs.append(vert_map[key])
         compact_tris.append(tri_idxs)
+        if tri_i < terrain_count:
+            emitted_terrain_count += 1
 
     if compact_verts:
         xs = [v[0] for v in compact_verts]
@@ -799,6 +837,11 @@ def build_collision_json(zone_id, vertices, triangle_indices, terrain_count=None
             "source": "MZB",
             "vertex_count": len(compact_verts),
             "triangle_count": len(compact_tris),
+            # Index boundary between the filtered terrain prefix and the
+            # instance-wall suffix in the emitted `triangles` list. Consumers
+            # that need instance walls (hitwall occlusion check, etc.) must
+            # slice `triangles[emitted_terrain_count:]`.
+            "emitted_terrain_count": emitted_terrain_count,
         },
         "bounds": bounds,
         "vertices":  compact_verts,
@@ -899,7 +942,9 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
                 va = world_verts[a]
                 vb = world_verts[b]
                 vc = world_verts[c]
-                # Face normal Z component (JSON coord Z = elevation-negated)
+                # Face normal Z component in Ashita space (Z = down-positive
+                # elevation). |nz| ≥ 0.707 => near-horizontal (floor or
+                # ceiling); skip to keep only wall-like faces.
                 ex1 = vb[0] - va[0]; ey1 = vb[1] - va[1]; ez1 = vb[2] - va[2]
                 ex2 = vc[0] - va[0]; ey2 = vc[1] - va[1]; ez2 = vc[2] - va[2]
                 nz = ex1 * ey2 - ey1 * ex2
@@ -920,30 +965,30 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
             # Emit a bbox per submesh, built ONLY from verts that participate
             # in emitted wall triangles. This is exactly the geometry Recast
             # sees as collision — skipping the unused "top face" verts that
-            # would otherwise inflate the bbox. See
-            # ~/.claude/skills/ffxi-coordinates for the storage → runtime
-            # Ashita axis flips (negate both Y and Z).
+            # would otherwise inflate the bbox. world_verts are already in
+            # Ashita convention (see apply_instance_transform), so no axis
+            # flip is needed here.
             if wall_vert_idxs:
                 wv_idxs_sorted = sorted(wall_vert_idxs)
                 wv = [world_verts[i] for i in wv_idxs_sorted]
                 xs = [v[0] for v in wv]
-                ys_true = [-v[1] for v in wv]
-                zs_true = [-v[2] for v in wv]
+                ys = [v[1] for v in wv]
+                zs = [v[2] for v in wv]
                 label = inst['name'] if len(model['models']) == 1 else f"{inst['name']}[{sub_idx}]"
                 record = {
                     'name': label,
                     'collision': inst['collision'],
-                    'bbox_min': [round(min(xs), 2), round(min(ys_true), 2), round(min(zs_true), 2)],
-                    'bbox_max': [round(max(xs), 2), round(max(ys_true), 2), round(max(zs_true), 2)],
+                    'bbox_min': [round(min(xs), 2), round(min(ys), 2), round(min(zs), 2)],
+                    'bbox_max': [round(max(xs), 2), round(max(ys), 2), round(max(zs), 2)],
                 }
                 # Optionally emit full wall-triangle mesh for the addon to draw
                 # line outlines. Indexed format: verts[] + tris[[i0,i1,i2]...],
-                # all in runtime Ashita (Y and Z negated from storage).
+                # all in Ashita convention (same as the verts above).
                 if inst['name'] in debug_edge_names:
                     remap = {old: new for new, old in enumerate(wv_idxs_sorted)}
                     record['verts'] = [[round(xs[i], 2),
-                                        round(ys_true[i], 2),
-                                        round(zs_true[i], 2)]
+                                        round(ys[i], 2),
+                                        round(zs[i], 2)]
                                        for i in range(len(wv))]
                     record['tris'] = [[remap[a], remap[b], remap[c]]
                                       for a, b, c in wall_tri_local

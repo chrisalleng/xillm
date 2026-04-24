@@ -53,6 +53,21 @@ struct NavMeshData {
     }
 };
 
+// One-way (or bidirectional) jump/drop-off link between two navmesh points.
+// Coords are in Recast space (Y-up) — same space as verts/tris passed to
+// build_navmesh. Caller converts from game coords via game_to_recast() before
+// passing the list in. radius is the tolerance used by Detour to snap each
+// endpoint to the nearest walkable polygon; 0.75y is a reasonable default.
+struct OffMeshConnection {
+    float start[3];
+    float end[3];
+    float radius;
+    bool bidir;              // false = start → end only (drop-off); true = both ways
+    unsigned char area;      // area type id (RC_WALKABLE_AREA default is 63; use 2 for drop-offs)
+    unsigned short flags;    // polyFlags OR'd onto the link poly (1 = walkable)
+    unsigned int userId;     // optional caller tag
+};
+
 struct NavSettings {
     float cellSize = 0.4f;
     float cellHeight = 0.2f;
@@ -69,6 +84,84 @@ struct NavSettings {
     float detailSampleMaxError = 1.0f;
     int tileSize = 0;  // 0 = solo mesh (no tiling)
 };
+
+// Convert a Python list of dicts to the internal OffMeshConnection vector.
+// Expected shape:
+//   [{"start": (x,y,z), "end": (x,y,z), "radius": 0.75, "bidir": False,
+//     "area": 2, "flags": 1, "user_id": 0}, ...]
+// "area", "flags", "user_id" default to sensible values if absent.
+static std::vector<OffMeshConnection> parseOffMeshConnections(py::object obj) {
+    std::vector<OffMeshConnection> out;
+    if (obj.is_none()) return out;
+    py::list list = obj.cast<py::list>();
+    out.reserve(list.size());
+    for (auto item : list) {
+        py::dict d = item.cast<py::dict>();
+        OffMeshConnection c{};
+        auto startTup = d["start"].cast<py::tuple>();
+        auto endTup = d["end"].cast<py::tuple>();
+        c.start[0] = startTup[0].cast<float>();
+        c.start[1] = startTup[1].cast<float>();
+        c.start[2] = startTup[2].cast<float>();
+        c.end[0] = endTup[0].cast<float>();
+        c.end[1] = endTup[1].cast<float>();
+        c.end[2] = endTup[2].cast<float>();
+        c.radius = d.contains("radius") ? d["radius"].cast<float>() : 0.75f;
+        c.bidir = d.contains("bidir") ? d["bidir"].cast<bool>() : false;
+        c.area = d.contains("area") ? d["area"].cast<unsigned char>() : (unsigned char)2;
+        c.flags = d.contains("flags") ? d["flags"].cast<unsigned short>() : (unsigned short)1;
+        c.userId = d.contains("user_id") ? d["user_id"].cast<unsigned int>() : 0u;
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Flatten a subset of connections into the contiguous arrays that
+// dtNavMeshCreateParams expects.
+struct OffMeshFlat {
+    std::vector<float> verts;       // 6 floats per connection: start_xyz, end_xyz
+    std::vector<float> rad;
+    std::vector<unsigned char> dirs;
+    std::vector<unsigned char> areas;
+    std::vector<unsigned short> flags;
+    std::vector<unsigned int> userIds;
+    int count = 0;
+};
+
+static OffMeshFlat flattenOffMesh(const std::vector<OffMeshConnection>& conns) {
+    OffMeshFlat f;
+    f.count = (int)conns.size();
+    f.verts.reserve(conns.size() * 6);
+    f.rad.reserve(conns.size());
+    f.dirs.reserve(conns.size());
+    f.areas.reserve(conns.size());
+    f.flags.reserve(conns.size());
+    f.userIds.reserve(conns.size());
+    for (const auto& c : conns) {
+        f.verts.push_back(c.start[0]);
+        f.verts.push_back(c.start[1]);
+        f.verts.push_back(c.start[2]);
+        f.verts.push_back(c.end[0]);
+        f.verts.push_back(c.end[1]);
+        f.verts.push_back(c.end[2]);
+        f.rad.push_back(c.radius);
+        f.dirs.push_back(c.bidir ? (unsigned char)DT_OFFMESH_CON_BIDIR : (unsigned char)0);
+        f.areas.push_back(c.area);
+        f.flags.push_back(c.flags);
+        f.userIds.push_back(c.userId);
+    }
+    return f;
+}
+
+static void attachOffMeshToParams(dtNavMeshCreateParams& params, OffMeshFlat& f) {
+    params.offMeshConVerts = f.count ? f.verts.data() : nullptr;
+    params.offMeshConRad = f.count ? f.rad.data() : nullptr;
+    params.offMeshConDir = f.count ? f.dirs.data() : nullptr;
+    params.offMeshConAreas = f.count ? f.areas.data() : nullptr;
+    params.offMeshConFlags = f.count ? f.flags.data() : nullptr;
+    params.offMeshConUserID = f.count ? f.userIds.data() : nullptr;
+    params.offMeshConCount = f.count;
+}
 
 static void fillRcConfig(rcConfig& cfg, const NavSettings& s, int borderSize = 0) {
     memset(&cfg, 0, sizeof(cfg));
@@ -185,7 +278,8 @@ static std::shared_ptr<NavMeshData> build_solo(
     const float* verts, int nverts,
     const int* tris, int ntris,
     const float* bmin, const float* bmax,
-    const NavSettings& settings)
+    const NavSettings& settings,
+    const std::vector<OffMeshConnection>& offMesh)
 {
     rcConfig cfg;
     fillRcConfig(cfg, settings);
@@ -222,6 +316,11 @@ static std::shared_ptr<NavMeshData> build_solo(
     params.cs = cfg.cs;
     params.ch = cfg.ch;
     params.buildBvTree = true;
+
+    // Attach off-mesh connections. In solo mode every connection is part of
+    // the single tile, so we pass the full flattened list.
+    OffMeshFlat omFlat = flattenOffMesh(offMesh);
+    attachOffMeshToParams(params, omFlat);
 
     unsigned char* navData = nullptr;
     int navDataSize = 0;
@@ -261,7 +360,8 @@ static std::shared_ptr<NavMeshData> build_tiled(
     const float* verts, int nverts,
     const int* tris, int ntris,
     const float* bmin, const float* bmax,
-    const NavSettings& settings)
+    const NavSettings& settings,
+    const std::vector<OffMeshConnection>& offMesh)
 {
     const int ts = settings.tileSize;
     const float tcs = ts * settings.cellSize;
@@ -409,6 +509,23 @@ static std::shared_ptr<NavMeshData> build_tiled(
             params.tileY = y;
             params.tileLayer = 0;
 
+            // Collect off-mesh connections whose start point lies in this
+            // tile's non-padded bounds (half-open interval on x/z). Each
+            // connection belongs to exactly one tile.
+            float cellTileXMin = bmin[0] + x * tcs;
+            float cellTileXMax = bmin[0] + (x + 1) * tcs;
+            float cellTileZMin = bmin[2] + y * tcs;
+            float cellTileZMax = bmin[2] + (y + 1) * tcs;
+            std::vector<OffMeshConnection> tileOm;
+            for (const auto& c : offMesh) {
+                if (c.start[0] >= cellTileXMin && c.start[0] < cellTileXMax &&
+                    c.start[2] >= cellTileZMin && c.start[2] < cellTileZMax) {
+                    tileOm.push_back(c);
+                }
+            }
+            OffMeshFlat tileFlat = flattenOffMesh(tileOm);
+            attachOffMeshToParams(params, tileFlat);
+
             unsigned char* navData = nullptr;
             int navDataSize = 0;
             if (dtCreateNavMeshData(&params, &navData, &navDataSize)) {
@@ -440,7 +557,8 @@ static std::shared_ptr<NavMeshData> build_tiled(
 static std::shared_ptr<NavMeshData> build_navmesh(
     py::array_t<float> verts_arr,
     py::array_t<int> tris_arr,
-    const NavSettings& settings)
+    const NavSettings& settings,
+    py::object off_mesh_connections)
 {
     auto verts_info = verts_arr.request();
     auto tris_info = tris_arr.request();
@@ -465,13 +583,18 @@ static std::shared_ptr<NavMeshData> build_navmesh(
         }
     }
 
+    std::vector<OffMeshConnection> offMesh = parseOffMeshConnections(off_mesh_connections);
+    if (!offMesh.empty()) {
+        printf("build_navmesh: %d off-mesh connection(s) supplied\n", (int)offMesh.size());
+    }
+
     if (settings.tileSize <= 0) {
-        return build_solo(verts, nverts, tris, ntris, bmin, bmax, settings);
+        return build_solo(verts, nverts, tris, ntris, bmin, bmax, settings, offMesh);
     }
 
     // Release GIL for the potentially long tiled build
     py::gil_scoped_release release;
-    return build_tiled(verts, nverts, tris, ntris, bmin, bmax, settings);
+    return build_tiled(verts, nverts, tris, ntris, bmin, bmax, settings, offMesh);
 }
 
 static std::vector<std::tuple<float,float,float>> find_path(
@@ -540,6 +663,77 @@ static std::vector<std::tuple<float,float,float>> find_path(
     return result;
 }
 
+// Count polys by type in the built navmesh. Returns (ground_poly_count,
+// offmesh_poly_count). Used for Phase 1 plumbing verification.
+static std::tuple<int,int> count_polys(std::shared_ptr<NavMeshData> mesh) {
+    int ground = 0, offmesh = 0;
+    if (!mesh || !mesh->navMesh) return {0, 0};
+    const dtNavMesh* nav = mesh->navMesh;
+    for (int i = 0; i < nav->getMaxTiles(); i++) {
+        const dtMeshTile* tile = nav->getTile(i);
+        if (!tile || !tile->header) continue;
+        for (int j = 0; j < tile->header->polyCount; j++) {
+            const dtPoly* poly = &tile->polys[j];
+            if (poly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION) offmesh++;
+            else ground++;
+        }
+    }
+    return {ground, offmesh};
+}
+
+// Path query using explicit poly refs for both endpoints, skipping the
+// findNearestPoly snap. Used by the drop-off detector — when the redundancy
+// check must decide whether TWO SPECIFIC polys (the top-of-cliff and the
+// landing) are already connected, findNearestPoly's 100y snap can silently
+// move both endpoints onto a connecting slope poly and return a bogus short
+// path. Providing refs directly avoids that.
+//
+// Returns the navmesh path length in XZ (horizontal yalms). -1.0 if no path.
+static float find_path_length_between_refs(
+    std::shared_ptr<NavMeshData> mesh,
+    uint64_t start_ref,
+    uint64_t end_ref,
+    std::tuple<float,float,float> start_pos,
+    std::tuple<float,float,float> end_pos)
+{
+    if (!mesh || !mesh->navQuery) return -1.0f;
+    if (!start_ref || !end_ref) return -1.0f;
+    float spos[3] = { std::get<0>(start_pos), std::get<1>(start_pos), std::get<2>(start_pos) };
+    float epos[3] = { std::get<0>(end_pos), std::get<1>(end_pos), std::get<2>(end_pos) };
+    dtQueryFilter filter;
+    filter.setIncludeFlags(0xFFFF);
+    filter.setExcludeFlags(0);
+
+    const int MAX_POLYS = 512;
+    dtPolyRef polys[MAX_POLYS];
+    int npolys = 0;
+    dtStatus st = mesh->navQuery->findPath((dtPolyRef)start_ref, (dtPolyRef)end_ref,
+                                           spos, epos, &filter,
+                                           polys, &npolys, MAX_POLYS);
+    if (dtStatusFailed(st) || npolys == 0) return -1.0f;
+    // If the path doesn't actually reach the target poly (can happen when
+    // MAX_POLYS is hit or when start/end are not connected), report "no path".
+    if (polys[npolys - 1] != (dtPolyRef)end_ref) return -1.0f;
+
+    const int MAX_STRAIGHT = 1024;
+    float straightPath[MAX_STRAIGHT * 3];
+    unsigned char straightFlags[MAX_STRAIGHT];
+    dtPolyRef straightPolys[MAX_STRAIGHT];
+    int nstraight = 0;
+    st = mesh->navQuery->findStraightPath(spos, epos, polys, npolys,
+                                          straightPath, straightFlags, straightPolys,
+                                          &nstraight, MAX_STRAIGHT);
+    if (dtStatusFailed(st) || nstraight < 2) return -1.0f;
+
+    float total = 0.0f;
+    for (int i = 1; i < nstraight; i++) {
+        float dx = straightPath[i*3]   - straightPath[(i-1)*3];
+        float dz = straightPath[i*3+2] - straightPath[(i-1)*3+2];
+        total += sqrtf(dx*dx + dz*dz);
+    }
+    return total;
+}
+
 static std::vector<std::tuple<float,float,float>> get_poly_centers(
     std::shared_ptr<NavMeshData> mesh)
 {
@@ -563,6 +757,90 @@ static std::vector<std::tuple<float,float,float>> get_poly_centers(
         }
     }
     return centers;
+}
+
+// Enumerate every border edge of the navmesh (an edge with no neighbor poly).
+// For each, return the two endpoints (in Recast space), the outward XY normal
+// (pointing away from the poly, perpendicular to the edge in the XZ plane),
+// the top-edge midpoint height (y = max of endpoints), and the Detour poly
+// ref the edge belongs to. Used by the drop-off detector.
+//
+// Return shape: list of tuples
+//   (p1x, p1y, p1z, p2x, p2y, p2z, nx, nz, poly_ref)
+static std::vector<std::tuple<float,float,float,float,float,float,float,float,uint64_t>>
+enumerate_border_edges(std::shared_ptr<NavMeshData> mesh)
+{
+    std::vector<std::tuple<float,float,float,float,float,float,float,float,uint64_t>> out;
+    if (!mesh || !mesh->navMesh) return out;
+    const dtNavMesh* nav = mesh->navMesh;
+    for (int ti = 0; ti < nav->getMaxTiles(); ti++) {
+        const dtMeshTile* tile = nav->getTile(ti);
+        if (!tile || !tile->header) continue;
+        dtPolyRef base = nav->getPolyRefBase(tile);
+        for (int pi = 0; pi < tile->header->polyCount; pi++) {
+            const dtPoly* poly = &tile->polys[pi];
+            if (poly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION) continue;
+            dtPolyRef polyRef = base | (dtPolyRef)pi;
+            int vc = (int)poly->vertCount;
+            // Compute XZ centroid for the outward-normal sign test.
+            float cx = 0.0f, cz = 0.0f;
+            for (int k = 0; k < vc; k++) {
+                const float* v = &tile->verts[poly->verts[k] * 3];
+                cx += v[0]; cz += v[2];
+            }
+            cx /= vc; cz /= vc;
+            for (int k = 0; k < vc; k++) {
+                // Border iff neis[k]==0 and no external link either.
+                // (External links (DT_EXT_LINK bit set) are tile-boundary
+                // edges that ARE actually connected to the adjacent tile.)
+                if (poly->neis[k] != 0) continue;
+                int k2 = (k + 1) % vc;
+                const float* va = &tile->verts[poly->verts[k] * 3];
+                const float* vb = &tile->verts[poly->verts[k2] * 3];
+                // Outward normal in XZ plane (rotate edge vector 90°).
+                float ex = vb[0] - va[0];
+                float ez = vb[2] - va[2];
+                // Two candidate perpendiculars: (ez, -ex) or (-ez, ex).
+                // Pick the one pointing AWAY from the centroid.
+                float n1x = ez,  n1z = -ex;
+                float n2x = -ez, n2z = ex;
+                float mx = 0.5f * (va[0] + vb[0]);
+                float mz = 0.5f * (va[2] + vb[2]);
+                float dotCentroid = n1x * (mx - cx) + n1z * (mz - cz);
+                float nx, nz;
+                if (dotCentroid > 0) { nx = n1x; nz = n1z; }
+                else                 { nx = n2x; nz = n2z; }
+                float nlen = sqrtf(nx * nx + nz * nz);
+                if (nlen > 1e-6f) { nx /= nlen; nz /= nlen; }
+                out.emplace_back(va[0], va[1], va[2],
+                                 vb[0], vb[1], vb[2],
+                                 nx, nz, (uint64_t)polyRef);
+            }
+        }
+    }
+    return out;
+}
+
+// Wrapper around dtNavMeshQuery::findNearestPoly that returns the nearest
+// walkable poly ref and its closest-point on the mesh for a given search
+// center and AABB half-extents (sx, sy, sz). Returns (poly_ref, x, y, z) or
+// (0, nan, nan, nan) if nothing found.
+static std::tuple<uint64_t,float,float,float>
+find_nearest_poly(std::shared_ptr<NavMeshData> mesh,
+                  std::tuple<float,float,float> center,
+                  std::tuple<float,float,float> extents)
+{
+    if (!mesh || !mesh->navQuery)
+        throw std::runtime_error("Invalid navmesh");
+    float c[3] = { std::get<0>(center), std::get<1>(center), std::get<2>(center) };
+    float e[3] = { std::get<0>(extents), std::get<1>(extents), std::get<2>(extents) };
+    dtQueryFilter filter;
+    filter.setIncludeFlags(0xFFFF);
+    filter.setExcludeFlags(0);
+    dtPolyRef ref = 0;
+    float nearest[3] = { NAN, NAN, NAN };
+    mesh->navQuery->findNearestPoly(c, e, &filter, &ref, nearest);
+    return { (uint64_t)ref, nearest[0], nearest[1], nearest[2] };
 }
 
 static int mark_polys_blocked(
@@ -908,13 +1186,38 @@ PYBIND11_MODULE(navmesh, m) {
     py::class_<NavMeshData, std::shared_ptr<NavMeshData>>(m, "NavMeshData");
 
     m.def("build_navmesh", &build_navmesh,
-          "Build navmesh from vertices and triangles",
+          "Build navmesh from vertices and triangles. off_mesh_connections is "
+          "an optional list of dicts: [{'start': (x,y,z), 'end': (x,y,z), "
+          "'radius': 0.75, 'bidir': False, 'area': 2, 'flags': 1, 'user_id': 0}]. "
+          "Coords are in Recast space (Y-up, same as verts).",
           py::arg("verts"), py::arg("tris"),
-          py::arg("settings") = NavSettings());
+          py::arg("settings") = NavSettings(),
+          py::arg("off_mesh_connections") = py::none());
 
     m.def("get_poly_centers", &get_poly_centers,
           "Get center positions of all navmesh polygons",
           py::arg("mesh"));
+
+    m.def("count_polys", &count_polys,
+          "Returns (ground_polys, offmesh_polys) in the built navmesh.",
+          py::arg("mesh"));
+
+    m.def("enumerate_border_edges", &enumerate_border_edges,
+          "List every border edge (edge with no neighbor poly) of the navmesh. "
+          "Each entry: (p1x, p1y, p1z, p2x, p2y, p2z, nx, nz, poly_ref) in "
+          "Recast space; (nx, nz) is the unit outward XY normal.",
+          py::arg("mesh"));
+
+    m.def("find_path_length_between_refs", &find_path_length_between_refs,
+          "Path length (horizontal, yalms) between two explicit polygon refs. "
+          "Returns -1.0 if no path. Avoids the findNearestPoly snap.",
+          py::arg("mesh"), py::arg("start_ref"), py::arg("end_ref"),
+          py::arg("start_pos"), py::arg("end_pos"));
+
+    m.def("find_nearest_poly", &find_nearest_poly,
+          "Find the nearest walkable poly within an AABB around center. "
+          "Returns (poly_ref, x, y, z); poly_ref==0 if none found.",
+          py::arg("mesh"), py::arg("center"), py::arg("extents"));
 
     m.def("find_path", &find_path,
           "Find path between two points",
