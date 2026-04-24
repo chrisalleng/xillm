@@ -16,7 +16,7 @@
 
 addon.name    = 'mapper'
 addon.author  = 'xillm'
-addon.version = '.10'
+addon.version = '.22'
 addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
@@ -36,9 +36,6 @@ local STUCK_CHECK_FRAMES = 120
 local STUCK_MIN_PROGRESS = 0.5
 local STATUS_INTERVAL    = 30
 
-local BACKTRACK_FRAMES   = 25
-local SIDESTEP_FRAMES    = 40
-local RESUME_FRAMES      = 25
 local ENTITY_SCAN_INTERVAL = 90
 local ENTITY_SAVE_INTERVAL = 1800
 
@@ -54,13 +51,13 @@ local state = {
     wp_idx      = 1,
     moving      = false,
     goal        = nil,
+    -- Preview mode: load waypoints without moving the character
+    preview_mode = false,
     -- Stuck detection
     check_x     = 0,
     check_y     = 0,
     check_frame = 0,
     stuck_count = 0,
-    -- Avoidance maneuver
-    avoidance   = nil,
     -- Request/response handshake
     pending_seq = nil,   -- sequence number of request awaiting response
     last_seq    = 0,     -- monotonic counter
@@ -70,6 +67,16 @@ local state = {
     search      = nil,   -- { target_name, waypoints, wp_idx }
     -- Cross-zone route
     route       = nil,   -- { segments, seg_idx, target_zone, target_name }
+    -- Object instance overlay (debug): list of { name, collision, bbox_min, bbox_max }
+    instances     = nil,
+    draw_objects  = false,
+    object_range  = 50.0,  -- yalms; only draw instances whose center is within this radius
+    -- Recording mode: captures player positions for offline comparison vs navmesh
+    record_active = false,
+    record_path   = nil,   -- list of { x, y, z, frame }
+    record_zone   = nil,
+    record_last_x = nil,
+    record_last_y = nil,
 }
 
 -------------------------------------------------------------------------------
@@ -130,7 +137,6 @@ local function cancel_all()
     state.goal = nil
     state.pending_seq = nil
     state.stuck_count = 0
-    state.avoidance = nil
     state.search = nil
     state.route = nil
 end
@@ -208,6 +214,16 @@ local function load_entities(zone_id)
     local n = entities.count(zone_id)
     if n > 0 then
         msg(string.format('Loaded %d entity records for zone %d.', n, zone_id))
+    end
+end
+
+local function load_instances(zone_id)
+    state.instances = nil
+    if not zone_id or zone_id == 0 then return end
+    local data = read_json(ipc_path('instances/' .. zone_id .. '.json'))
+    if data and data.instances then
+        state.instances = data.instances
+        msg(string.format('Loaded %d object instances for zone %d.', #data.instances, zone_id))
     end
 end
 
@@ -305,14 +321,17 @@ local function check_path_response()
     if (data.status == 'ok' or data.status == 'partial') and data.waypoints and #data.waypoints > 0 then
         state.waypoints = data.waypoints
         state.wp_idx = 1
-        state.moving = true
+        local preview = state.preview_mode
+        state.preview_mode = false
+        state.moving = not preview
         state.stuck_count = 0
         state.check_frame = state.frame
+        local tag = preview and 'Preview' or 'Path received'
         if data.status == 'partial' then
-            msg(string.format('Partial path: %d waypoints (ends %.0f yalms from target).',
-                #data.waypoints, data.end_dist or 0))
+            msg(string.format('%s (partial): %d waypoints (ends %.0f yalms from target).',
+                tag, #data.waypoints, data.end_dist or 0))
         else
-            msg(string.format('Path received: %d waypoints.', #data.waypoints))
+            msg(string.format('%s: %d waypoints.', tag, #data.waypoints))
         end
     elseif data.status == 'partial' and state.search and (data.end_dist or 0) > 30 then
         msg(string.format('Search point unreachable (%.0fy short) - skipping.', data.end_dist or 0))
@@ -332,64 +351,8 @@ local function check_path_response()
 end
 
 -------------------------------------------------------------------------------
--- Obstacle avoidance
+-- Obstacle avoidance (disabled - pauses on stuck for debugging)
 -------------------------------------------------------------------------------
-
-local function start_avoidance(px, py)
-    local wp = state.waypoints and state.waypoints[state.wp_idx]
-    if not wp then return false end
-
-    local dx = wp[1] - px
-    local dy = wp[2] - py
-    local len = math.sqrt(dx * dx + dy * dy)
-    if len < 0.01 then return false end
-    dx, dy = dx / len, dy / len
-
-    local side = (state.stuck_count % 2 == 0) and 1 or -1
-    state.avoidance = {
-        phase = 'backtrack',
-        frame_start = state.frame,
-        fwd_x = dx,
-        fwd_y = dy,
-        perp_x = -dy * side,
-        perp_y = dx * side,
-    }
-    msg(string.format('Obstacle detected - maneuvering (attempt %d)...', state.stuck_count))
-    return true
-end
-
-local function avoidance_tick(px, py)
-    local av = state.avoidance
-    if not av then return end
-
-    local elapsed = state.frame - av.frame_start
-
-    if av.phase == 'backtrack' then
-        if elapsed < BACKTRACK_FRAMES then
-            drive_toward(px, py, px - av.fwd_x * 5, py - av.fwd_y * 5)
-        else
-            av.phase = 'sidestep'
-            av.frame_start = state.frame
-        end
-    elseif av.phase == 'sidestep' then
-        if elapsed < SIDESTEP_FRAMES then
-            drive_toward(px, py, px + av.perp_x * 5, py + av.perp_y * 5)
-        else
-            av.phase = 'resume'
-            av.frame_start = state.frame
-        end
-    elseif av.phase == 'resume' then
-        if elapsed < RESUME_FRAMES then
-            drive_toward(px, py, px + av.fwd_x * 5, py + av.fwd_y * 5)
-        else
-            state.avoidance = nil
-            state.check_frame = state.frame
-            state.check_x = px
-            state.check_y = py
-            state.check_wp_idx = state.wp_idx
-        end
-    end
-end
 
 -------------------------------------------------------------------------------
 -- Movement tick
@@ -397,11 +360,6 @@ end
 
 local function movement_tick(px, py, pz)
     if not state.moving or not state.waypoints then return end
-
-    if state.avoidance then
-        avoidance_tick(px, py)
-        return
-    end
 
     local wp = state.waypoints[state.wp_idx]
     if not wp then
@@ -437,7 +395,7 @@ local function movement_tick(px, py, pz)
 
     drive_toward(px, py, wx, wy)
 
-    -- Stuck detection: no waypoint advancement for STUCK_CHECK_FRAMES
+    -- Stuck detection: pause and report position for debugging
     if state.frame - state.check_frame >= STUCK_CHECK_FRAMES then
         local wp_progress = state.wp_idx - (state.check_wp_idx or state.wp_idx)
         local pos_progress = dist2d(px, py, state.check_x, state.check_y)
@@ -447,36 +405,9 @@ local function movement_tick(px, py, pz)
         state.check_frame = state.frame
 
         if wp_progress < 3 and pos_progress < 3.0 then
-            state.stuck_count = state.stuck_count + 1
-
-            if state.search and state.stuck_count >= 2 then
-                msg('Search point stuck - skipping.')
-                stop_movement()
-                state.stuck_count = 0
-                state.goal = nil
-                return
-            end
-
-            if state.stuck_count >= 6 then
-                msg('Cannot reach destination after multiple retries.')
-                cancel_all()
-                return
-            end
-
-            if state.stuck_count % 2 == 1 then
-                msg(string.format('Stuck (attempt %d) at wp %d/%d - trying avoidance.',
-                    state.stuck_count, state.wp_idx, #state.waypoints))
-                start_avoidance(px, py)
-            else
-                msg(string.format('Stuck (attempt %d) at wp %d/%d - reporting obstacle, repathing.',
-                    state.stuck_count, state.wp_idx, #state.waypoints))
-                local obstacle = { px, py, pz }
-                local goal = state.goal
-                stop_movement()
-                if goal then
-                    request_path(px, py, pz, goal.x, goal.y, obstacle)
-                end
-            end
+            msg(string.format('Stuck at (%.1f, %.1f) elev=%.1f wp %d/%d - pausing.',
+                px, py, pz, state.wp_idx, #state.waypoints))
+            stop_movement()
         end
     end
 end
@@ -495,7 +426,7 @@ local function draw_path()
         local fg = imgui.GetForegroundDrawList()
         if not fg then error('no draw list') end
 
-        if not state.moving or not state.waypoints then return end
+        if not state.waypoints then return end
 
         local dev = d3d8.get_device()
         if not dev then error('no device') end
@@ -561,6 +492,139 @@ local function draw_path()
     end
 end
 
+local function draw_object_boxes(px, py, pz)
+    if not draw_ok then return end
+    if not state.draw_objects then return end
+    if not state.instances then return end
+
+    local ok, err = pcall(function()
+        local fg = imgui.GetForegroundDrawList()
+        if not fg then error('no draw list') end
+        local dev = d3d8.get_device()
+        if not dev then error('no device') end
+        local r1, view = dev:GetTransform(2)
+        local r2, proj = dev:GetTransform(3)
+        if r1 ~= 0 or r2 ~= 0 or not view or not proj then
+            error(string.format('transform fail v=%d p=%d', r1 or -1, r2 or -1))
+        end
+        local r3, vp = dev:GetViewport()
+        if r3 ~= 0 or not vp then error('viewport fail') end
+
+        local function project(gx, gy, gz)
+            local wx, wy, wz = gx, gz, gy
+            local vx = wx*view._11 + wy*view._21 + wz*view._31 + view._41
+            local vy = wx*view._12 + wy*view._22 + wz*view._32 + view._42
+            local vz = wx*view._13 + wy*view._23 + wz*view._33 + view._43
+            local vw = wx*view._14 + wy*view._24 + wz*view._34 + view._44
+            local cx = vx*proj._11 + vy*proj._21 + vz*proj._31 + vw*proj._41
+            local cy = vx*proj._12 + vy*proj._22 + vz*proj._32 + vw*proj._42
+            local cw = vx*proj._14 + vy*proj._24 + vz*proj._34 + vw*proj._44
+            if cw <= 0.001 then return nil, nil end
+            return (cx/cw * 0.5 + 0.5) * vp.Width + vp.X,
+                   (-cy/cw * 0.5 + 0.5) * vp.Height + vp.Y
+        end
+
+        local yellow = 0xFF00FFFF
+        local cyan   = 0xFFFFFF00
+        local range  = state.object_range or 50.0
+        local range_sq = range * range
+
+        for i = 1, #state.instances do
+            local inst = state.instances[i]
+            local mn, mx = inst.bbox_min, inst.bbox_max
+            local cx = (mn[1] + mx[1]) * 0.5
+            local cy = (mn[2] + mx[2]) * 0.5
+            local dx, dy = cx - px, cy - py
+            if dx*dx + dy*dy <= range_sq then
+                local col = (inst.collision == 0) and yellow or cyan
+
+                if inst.tris and inst.verts then
+                    -- Mesh outline mode: draw each wall triangle's edges so
+                    -- the user sees the actual collision shape (not an AABB).
+                    local verts = inst.verts
+                    local tris = inst.tris
+                    local ps = {}
+                    for k = 1, #verts do
+                        local v = verts[k]
+                        ps[k] = { project(v[1], v[2], v[3]) }
+                    end
+                    for t = 1, #tris do
+                        local tri = tris[t]
+                        local a = ps[tri[1] + 1]
+                        local b = ps[tri[2] + 1]
+                        local c = ps[tri[3] + 1]
+                        if a and b and c then
+                            if a[1] and b[1] then fg:AddLine({ a[1], a[2] }, { b[1], b[2] }, col, 1.0) end
+                            if b[1] and c[1] then fg:AddLine({ b[1], b[2] }, { c[1], c[2] }, col, 1.0) end
+                            if c[1] and a[1] then fg:AddLine({ c[1], c[2] }, { a[1], a[2] }, col, 1.0) end
+                        end
+                    end
+                    -- Label at the first projected vertex
+                    local lp = ps[1]
+                    if lp and lp[1] and lp[2] then
+                        local label = string.format('%s (%.0f,%.0f,%.0f)',
+                            inst.name, cx, cy, (mn[3]+mx[3])*0.5)
+                        fg:AddText({ lp[1] + 2, lp[2] - 12 }, col, label)
+                    end
+                else
+                    -- Fallback: AABB wireframe + label for instances without mesh detail.
+                    local x0, y0, z0 = mn[1], mn[2], mn[3]
+                    local x1, y1, z1 = mx[1], mx[2], mx[3]
+                    local c = {
+                        { x0, y0, z0 }, { x1, y0, z0 }, { x1, y1, z0 }, { x0, y1, z0 },
+                        { x0, y0, z1 }, { x1, y0, z1 }, { x1, y1, z1 }, { x0, y1, z1 },
+                    }
+                    local s = {}
+                    for k = 1, 8 do
+                        s[k] = { project(c[k][1], c[k][2], c[k][3]) }
+                    end
+                    local edges = {
+                        {1,2},{2,3},{3,4},{4,1},
+                        {5,6},{6,7},{7,8},{8,5},
+                        {1,5},{2,6},{3,7},{4,8},
+                    }
+                    for _, e in ipairs(edges) do
+                        local a, b = s[e[1]], s[e[2]]
+                        if a[1] and b[1] then
+                            fg:AddLine({ a[1], a[2] }, { b[1], b[2] }, col, 1.0)
+                        end
+                    end
+                    local lp = s[8]
+                    if lp and lp[1] and lp[2] then
+                        local label = string.format('%s (%.0f,%.0f,%.0f)',
+                            inst.name, cx, cy, (mn[3]+mx[3])*0.5)
+                        fg:AddText({ lp[1] + 2, lp[2] - 12 }, col, label)
+                    end
+                end
+            end
+        end
+    end)
+
+    if not ok then
+        if not draw_err_msg or draw_err_msg ~= tostring(err) then
+            draw_err_msg = tostring(err)
+            msg('Object draw error: ' .. draw_err_msg)
+        end
+        draw_ok = false
+    end
+end
+
+-- Project a single world-space point (game coords: X east-west, Y north-south,
+-- Z elevation) into screen space. Returns sx, sy or nil if off-screen/behind camera.
+local function project_point(gx, gy, gz, view, proj, vp)
+    local wx, wy, wz = gx, gz, gy
+    local vx = wx*view._11 + wy*view._21 + wz*view._31 + view._41
+    local vy = wx*view._12 + wy*view._22 + wz*view._32 + view._42
+    local vz = wx*view._13 + wy*view._23 + wz*view._33 + view._43
+    local vw = wx*view._14 + wy*view._24 + wz*view._34 + view._44
+    local cx = vx*proj._11 + vy*proj._21 + vz*proj._31 + vw*proj._41
+    local cy = vx*proj._12 + vy*proj._22 + vz*proj._32 + vw*proj._42
+    local cw = vx*proj._14 + vy*proj._24 + vz*proj._34 + vw*proj._44
+    if cw <= 0.001 then return nil, nil end
+    return (cx/cw * 0.5 + 0.5) * vp.Width + vp.X,
+           (-cy/cw * 0.5 + 0.5) * vp.Height + vp.Y
+end
+
 -------------------------------------------------------------------------------
 -- Events
 -------------------------------------------------------------------------------
@@ -573,6 +637,7 @@ ashita.events.register('load', 'mapper_load', function()
     if zone_id and zone_id ~= 0 then
         state.zone_id = zone_id
         load_entities(zone_id)
+        load_instances(zone_id)
     end
     msg('Loaded v' .. addon.version .. '. /mapper goto <x> <y> [zone] | goto <zone> | find "name"')
 end)
@@ -618,8 +683,7 @@ ashita.events.register('d3d_present', 'mapper_render', function()
                 stop_movement()
                 state.pending_seq = nil
                 state.stuck_count = 0
-                state.avoidance = nil
-                state.search = nil
+                            state.search = nil
                 state.goal = nil
 
                 local r = state.route
@@ -675,6 +739,7 @@ ashita.events.register('d3d_present', 'mapper_render', function()
 
             state.zone_id = zone_id
             load_entities(zone_id)
+            load_instances(zone_id)
         end
     end
 
@@ -759,8 +824,19 @@ ashita.events.register('d3d_present', 'mapper_render', function()
         })
     end
 
-    -- Draw path overlay
+    -- Recording: append sample when player moves > 0.3y
+    if state.record_active and state.zone_id == state.record_zone then
+        local lx, ly = state.record_last_x, state.record_last_y
+        if lx == nil or ((px-lx)*(px-lx) + (py-ly)*(py-ly)) > 0.09 then
+            state.record_path[#state.record_path + 1] = { px, py, pz, state.frame }
+            state.record_last_x = px
+            state.record_last_y = py
+        end
+    end
+
+    -- Draw overlays
     draw_path()
+    draw_object_boxes(px, py, pz)
 end)
 
 ashita.events.register('command', 'mapper_cmd', function(e)
@@ -917,6 +993,159 @@ ashita.events.register('command', 'mapper_cmd', function(e)
         cancel_all()
         msg('Stopped.')
 
+    elseif cmd == 'preview' then
+        -- Same syntax as `goto` but loads waypoints for visualization only
+        -- (does not move the character).
+        if #args < 3 then
+            msg('Usage: /mapper preview <x> <y> [zone] | preview <zone> | preview "entity"')
+            return
+        end
+        local tx = tonumber(args[3])
+        local ty = tonumber(args[4])
+        local px, py, pz = get_player_pos()
+        if not px then
+            msg('Cannot get player position.')
+            return
+        end
+        state.preview_mode = true
+        if tx and ty then
+            if #args >= 5 then
+                local zone_name = table.concat(args, ' ', 5)
+                zone_name = zone_name:gsub('\xEF.', '')
+                local zone_id = resolve_zone_name(zone_name)
+                if not zone_id then
+                    msg(string.format('Unknown zone: %s', zone_name))
+                    state.preview_mode = false
+                    return
+                end
+                if zone_id == state.zone_id then
+                    cancel_all()
+                    state.preview_mode = true
+                    request_path(px, py, pz, tx, ty)
+                else
+                    msg('Cross-zone preview not supported; previewing within current zone only.')
+                    state.preview_mode = false
+                    return
+                end
+            else
+                cancel_all()
+                state.preview_mode = true
+                request_path(px, py, pz, tx, ty)
+            end
+        else
+            local name = parse_name(args, 3)
+            if not name or name == '' then
+                msg('Usage: /mapper preview <x> <y> [zone] | preview "entity"')
+                state.preview_mode = false
+                return
+            end
+            local match = entities.find_by_name(state.zone_id, name, px, py)
+            if match then
+                cancel_all()
+                state.preview_mode = true
+                request_path(px, py, pz, match.x, match.y)
+                msg(string.format('Previewing path to %s at (%.0f, %.0f).', match.name, match.x, match.y))
+            else
+                msg(string.format('No entity "%s" in current zone.', name))
+                state.preview_mode = false
+            end
+        end
+
+    elseif cmd == 'objects' then
+        local sub = args[3] and args[3]:lower()
+        if sub == 'on' then
+            state.draw_objects = true
+        elseif sub == 'off' then
+            state.draw_objects = false
+        elseif sub == 'range' and args[4] then
+            local r = tonumber(args[4])
+            if r and r > 0 then state.object_range = r end
+        elseif sub == 'reload' then
+            load_instances(state.zone_id)
+        elseif sub == 'near' then
+            local px, py, pz = get_player_pos()
+            if not px or not state.instances then
+                msg('No player pos or no instances loaded.')
+                return
+            end
+            local ranked = {}
+            for _, i in ipairs(state.instances) do
+                local cx = (i.bbox_min[1] + i.bbox_max[1]) * 0.5
+                local cy = (i.bbox_min[2] + i.bbox_max[2]) * 0.5
+                local cz = (i.bbox_min[3] + i.bbox_max[3]) * 0.5
+                local dx, dy = cx - px, cy - py
+                table.insert(ranked, {
+                    d = math.sqrt(dx*dx + dy*dy),
+                    name = i.name, cx = cx, cy = cy, cz = cz,
+                    col = i.collision,
+                    mn = i.bbox_min, mx = i.bbox_max,
+                })
+            end
+            table.sort(ranked, function(a, b) return a.d < b.d end)
+            msg(string.format('Player (%.1f,%.1f,%.1f) — 5 nearest:', px, py, pz))
+            for k = 1, math.min(5, #ranked) do
+                local r = ranked[k]
+                msg(string.format('  %.1fy  %s  col=%d  center=(%.1f,%.1f,%.1f)  bbox=(%.0f..%.0f, %.0f..%.0f, %.0f..%.0f)',
+                    r.d, r.name, r.col, r.cx, r.cy, r.cz,
+                    r.mn[1], r.mx[1], r.mn[2], r.mx[2], r.mn[3], r.mx[3]))
+            end
+        else
+            state.draw_objects = not state.draw_objects
+        end
+        if sub ~= 'near' then
+            local n = state.instances and #state.instances or 0
+            msg(string.format('Object boxes: %s (zone=%d, %d instances, range=%.0f yalms)',
+                state.draw_objects and 'ON' or 'OFF',
+                state.zone_id or 0, n, state.object_range or 0))
+        end
+
+    elseif cmd == 'refresh' then
+        local all = args[3] and args[3]:lower() == 'all'
+        state.last_seq = state.last_seq + 1
+        local req = {
+            action  = 'clear_cache',
+            seq     = state.last_seq,
+        }
+        if not all then
+            req.zone_id = state.zone_id
+        end
+        write_json(ipc_path('nav_request.json'), req)
+        if all then
+            msg('Requesting server mesh refresh for ALL zones...')
+        else
+            msg(string.format('Requesting server mesh refresh for zone %d (use "refresh all" for all zones)...',
+                state.zone_id or 0))
+        end
+
+    elseif cmd == 'record' then
+        local sub = args[3] and args[3]:lower()
+        if sub == 'start' then
+            state.record_active = true
+            state.record_path = {}
+            state.record_zone = state.zone_id
+            state.record_last_x = nil
+            state.record_last_y = nil
+            msg(string.format('Recording started for zone %d. Walk the route, then /mapper record stop.',
+                state.zone_id or 0))
+        elseif sub == 'stop' then
+            if state.record_path and #state.record_path > 0 then
+                write_json(ipc_path('nav_record.json'), {
+                    zone_id = state.record_zone,
+                    points = state.record_path,
+                })
+                msg(string.format('Recording stopped: %d samples written to nav_record.json (zone %d).',
+                    #state.record_path, state.record_zone or 0))
+            else
+                msg('Recording stopped: no samples captured.')
+            end
+            state.record_active = false
+        else
+            local n = state.record_path and #state.record_path or 0
+            msg(string.format('Recording: %s (%d samples, zone %d). Subcommands: start | stop',
+                state.record_active and 'ACTIVE' or 'off',
+                n, state.record_zone or 0))
+        end
+
     elseif cmd == 'pos' then
         local px, py, pz = get_player_pos()
         if px then
@@ -949,6 +1178,6 @@ ashita.events.register('command', 'mapper_cmd', function(e)
             entities.count(state.zone_id)))
 
     else
-        msg('Commands: goto <x> <y> [zone] | goto <zone> | goto "name" | find "name" | stop | pos | status')
+        msg('Commands: goto <x> <y> [zone] | goto <zone> | goto "name" | find "name" | stop | pos | status | objects [on|off|range <y>|reload]')
     end
 end)

@@ -332,7 +332,7 @@ class NavServer:
         verts_raw = np.array(data['vertices'], dtype=np.float64)
         tris = np.array(data['triangles'], dtype=np.int32)
 
-        valid = np.all(np.abs(verts_raw) < 100000, axis=1)
+        valid = np.all(np.abs(verts_raw) < 1500, axis=1)
         if not np.all(valid):
             bad = int(np.sum(~valid))
             print(f'  Warning: filtering {bad}/{len(verts_raw)} corrupt vertices in zone {zone_id}')
@@ -357,18 +357,23 @@ class NavServer:
 
         verts_raw = verts_raw.astype(np.float32)
 
-        # MZB → Recast (Y-up): (MZB.x, MZB.z, -MZB.y)
+        # JSON storage convention (see extract_collision.py) → Recast Y-up.
+        # V = (engine.X, -engine.Z, engine.Y)  ⟹  Recast = (V.x, V.z, -V.y)
+        #                                     = (engine.X, engine.Y, engine.Z)
         verts = np.column_stack([
             verts_raw[:, 0],
             verts_raw[:, 2],
             -verts_raw[:, 1]
         ]).astype(np.float32)
 
-        # Fix winding order
+        # Fix winding order: the -V.y flip above inverts handedness, so the
+        # MZB-native triangle winding is reversed in Recast space. Swap indices
+        # 1 and 2 so walkable triangles have +Y normals.
         tris_fixed = tris.copy()
         tris_fixed[:, 1], tris_fixed[:, 2] = tris[:, 2].copy(), tris[:, 1].copy()
 
         return verts, tris_fixed
+
 
     def get_mesh(self, zone_id: int):
         if zone_id not in self.meshes:
@@ -430,11 +435,13 @@ class NavServer:
             print(f'  Blocked {total} polys for {len(obstacles)} obstacles in zone {zone_id}')
 
     def game_to_recast(self, x, y, z):
-        """Ashita coords → Recast coords. Ashita.Y=-MZB.y, Ashita.Z=-MZB.z."""
+        """Runtime Ashita LocalPosition → Recast. See ~/.claude/skills/ffxi-coordinates
+        for the full coord-system contract. The -z/y shuffle pairs with
+        load_collision's -V.y (which un-flips the storage convention) so
+        terrain and player land in the same Recast space."""
         return (x, -z, y)
 
     def recast_to_game(self, rx, ry, rz):
-        """Recast coords → Ashita coords."""
         return (rx, rz, -ry)
 
     def _path_to_waypoints(self, path_rc, max_segment=1.0):
@@ -504,6 +511,7 @@ class NavServer:
         path_rc = navmesh.find_path(mesh, start_rc, end_rc)
         best = self._path_to_waypoints(path_rc)
         best_dist = self._end_dist_2d(best, tx, ty)
+        initial_raw_len = len(path_rc)
 
         if best_dist > 5.0:
             centers = navmesh.get_poly_centers(mesh)
@@ -534,6 +542,26 @@ class NavServer:
             dy = last[1] - end_game[1]
             if (dx*dx + dy*dy) ** 0.5 < 15.0:
                 best.append([round(end_game[0], 2), round(end_game[1], 2), last[2]])
+
+        # Diagnostics when a path call produces nothing or stops far short.
+        # Exposes whether Recast returned empty, whether the target poly
+        # exists, how many polys live near the endpoints, and whether
+        # exclude_flags was the culprit.
+        if not best or self._end_dist_2d(best, tx, ty) > 10.0:
+            try:
+                path_nofilter = navmesh.find_path(mesh, start_rc, end_rc, exclude_flags=0)
+            except Exception:
+                path_nofilter = []
+            import numpy as _np
+            centers = _np.array(navmesh.get_poly_centers(mesh))
+            near_start = 0
+            near_end = 0
+            if len(centers) > 0:
+                near_start = int(((centers[:,0]-start_rc[0])**2 + (centers[:,2]-start_rc[2])**2 < 25).sum())
+                near_end = int(((centers[:,0]-end_rc[0])**2 + (centers[:,2]-end_rc[2])**2 < 25).sum())
+            print(f'  [find_path diag] raw_len={initial_raw_len}  with_flags0_len={len(path_nofilter)}  '
+                  f'polys_within_5y_of_start={near_start}  polys_within_5y_of_end={near_end}  '
+                  f'best_dist_to_target={self._end_dist_2d(best, tx, ty):.1f}y')
 
         return best
 
@@ -749,10 +777,26 @@ class NavServer:
             zone = req.get('zone_id')
             if zone and zone in self.meshes:
                 del self.meshes[zone]
+                self.reachability.pop(zone, None)
                 print(f'Cleared cache for zone {zone}')
             elif not zone:
                 self.meshes.clear()
+                self.reachability.clear()
                 print('Cleared all caches')
+            self.write_response({'status': 'ok', 'action': 'clear_cache',
+                                 'zone_id': zone, 'seq': req.get('seq')})
+
+        elif action == 'clear_blocks':
+            zone = req.get('zone_id')
+            if zone and zone in self.meshes:
+                n = navmesh.clear_blocked(self.meshes[zone])
+                print(f'Cleared {n} blocked polys in zone {zone}')
+                self.write_response({'status': 'ok', 'action': 'clear_blocks',
+                                     'zone_id': zone, 'cleared': n,
+                                     'seq': req.get('seq')})
+            else:
+                self.write_response({'status': 'no_mesh', 'action': 'clear_blocks',
+                                     'zone_id': zone, 'seq': req.get('seq')})
 
     def write_response(self, data):
         tmp = str(PATH_FILE) + '.tmp'

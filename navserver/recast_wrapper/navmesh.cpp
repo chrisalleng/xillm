@@ -304,7 +304,12 @@ static std::shared_ptr<NavMeshData> build_tiled(
 
     // Compute max polys per tile respecting Detour's 32-bit poly ref.
     // Detour requires at least 10 salt bits: tileBits + polyBits <= 22.
-    int maxPolysPerTile = 1024;
+    // Dense zones with instance geometry have been observed producing 1400+
+    // polys per tile; 1024 was too tight and silently dropped them when
+    // addTile stored polys into the fixed-size tile slot. Bump the starting
+    // cap to 16384 and let the salt-bit constraint below shrink it if the
+    // zone's tile grid is unusually large.
+    int maxPolysPerTile = 16384;
     {
         unsigned int tb = ilog2(nextPow2((unsigned int)(tw * th)));
         unsigned int pb = ilog2(nextPow2((unsigned int)maxPolysPerTile));
@@ -626,6 +631,260 @@ static int clear_blocked(std::shared_ptr<NavMeshData> mesh)
     return cleared;
 }
 
+// Debug: run the Recast build pipeline for the single tile containing a probe
+// (probe_x, probe_z) and report the state of the cell containing that probe
+// after each stage. Lets us pinpoint which stage filters/erodes/merges away
+// a cell the player is standing on.
+static py::dict debug_tile_pipeline(
+    py::array_t<float> verts_arr, py::array_t<int> tris_arr,
+    const NavSettings& settings, float probe_x, float probe_z)
+{
+    py::dict out;
+    auto vbuf = verts_arr.request();
+    auto tbuf = tris_arr.request();
+    if (vbuf.ndim != 2 || vbuf.shape[1] != 3)
+        throw std::runtime_error("verts must be Nx3");
+    if (tbuf.ndim != 2 || tbuf.shape[1] != 3)
+        throw std::runtime_error("tris must be Nx3");
+    int nverts = (int)vbuf.shape[0];
+    int ntris = (int)tbuf.shape[0];
+    const float* verts = static_cast<const float*>(vbuf.ptr);
+    const int* tris = static_cast<const int*>(tbuf.ptr);
+
+    // Compute world bounds
+    float bmin[3], bmax[3];
+    if (nverts == 0) throw std::runtime_error("empty verts");
+    bmin[0]=bmax[0]=verts[0]; bmin[1]=bmax[1]=verts[1]; bmin[2]=bmax[2]=verts[2];
+    for (int i = 1; i < nverts; i++) {
+        for (int k = 0; k < 3; k++) {
+            float v = verts[i*3+k];
+            if (v < bmin[k]) bmin[k] = v;
+            if (v > bmax[k]) bmax[k] = v;
+        }
+    }
+
+    if (settings.tileSize == 0) throw std::runtime_error("debug only supported for tiled builds");
+    const int ts = settings.tileSize;
+    const float cs = settings.cellSize;
+    const float tcs = ts * cs;
+    const int walkableRadius = (int)ceilf(settings.agentRadius / cs);
+    const int borderSize = walkableRadius + 3;
+    const float borderPad = borderSize * cs;
+
+    int tx = (int)floorf((probe_x - bmin[0]) / tcs);
+    int ty = (int)floorf((probe_z - bmin[2]) / tcs);
+    int gw, gh; rcCalcGridSize(bmin, bmax, cs, &gw, &gh);
+    int tw = (gw + ts - 1) / ts;
+    int th = (gh + ts - 1) / ts;
+    out["probe_world"] = py::make_tuple(probe_x, probe_z);
+    out["tile_coords"] = py::make_tuple(tx, ty);
+    out["tile_grid"] = py::make_tuple(tw, th);
+    if (tx < 0 || tx >= tw || ty < 0 || ty >= th) {
+        out["error"] = "probe outside tile grid";
+        return out;
+    }
+
+    // Tile bounds with border
+    float tileBmin[3], tileBmax[3];
+    tileBmin[0] = bmin[0] + tx * tcs - borderPad;
+    tileBmin[1] = bmin[1];
+    tileBmin[2] = bmin[2] + ty * tcs - borderPad;
+    tileBmax[0] = bmin[0] + (tx + 1) * tcs + borderPad;
+    tileBmax[1] = bmax[1];
+    tileBmax[2] = bmin[2] + (ty + 1) * tcs + borderPad;
+
+    rcConfig cfg;
+    fillRcConfig(cfg, settings, borderSize);
+    cfg.width = ts + borderSize * 2;
+    cfg.height = ts + borderSize * 2;
+    rcVcopy(cfg.bmin, tileBmin);
+    rcVcopy(cfg.bmax, tileBmax);
+
+    // Cell of the probe within the tile
+    int cx = (int)floorf((probe_x - tileBmin[0]) / cs);
+    int cz = (int)floorf((probe_z - tileBmin[2]) / cs);
+    out["probe_cell_in_tile"] = py::make_tuple(cx, cz);
+    out["tile_cell_dims"] = py::make_tuple(cfg.width, cfg.height);
+    out["tile_bmin"] = py::make_tuple(tileBmin[0], tileBmin[1], tileBmin[2]);
+    out["tile_bmax"] = py::make_tuple(tileBmax[0], tileBmax[1], tileBmax[2]);
+
+    // Bucket triangles into this tile
+    std::vector<int> triList;
+    for (int i = 0; i < ntris; i++) {
+        float xmn = verts[tris[i*3]*3], xmx = xmn;
+        float zmn = verts[tris[i*3]*3+2], zmx = zmn;
+        for (int j = 1; j < 3; j++) {
+            float vx = verts[tris[i*3+j]*3], vz = verts[tris[i*3+j]*3+2];
+            if (vx < xmn) xmn = vx; if (vx > xmx) xmx = vx;
+            if (vz < zmn) zmn = vz; if (vz > zmx) zmx = vz;
+        }
+        if (xmx < tileBmin[0] || xmn > tileBmax[0]) continue;
+        if (zmx < tileBmin[2] || zmn > tileBmax[2]) continue;
+        triList.push_back(i);
+    }
+    out["tile_tris"] = (int)triList.size();
+    if (triList.empty()) {
+        out["error"] = "no triangles in tile";
+        return out;
+    }
+
+    std::vector<int> tileTriData(triList.size() * 3);
+    for (size_t i = 0; i < triList.size(); i++) {
+        tileTriData[i*3+0] = tris[triList[i]*3+0];
+        tileTriData[i*3+1] = tris[triList[i]*3+1];
+        tileTriData[i*3+2] = tris[triList[i]*3+2];
+    }
+
+    auto cellInBounds = [&](int x, int z) {
+        return x >= 0 && x < cfg.width && z >= 0 && z < cfg.height;
+    };
+    auto spanCount = [&](rcHeightfield& hf) {
+        if (!cellInBounds(cx, cz)) return -1;
+        int n = 0;
+        for (rcSpan* s = hf.spans[cx + cz * cfg.width]; s; s = s->next) n++;
+        return n;
+    };
+
+    rcContext ctx(false);
+    rcHeightfield* solid = rcAllocHeightfield();
+    if (!solid || !rcCreateHeightfield(&ctx, *solid, cfg.width, cfg.height,
+                                        cfg.bmin, cfg.bmax, cfg.cs, cfg.ch)) {
+        rcFreeHeightField(solid);
+        out["error"] = "rcCreateHeightfield failed";
+        return out;
+    }
+    int nTileTris = (int)triList.size();
+    std::vector<unsigned char> areas(nTileTris, 0);
+    rcMarkWalkableTriangles(&ctx, cfg.walkableSlopeAngle,
+                            verts, nverts, tileTriData.data(), nTileTris, areas.data());
+    int walkableMarked = 0;
+    for (auto a : areas) if (a != RC_NULL_AREA) walkableMarked++;
+    out["walkable_tris_marked"] = walkableMarked;
+    out["non_walkable_tris_marked"] = nTileTris - walkableMarked;
+
+    if (!rcRasterizeTriangles(&ctx, verts, nverts, tileTriData.data(), areas.data(),
+                               nTileTris, *solid, cfg.walkableClimb)) {
+        rcFreeHeightField(solid);
+        out["error"] = "rcRasterizeTriangles failed";
+        return out;
+    }
+    out["spans_at_probe_after_rasterize"] = spanCount(*solid);
+
+    rcFilterLowHangingWalkableObstacles(&ctx, cfg.walkableClimb, *solid);
+    out["spans_at_probe_after_low_hanging_filter"] = spanCount(*solid);
+    rcFilterLedgeSpans(&ctx, cfg.walkableHeight, cfg.walkableClimb, *solid);
+    out["spans_at_probe_after_ledge_filter"] = spanCount(*solid);
+    rcFilterWalkableLowHeightSpans(&ctx, cfg.walkableHeight, *solid);
+    out["spans_at_probe_after_low_height_filter"] = spanCount(*solid);
+
+    // Count walkable spans at probe cell
+    int walkableSpansProbe = 0;
+    if (cellInBounds(cx, cz)) {
+        for (rcSpan* s = solid->spans[cx + cz * cfg.width]; s; s = s->next)
+            if (s->area != RC_NULL_AREA) walkableSpansProbe++;
+    }
+    out["walkable_spans_at_probe"] = walkableSpansProbe;
+
+    rcCompactHeightfield* chf = rcAllocCompactHeightfield();
+    if (!chf || !rcBuildCompactHeightfield(&ctx, cfg.walkableHeight, cfg.walkableClimb,
+                                            *solid, *chf)) {
+        rcFreeHeightField(solid);
+        rcFreeCompactHeightfield(chf);
+        out["error"] = "rcBuildCompactHeightfield failed";
+        return out;
+    }
+    rcFreeHeightField(solid);
+
+    auto countCompactSpans = [&]() {
+        if (!cellInBounds(cx, cz)) return 0;
+        const rcCompactCell& c = chf->cells[cx + cz * cfg.width];
+        return (int)c.count;
+    };
+    auto compactAreaAtProbe = [&]() {
+        if (!cellInBounds(cx, cz)) return -1;
+        const rcCompactCell& c = chf->cells[cx + cz * cfg.width];
+        if (c.count == 0) return -2;
+        int best_area = -2;
+        for (unsigned i = c.index; i < c.index + c.count; i++) {
+            if (chf->areas[i] != RC_NULL_AREA) { best_area = chf->areas[i]; break; }
+            if (best_area < 0) best_area = chf->areas[i];
+        }
+        return best_area;
+    };
+    out["compact_spans_at_probe"] = countCompactSpans();
+    out["compact_area_at_probe"] = compactAreaAtProbe();
+
+    if (!rcErodeWalkableArea(&ctx, cfg.walkableRadius, *chf)) {
+        rcFreeCompactHeightfield(chf);
+        out["error"] = "rcErodeWalkableArea failed";
+        return out;
+    }
+    int walkableAfterErode = 0;
+    if (cellInBounds(cx, cz)) {
+        const rcCompactCell& c = chf->cells[cx + cz * cfg.width];
+        for (unsigned i = c.index; i < c.index + c.count; i++)
+            if (chf->areas[i] != RC_NULL_AREA) walkableAfterErode++;
+    }
+    out["walkable_spans_at_probe_after_erode"] = walkableAfterErode;
+
+    if (!rcBuildDistanceField(&ctx, *chf)) {
+        rcFreeCompactHeightfield(chf);
+        out["error"] = "rcBuildDistanceField failed";
+        return out;
+    }
+    int distAtProbe = -1;
+    if (cellInBounds(cx, cz)) {
+        const rcCompactCell& c = chf->cells[cx + cz * cfg.width];
+        for (unsigned i = c.index; i < c.index + c.count; i++)
+            if (chf->areas[i] != RC_NULL_AREA) {
+                distAtProbe = chf->dist[i]; break;
+            }
+    }
+    out["distance_field_at_probe"] = distAtProbe;
+
+    if (!rcBuildRegions(&ctx, *chf, cfg.borderSize, cfg.minRegionArea, cfg.mergeRegionArea)) {
+        rcFreeCompactHeightfield(chf);
+        out["error"] = "rcBuildRegions failed";
+        return out;
+    }
+    int regionAtProbe = -1;
+    if (cellInBounds(cx, cz)) {
+        const rcCompactCell& c = chf->cells[cx + cz * cfg.width];
+        for (unsigned i = c.index; i < c.index + c.count; i++)
+            if (chf->areas[i] != RC_NULL_AREA) {
+                regionAtProbe = chf->spans[i].reg; break;
+            }
+    }
+    out["region_id_at_probe"] = regionAtProbe;
+    out["max_region_id"] = (int)chf->maxRegions;
+
+    rcContourSet* cset = rcAllocContourSet();
+    if (!cset || !rcBuildContours(&ctx, *chf, cfg.maxSimplificationError, cfg.maxEdgeLen, *cset)) {
+        rcFreeCompactHeightfield(chf);
+        rcFreeContourSet(cset);
+        out["error"] = "rcBuildContours failed";
+        return out;
+    }
+    out["contour_count"] = cset->nconts;
+
+    rcPolyMesh* pmesh = rcAllocPolyMesh();
+    if (!pmesh || !rcBuildPolyMesh(&ctx, *cset, cfg.maxVertsPerPoly, *pmesh)) {
+        rcFreeCompactHeightfield(chf);
+        rcFreeContourSet(cset);
+        rcFreePolyMesh(pmesh);
+        out["error"] = "rcBuildPolyMesh failed";
+        return out;
+    }
+    out["poly_count"] = pmesh->npolys;
+    out["vert_count"] = pmesh->nverts;
+
+    rcFreeCompactHeightfield(chf);
+    rcFreeContourSet(cset);
+    rcFreePolyMesh(pmesh);
+    return out;
+}
+
+
 PYBIND11_MODULE(navmesh, m) {
     m.doc() = "Recast/Detour navmesh builder and pathfinder for FFXI";
 
@@ -670,4 +929,11 @@ PYBIND11_MODULE(navmesh, m) {
     m.def("clear_blocked", &clear_blocked,
           "Clear all blocked polygon flags",
           py::arg("mesh"));
+
+    m.def("debug_tile_pipeline", &debug_tile_pipeline,
+          "Run the Recast build pipeline for the single tile containing "
+          "(probe_x, probe_z) and return per-stage cell state. Used to locate "
+          "which stage filters out a cell the player is standing on.",
+          py::arg("verts"), py::arg("tris"), py::arg("settings"),
+          py::arg("probe_x"), py::arg("probe_z"));
 }

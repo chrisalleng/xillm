@@ -3,3 +3,5 @@ __pycache__/
 navserver/recast_wrapper/build/
 mapper/data/obstacles/
 mapper/data/collision/
+mapper/data/instances/
+.claude/
