@@ -375,6 +375,14 @@ class NavServer:
         return verts, tris_fixed
 
 
+    # Per-zone NavSettings overrides. Keys match navmesh.NavSettings field
+    # names (cell_size, agent_radius, agent_max_slope, agent_max_climb, ...).
+    # Defaults apply to every zone not listed here.
+    ZONE_NAV_OVERRIDES = {
+        # Add entries like `106: {'agent_radius': 1.8}` to override per-zone
+        # NavSettings fields when a specific zone needs different tuning.
+    }
+
     def get_mesh(self, zone_id: int):
         if zone_id not in self.meshes:
             print(f'Building navmesh for zone {zone_id}...')
@@ -384,11 +392,21 @@ class NavServer:
             settings.cell_size = 0.20
             settings.cell_height = 0.12
             settings.agent_radius = 1.5
-            settings.agent_max_slope = 40.0
-            settings.agent_max_climb = 1.0
+            settings.agent_max_slope = 45.0
+            # Default agent_max_climb = 0.3y. Zone 110 recording shows real
+            # natural-terrain single-step climbs max out at ~0.37y with 95th
+            # percentile at 0.13y; 0.3 keeps 1y+ railings/walls as obstacles
+            # (previous 1.0y let rcFilterLowHangingWalkableObstacles smooth
+            # them into "tiny steps"). Bump per-zone if specific terrain
+            # ends up with holes.
+            settings.agent_max_climb = 0.3
             settings.region_min_size = 2
             settings.region_merge_size = 20
             settings.tile_size = 1024
+            overrides = self.ZONE_NAV_OVERRIDES.get(zone_id, {})
+            for k, v in overrides.items():
+                setattr(settings, k, v)
+                print(f'  Override {k}={v}')
             self.meshes[zone_id] = navmesh.build_navmesh(verts, tris, settings)
             print(f'  Built in {time.time()-t0:.1f}s')
             self._apply_obstacle_blocking(zone_id, self.meshes[zone_id])

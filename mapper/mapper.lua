@@ -16,7 +16,7 @@
 
 addon.name    = 'mapper'
 addon.author  = 'xillm'
-addon.version = '.22'
+addon.version = '.26'
 addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
@@ -147,10 +147,96 @@ local function dist2d(ax, ay, bx, by)
     return math.sqrt(dx * dx + dy * dy)
 end
 
+-- Autotranslate (groupId, messageId) → zone_id. Extracted from LSB
+-- scripts/commands/zone.lua. Key = (groupId<<8) | messageId.
+-- When the user types {East Ronfaure} the Ashita command arg contains a
+-- 0xFD-delimited byte sequence with groupId at +3 and messageId at +4 from
+-- the 0xFD marker (matching LSB's !zone command parser).
+local AUTOTRANS_ZONE_MAP = {
+    [0x14A9] = 1, [0x14AA] = 2, [0x1484] = 3, [0x1485] = 4, [0x148A] = 5,
+    [0x148B] = 6, [0x1486] = 7, [0x1487] = 8, [0x1488] = 9, [0x1489] = 10,
+    [0x148C] = 11, [0x148D] = 12, [0x148E] = 13, [0x14DC] = 13, [0x14AB] = 14,
+    [0x149B] = 16, [0x149A] = 16, [0x149C] = 17, [0x149E] = 18, [0x149D] = 18,
+    [0x149F] = 19, [0x14A0] = 20, [0x14A1] = 20, [0x14A2] = 21, [0x14A3] = 22,
+    [0x14A4] = 22, [0x14A5] = 22, [0x14A6] = 22, [0x14A7] = 23, [0x14A8] = 23,
+    [0x1490] = 24, [0x1491] = 25, [0x148F] = 26, [0x1493] = 27, [0x1494] = 28,
+    [0x1496] = 29, [0x1495] = 29, [0x1498] = 30, [0x1497] = 30, [0x1499] = 31,
+    [0x1492] = 32, [0x14AC] = 33, [0x14AD] = 34, [0x14AE] = 35, [0x14B0] = 36,
+    [0x14B1] = 37, [0x14B2] = 38, [0x14B4] = 39, [0x14B5] = 40, [0x14B6] = 41,
+    [0x14B7] = 42, [0x14AF] = 43, [0x14B8] = 44, [0x14B9] = 46, [0x14BA] = 47,
+    [0x14BB] = 48, [0x14DB] = 50, [0x14BC] = 50, [0x14BD] = 51, [0x14BE] = 52,
+    [0x14BF] = 53, [0x14C0] = 54, [0x14C1] = 55, [0x14C2] = 56, [0x14C3] = 57,
+    [0x14C4] = 58, [0x14C5] = 59, [0x14C6] = 60, [0x14C7] = 61, [0x14C8] = 62,
+    [0x14C9] = 63, [0x14CA] = 64, [0x14CB] = 65, [0x14CC] = 66, [0x14CD] = 67,
+    [0x14CE] = 68, [0x14CF] = 69, [0x270F] = 70, [0x2710] = 71, [0x14DD] = 72,
+    [0x14DE] = 73, [0x14DF] = 74, [0x14E0] = 75, [0x14E1] = 76, [0x14E2] = 77,
+    [0x14DA] = 78, [0x14D0] = 79, [0x2711] = 80, [0x2713] = 81, [0x2715] = 82,
+    [0x2723] = 83, [0x2717] = 84, [0x273E] = 85, [0x2740] = 85, [0x2719] = 86,
+    [0x271C] = 87, [0x271E] = 88, [0x2720] = 89, [0x2725] = 90, [0x2727] = 91,
+    [0x2742] = 92, [0x2722] = 93, [0x272B] = 94, [0x272D] = 95, [0x272F] = 96,
+    [0x2732] = 97, [0x2734] = 98, [0x2744] = 99, [0x1411] = 100, [0x140F] = 101,
+    [0x1451] = 102, [0x1460] = 103, [0x1401] = 104, [0x1402] = 105, [0x1464] = 106,
+    [0x1463] = 107, [0x1469] = 108, [0x142B] = 109, [0x1407] = 110, [0x1424] = 111,
+    [0x144D] = 112, [0x143D] = 113, [0x143E] = 114, [0x1418] = 115, [0x1427] = 116,
+    [0x1417] = 117, [0x1416] = 118, [0x1420] = 119, [0x142E] = 120, [0x143F] = 121,
+    [0x147D] = 122, [0x147C] = 122, [0x1440] = 123, [0x1441] = 124, [0x1442] = 125,
+    [0x1408] = 126, [0x140A] = 127, [0x1443] = 128, [0x2731] = 129, [0x146F] = 130,
+    [0x1482] = 134, [0x1483] = 135, [0x2746] = 136, [0x2748] = 137, [0x1465] = 139,
+    [0x146C] = 140, [0x141F] = 141, [0x145E] = 142, [0x1466] = 143, [0x141A] = 144,
+    [0x1421] = 145, [0x1419] = 146, [0x142A] = 147, [0x1428] = 148, [0x1468] = 149,
+    [0x146D] = 150, [0x1423] = 151, [0x1404] = 152, [0x1444] = 153, [0x1437] = 154,
+    [0x140C] = 157, [0x140B] = 158, [0x1436] = 159, [0x1435] = 160, [0x1426] = 161,
+    [0x1425] = 161, [0x1450] = 162, [0x144F] = 162, [0x1439] = 163, [0x2736] = 164,
+    [0x145D] = 165, [0x142D] = 166, [0x1432] = 167, [0x143B] = 168, [0x141D] = 169,
+    [0x145C] = 170, [0x2729] = 171, [0x1461] = 172, [0x145B] = 173, [0x145A] = 174,
+    [0x271A] = 175, [0x1459] = 176, [0x1471] = 177, [0x1470] = 177, [0x1472] = 178,
+    [0x14B3] = 179, [0x1473] = 180, [0x1474] = 181, [0x140D] = 184, [0x147E] = 185,
+    [0x147F] = 186, [0x1480] = 187, [0x1481] = 188, [0x146E] = 190, [0x1462] = 191,
+    [0x141C] = 192, [0x1403] = 193, [0x141B] = 194, [0x146A] = 195, [0x1467] = 196,
+    [0x142C] = 197, [0x1415] = 198, [0x1414] = 200, [0x1477] = 201, [0x1475] = 202,
+    [0x147A] = 203, [0x144A] = 204, [0x1458] = 205, [0x146B] = 206, [0x1478] = 207,
+    [0x1457] = 208, [0x1476] = 209, [0x1479] = 211, [0x1434] = 212, [0x1433] = 213,
+    [0x144C] = 230, [0x1430] = 231, [0x1452] = 232, [0x1422] = 233, [0x1446] = 234,
+    [0x1456] = 235, [0x143C] = 236, [0x142F] = 237, [0x143A] = 238, [0x1454] = 239,
+    [0x1445] = 240, [0x1438] = 241, [0x1455] = 242, [0x1413] = 243, [0x144E] = 244,
+    [0x140E] = 245, [0x1406] = 246, [0x1431] = 247, [0x145F] = 248, [0x141E] = 249,
+    [0x1429] = 250, [0x147B] = 251, [0x1409] = 252, [0x274C] = 256, [0x274D] = 257,
+    [0x274E] = 258, [0x274F] = 260, [0x2750] = 261, [0x2751] = 262, [0x2756] = 263,
+    [0x2752] = 265, [0x2757] = 266, [0x275C] = 267, [0x2753] = 268, [0x2754] = 269,
+    [0x2755] = 270, [0x2758] = 272, [0x275D] = 273, [0x2712] = 274, [0x275A] = 280,
+    [0x2759] = 284, [0x275B] = 285, [0x271B] = 289, [0x271D] = 291,
+}
+
+local function decode_autotrans_zone(s)
+    -- Find 0xFD (253) marker and read groupId/messageId (LSB format:
+    -- groupId = s[atpos+3], messageId = s[atpos+4]).
+    for i = 1, #s do
+        if s:byte(i) == 253 and i + 4 <= #s then
+            local group = s:byte(i + 3)
+            local msg = s:byte(i + 4)
+            if group and msg then
+                local zid = AUTOTRANS_ZONE_MAP[group * 256 + msg]
+                if zid then return zid end
+            end
+        end
+    end
+    return nil
+end
+
 local function resolve_zone_name(name)
-    name = name:gsub('\xEF.', '')
+    -- 1) Autotranslate: if the arg contains a 0xFD byte, decode via the
+    --    (groupId, messageId) → zone_id map.
+    local at_zid = decode_autotrans_zone(name)
+    if at_zid then
+        local rm = AshitaCore:GetResourceManager()
+        local zname = rm:GetString('zones.names', at_zid)
+        return at_zid, zname or tostring(at_zid)
+    end
+    -- 2) Strip any leftover autotrans/encoding bytes and fall back to
+    --    plain-text substring matching.
+    name = name:gsub('[\xEF\xFD].', '')
     local rm = AshitaCore:GetResourceManager()
-    local name_lower = name:lower()
+    local name_lower = name:lower():match('^%s*(.-)%s*$') or name
     for id = 0, 300 do
         local zname = rm:GetString('zones.names', id)
         if zname and zname:lower() == name_lower then
@@ -499,29 +585,51 @@ local function draw_object_boxes(px, py, pz)
 
     local ok, err = pcall(function()
         local fg = imgui.GetForegroundDrawList()
-        if not fg then error('no draw list') end
+        if not fg then return end
         local dev = d3d8.get_device()
-        if not dev then error('no device') end
+        if not dev then return end
         local r1, view = dev:GetTransform(2)
         local r2, proj = dev:GetTransform(3)
-        if r1 ~= 0 or r2 ~= 0 or not view or not proj then
-            error(string.format('transform fail v=%d p=%d', r1 or -1, r2 or -1))
+        if r1 ~= 0 or r2 ~= 0 or not view or not proj then return end
+        -- Snapshot view/proj matrices into plain Lua locals. Ashita's d3d8
+        -- binding returns a live object whose fields can go nil between the
+        -- validation pass and subsequent reads (observed when stepping
+        -- through many instances on /mapper objects on). Copying to locals
+        -- up front ensures the projection math always sees numbers. If any
+        -- field is nil at snapshot time, skip this frame — next frame will
+        -- try again.
+        local v11, v12, v13, v14 = view._11, view._12, view._13, view._14
+        local v21, v22, v23, v24 = view._21, view._22, view._23, view._24
+        local v31, v32, v33, v34 = view._31, view._32, view._33, view._34
+        local v41, v42, v43, v44 = view._41, view._42, view._43, view._44
+        local p11, p12, p14 = proj._11, proj._12, proj._14
+        local p21, p22, p24 = proj._21, proj._22, proj._24
+        local p31, p32, p34 = proj._31, proj._32, proj._34
+        local p41, p42, p44 = proj._41, proj._42, proj._44
+        if not (v11 and v12 and v13 and v14 and v21 and v22 and v23 and v24
+                and v31 and v32 and v33 and v34 and v41 and v42 and v43 and v44
+                and p11 and p12 and p14 and p21 and p22 and p24
+                and p31 and p32 and p34 and p41 and p42 and p44) then
+            return
         end
         local r3, vp = dev:GetViewport()
-        if r3 ~= 0 or not vp then error('viewport fail') end
+        if r3 ~= 0 or not vp or type(vp.Width) ~= 'number' or type(vp.Height) ~= 'number' then
+            return
+        end
+        local vp_w, vp_h, vp_x, vp_y = vp.Width, vp.Height, vp.X or 0, vp.Y or 0
 
         local function project(gx, gy, gz)
             local wx, wy, wz = gx, gz, gy
-            local vx = wx*view._11 + wy*view._21 + wz*view._31 + view._41
-            local vy = wx*view._12 + wy*view._22 + wz*view._32 + view._42
-            local vz = wx*view._13 + wy*view._23 + wz*view._33 + view._43
-            local vw = wx*view._14 + wy*view._24 + wz*view._34 + view._44
-            local cx = vx*proj._11 + vy*proj._21 + vz*proj._31 + vw*proj._41
-            local cy = vx*proj._12 + vy*proj._22 + vz*proj._32 + vw*proj._42
-            local cw = vx*proj._14 + vy*proj._24 + vz*proj._34 + vw*proj._44
+            local vx = wx*v11 + wy*v21 + wz*v31 + v41
+            local vy = wx*v12 + wy*v22 + wz*v32 + v42
+            local vz = wx*v13 + wy*v23 + wz*v33 + v43
+            local vw = wx*v14 + wy*v24 + wz*v34 + v44
+            local cx = vx*p11 + vy*p21 + vz*p31 + vw*p41
+            local cy = vx*p12 + vy*p22 + vz*p32 + vw*p42
+            local cw = vx*p14 + vy*p24 + vz*p34 + vw*p44
             if cw <= 0.001 then return nil, nil end
-            return (cx/cw * 0.5 + 0.5) * vp.Width + vp.X,
-                   (-cy/cw * 0.5 + 0.5) * vp.Height + vp.Y
+            return (cx/cw * 0.5 + 0.5) * vp_w + vp_x,
+                   (-cy/cw * 0.5 + 0.5) * vp_h + vp_y
         end
 
         local yellow = 0xFF00FFFF

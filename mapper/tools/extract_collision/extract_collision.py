@@ -123,7 +123,13 @@ KEY_TABLE2 = bytes([
 # ---------------------------------------------------------------------------
 
 def get_rom_path(ffxi_path, zone_id):
-    """Return relative path like 'ROM/0/124.DAT' for the zone's terrain file."""
+    """Return relative path like 'ROM/0/124.DAT' for the zone's terrain file.
+
+    Expansion content (Rise of the Zilart, Chains of Promathia, Treasures of
+    Aht Urhgan, Wings of the Goddess, Seekers of Adoulin, etc.) lives in
+    ROM2..ROM9, each with its own VTABLE/FTABLE pair. The base VTABLE.DAT
+    has a 0 entry for files that moved into an expansion, so we need to try
+    each table in turn until we find a non-zero vt."""
     # File ID for zone terrain = zoneId + 100 (for zones 0-255)
     # For zones 256-1299: zoneId + 83635; 1300-1299: zoneId + 66911
     # Reference: d_ms.cs line "var fileId = x < 256 ? x + 100 : x + 83635"
@@ -134,32 +140,37 @@ def get_rom_path(ffxi_path, zone_id):
     else:
         file_id = zone_id + 83635
 
-    vtable_path = os.path.join(ffxi_path, 'VTABLE.DAT')
-    ftable_path = os.path.join(ffxi_path, 'FTABLE.DAT')
+    # Try the base VTABLE first, then each expansion VTABLE in order.
+    tables = [('VTABLE.DAT', 'FTABLE.DAT')]
+    for n in range(2, 10):
+        tables.append((f'ROM{n}/VTABLE{n}.DAT', f'ROM{n}/FTABLE{n}.DAT'))
 
-    if not os.path.exists(vtable_path) or not os.path.exists(ftable_path):
-        raise FileNotFoundError(f"VTABLE.DAT or FTABLE.DAT not found in {ffxi_path}")
+    last_err = None
+    for vt_rel, ft_rel in tables:
+        vtable_path = os.path.join(ffxi_path, vt_rel)
+        ftable_path = os.path.join(ffxi_path, ft_rel)
+        if not os.path.exists(vtable_path) or not os.path.exists(ftable_path):
+            continue
+        with open(vtable_path, 'rb') as f:
+            vtable = f.read()
+        with open(ftable_path, 'rb') as f:
+            ftable = f.read()
+        if file_id >= len(vtable) or file_id * 2 + 1 >= len(ftable):
+            continue
+        vt = vtable[file_id]
+        ft = struct.unpack_from('<H', ftable, file_id * 2)[0]
+        if vt == 0:
+            continue
+        rom = 'ROM' if vt == 1 else f'ROM{vt}'
+        candidate = f'{rom}/{ft >> 7}/{ft & 0x7F}.DAT'
+        if os.path.exists(os.path.join(ffxi_path, candidate)):
+            return candidate
+        last_err = f"{vt_rel} pointed at {candidate} but file missing"
 
-    with open(vtable_path, 'rb') as f:
-        vtable = f.read()
-    with open(ftable_path, 'rb') as f:
-        ftable = f.read()
-
-    if file_id >= len(vtable):
-        raise ValueError(f"file_id {file_id} out of range for VTABLE ({len(vtable)} bytes)")
-
-    vt = vtable[file_id]
-    ft = struct.unpack_from('<H', ftable, file_id * 2)[0]
-
-    if vt == 0:
-        raise ValueError(
-            f"Zone {zone_id} (fileId={file_id}): VTABLE entry is 0, "
-            "file not found in base ROM tables"
-        )
-    if vt == 1:
-        return f'ROM/{ft >> 7}/{ft & 0x7F}.DAT'
-    else:
-        return f'ROM{vt}/{ft >> 7}/{ft & 0x7F}.DAT'
+    raise ValueError(
+        f"Zone {zone_id} (fileId={file_id}): no VTABLE entry found "
+        f"(checked base + ROM2-ROM9). {last_err or ''}"
+    )
 
 
 # ---------------------------------------------------------------------------
