@@ -35,6 +35,7 @@ References:
 import argparse
 import json
 import os
+import shutil
 import struct
 import sys
 
@@ -648,6 +649,55 @@ def parse_mmb(data: bytes):
         return None
 
 
+# Per-process cache: { mmb_imgID -> parsed_model_dict } for MMBs resolved
+# from the shared asset pool. Populated lazily on first scan.
+_POOL_MMB_CACHE: dict | None = None
+
+
+def _load_missing_mmbs_from_pool(ffxi_path: str, wanted: set, mmb_models: dict) -> None:
+    """FFXI stores many generic mesh assets (`_obj_*_m`, `el_kaseki*`, etc.)
+    in shared-pool DATs under ROM/254/. Zone-specific DATs reference these
+    meshes by name via MZB instance records but do not duplicate the MMB
+    geometry. This helper scans the shared pool once per process, caches
+    every MMB it finds, then returns matches for the zone's missing names."""
+    global _POOL_MMB_CACHE
+    if _POOL_MMB_CACHE is None:
+        _POOL_MMB_CACHE = {}
+        pool_dirs = [os.path.join(ffxi_path, 'ROM', '254')]
+        for d in pool_dirs:
+            if not os.path.isdir(d):
+                continue
+            files = [os.path.join(d, n) for n in sorted(os.listdir(d))
+                     if n.endswith('.DAT')]
+            print(f"  Indexing shared MMB pool {os.path.relpath(d, ffxi_path)} "
+                  f"({len(files)} DATs) ...", flush=True)
+            for fp in files:
+                try:
+                    with open(fp, 'rb') as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                for type_id, block in iter_chunks(data):
+                    if type_id != RESOURCE_TYPE_MMB:
+                        continue
+                    buf = bytearray(block); decode_mmb(buf)
+                    parsed = parse_mmb(bytes(buf))
+                    if parsed is None:
+                        continue
+                    name = parsed['imgID']
+                    if name and name not in _POOL_MMB_CACHE:
+                        _POOL_MMB_CACHE[name] = parsed
+        print(f"  Shared pool indexed: {len(_POOL_MMB_CACHE)} unique MMB models")
+
+    hits = 0
+    for name in wanted:
+        if name in _POOL_MMB_CACHE and name not in mmb_models:
+            mmb_models[name] = _POOL_MMB_CACHE[name]
+            hits += 1
+    if hits:
+        print(f"  Shared pool supplied MMB for {hits} of {len(wanted)} missing names")
+
+
 def parse_mzb_instances(mzb_data: bytearray):
     """Extract SMZBBlock100 records (instance transforms + MMB refs).
 
@@ -795,17 +845,17 @@ def build_collision_json(zone_id, vertices, triangle_indices, terrain_count=None
         v0, v1, v2 = vertices[i0], vertices[i1], vertices[i2]
 
         if tri_i < terrain_count:
-            # Walkable-only filter, plus canonical winding. MZB terrain
-            # triangles come out with mixed winding: about half have their
-            # normal pointing "up" physically (−Ashita.Z direction, since Z
-            # is down-positive) and half point "down". The |snz| ≥ 0.707
-            # check keeps near-horizontal triangles regardless of winding;
-            # then we canonicalize them to snz < 0 so all walkable floors
-            # have consistent orientation by the time Recast sees them.
+            # Keep every terrain triangle — walkable floors AND steep cliff
+            # faces alike. Recast classifies them via rcMarkWalkableTriangles
+            # (slope > walkableSlopeAngle → area=0 = obstacle); the geometry
+            # still rasterizes into solid spans that keep the pathfinder from
+            # routing through cliff walls. Earlier versions of this code
+            # filtered steep terrain out at emit time, which silently let the
+            # navmesh walk through cliffs (see Attohwa Chasm zone 7 testing,
+            # 2026-04-24). For near-horizontal tris we still canonicalize
+            # winding to snz < 0 so floors have consistent normals.
             snz = _triangle_signed_normal_z(v0, v1, v2)
-            if abs(snz) < WALKABLE_NORMAL_Z:
-                continue
-            if snz > 0:
+            if abs(snz) >= WALKABLE_NORMAL_Z and snz > 0:
                 i1, i2 = i2, i1
                 v1, v2 = v2, v1
 
@@ -914,6 +964,17 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
     mzb_mut = bytearray(mzb_block)
     decode_mzb(mzb_mut)
     all_instances = parse_mzb_instances(mzb_mut)
+
+    # Resolve MMB references the zone DAT didn't provide from the shared
+    # asset pool (ROM/254/). FFXI keeps generic `_obj_*` / `el_kaseki*` /
+    # similar meshes in a shared pool rather than duplicating them into
+    # every zone DAT. Without this lookup the extractor silently drops
+    # thousands of instances and the navmesh / addon show "invisible" walls
+    # that the real game client still collides against.
+    needed_names = set(i['name'] for i in all_instances if i['collision'] != 0x02)
+    missing_in_zone = needed_names - set(mmb_models.keys())
+    if missing_in_zone:
+        _load_missing_mmbs_from_pool(ffxi_path, missing_in_zone, mmb_models)
     solid_inst = [i for i in all_instances if i['collision'] != 0x02]
     for inst in solid_inst:
         model = mmb_models.get(inst['name'])
@@ -922,14 +983,54 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
             continue
         matched += 1
         m = instance_matrix(inst)
+        # Non-colliding MMB patterns (verified empirically in zone 7
+        # 2026-04-24; the player walks straight through every instance in
+        # these buckets):
+        #   - single-submesh `*_m`: visual decorations (`_obj_*_m`,
+        #     `el_kaseki*_m`, `eli3_gake_*_m`).
+        #   - single-submesh `*_col` suffix, `col_*` prefix: client uses
+        #     them for occlusion / audio / animation bounds, NOT collision
+        #     despite the name.
+        #   - any 8-vert/12-tri box-hull MMB ("effect volume"): gas plumes
+        #     (`col_gasu*`), cliff-line occluders (`eli3_gake_*cl`,
+        #     `eli3_gake_cmit`), fossil box hulls (`el_kascol01`), etc.
+        #     This signature (exactly 8 verts, 12 tris, 1 submesh = an
+        #     axis-aligned box) is the universal marker for non-collision
+        #     volumes.
+        # Exception: `id_*` server-spawned objects (id_doku poison plants,
+        # id_gus gas vents) ARE real colliders despite matching the box-
+        # hull signature — they carry unique per-instance secondary-name
+        # tags at MZB offset 0x34 that tell the server which instances to
+        # materialize. Keep them solid.
+        name = inst['name']
+        subs = model['models']
+        single_sub = len(subs) == 1
+        is_box_hull = False
+        if single_sub:
+            sm = subs[0]
+            is_box_hull = (len(sm['vertices']) == 8 and len(sm['indices']) == 12)
+        is_server_obj = name.startswith('id_')
+        is_decoration_only = single_sub and not is_server_obj and (
+            name.endswith('_m')
+            or name.endswith('_col')
+            or name.startswith('col_')
+            or is_box_hull
+        )
         for sub_idx, sub in enumerate(model['models']):
             if not sub['vertices'] or not sub['indices']:
                 continue
             world_verts = apply_instance_transform(sub['vertices'], m)
-            base = len(vertices)
-            for v in world_verts:
-                vertices.append(v)
-            inst_verts_added += len(world_verts)
+            # Only add to the shared vertex pool when this submesh is
+            # contributing collision triangles. Decoration submeshes get
+            # their own local verts/tris for the bbox + optional debug mesh,
+            # without polluting the navmesh input.
+            if is_decoration_only:
+                base = None
+            else:
+                base = len(vertices)
+                for v in world_verts:
+                    vertices.append(v)
+                inst_verts_added += len(world_verts)
             # Only emit wall + slope triangles, skip the horizontal faces.
             # The horizontal tops of a stone/wall would otherwise be marked as
             # walkable by Recast, creating a navmesh-walkable platform on top of
@@ -957,8 +1058,9 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
                     # Nearly horizontal — would become walkable; skip it so
                     # Recast doesn't generate a poly on the object's top face.
                     continue
-                triangle_indices.append((base + a, base + b, base + c))
-                inst_tris += 1
+                if base is not None:
+                    triangle_indices.append((base + a, base + b, base + c))
+                    inst_tris += 1
                 wall_vert_idxs.add(a); wall_vert_idxs.add(b); wall_vert_idxs.add(c)
                 wall_tri_local.append((a, b, c))
 
@@ -978,6 +1080,7 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
                 record = {
                     'name': label,
                     'collision': inst['collision'],
+                    'collides': not is_decoration_only,
                     'bbox_min': [round(min(xs), 2), round(min(ys), 2), round(min(zs), 2)],
                     'bbox_max': [round(max(xs), 2), round(max(ys), 2), round(max(zs), 2)],
                 }
@@ -1025,6 +1128,15 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
         with open(inst_path, 'w') as f:
             json.dump({'zone_id': zone_id, 'instances': instance_records},
                       f, separators=(',', ':'))
+        # Mirror the instances JSON to the Ashita addon's live config folder so
+        # the mapper picks up rule changes (e.g. `collides` flag) immediately
+        # without a manual re-run of deploy.sh. The target path is hardcoded
+        # to match deploy.sh; if it doesn't exist, skip silently.
+        deploy_inst = ('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/'
+                       'config/addons/mapper/instances')
+        if os.path.isdir(os.path.dirname(deploy_inst)):
+            os.makedirs(deploy_inst, exist_ok=True)
+            shutil.copy2(inst_path, os.path.join(deploy_inst, f"{zone_id}.json"))
 
     size_kb = os.path.getsize(out_path) // 1024
     print(f"  Wrote {out_path} ({size_kb} KB, {out['metadata']['triangle_count']} triangles)")

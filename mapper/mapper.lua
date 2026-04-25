@@ -16,7 +16,7 @@
 
 addon.name    = 'mapper'
 addon.author  = 'xillm'
-addon.version = '.27'
+addon.version = '.30'
 addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
@@ -106,6 +106,14 @@ end
 
 local function ipc_path(filename)
     return state.data_path .. filename
+end
+
+local function get_player_pos()
+    local ok, player = pcall(GetPlayerEntity)
+    if not ok or not player then return nil end
+    return player.Movement.LocalPosition.X,
+           player.Movement.LocalPosition.Y,
+           player.Movement.LocalPosition.Z
 end
 
 local function drive_toward(px, py, tx, ty)
@@ -384,17 +392,7 @@ local function check_path_response()
     -- Handle cross_zone_goto response
     if data.action == 'cross_zone_goto' then
         if data.status == 'ok' and data.route and #data.route > 0 then
-            local last_seg = data.route[#data.route]
-            local target_zone = last_seg.next_zone or last_seg.zone_id
-            state.route = {
-                segments = data.route,
-                seg_idx = 1,
-                needs_path = true,
-                target_zone = target_zone,
-                target_pos = (not last_seg.is_transition) and last_seg.target or nil,
-                replans = state.route_replans or 0,
-            }
-            state.route_replans = nil
+            -- Summarize the route in chat regardless of preview vs. execute
             local names = {}
             local seen = {}
             for _, seg in ipairs(data.route) do
@@ -408,17 +406,46 @@ local function check_path_response()
                 local final = get_zone_name(data.route[#data.route].next_zone)
                 if not seen[final] then names[#names + 1] = final end
             end
-            msg(string.format('Route: %s (%d segments)',
-                table.concat(names, ' > '), #data.route))
+
+            if state.preview_mode then
+                -- Preview flow: render the first-segment path without moving.
+                -- Keep preview_mode=true so the subsequent single-zone response
+                -- is tagged "Preview:" and does not trigger auto-walk.
+                local seg1 = data.route[1]
+                state.route = nil
+                msg(string.format('Preview route: %s (%d segments)',
+                    table.concat(names, ' > '), #data.route))
+                local px, py, pz = get_player_pos()
+                if px and seg1.target then
+                    request_path(px, py, pz, seg1.target[1], seg1.target[2])
+                end
+            else
+                local last_seg = data.route[#data.route]
+                local target_zone = last_seg.next_zone or last_seg.zone_id
+                state.route = {
+                    segments = data.route,
+                    seg_idx = 1,
+                    needs_path = true,
+                    target_zone = target_zone,
+                    target_pos = (not last_seg.is_transition) and last_seg.target or nil,
+                    replans = state.route_replans or 0,
+                }
+                state.route_replans = nil
+                msg(string.format('Route: %s (%d segments)',
+                    table.concat(names, ' > '), #data.route))
+            end
         elseif data.status == 'already_there' then
             msg('Already in target zone.')
             state.route = nil
+            state.preview_mode = false
         elseif data.status == 'no_route' then
             msg('No route found to destination zone.')
             state.route = nil
+            state.preview_mode = false
         else
             msg('Cross-zone error: ' .. (data.message or data.status or 'unknown'))
             state.route = nil
+            state.preview_mode = false
         end
         return
     end
@@ -672,6 +699,13 @@ local function draw_object_boxes(px, py, pz)
 
         for i = 1, #state.instances do
             local inst = state.instances[i]
+            -- Only show objects that still carry collision in the navmesh.
+            -- Decorations (single-submesh `_m`, `_col` suffix, `col_*` prefix)
+            -- are tagged collides=false by the extractor and hidden here so
+            -- /mapper objects matches what the pathfinder actually sees.
+            if inst.collides == false then
+                goto continue
+            end
             local mn, mx = inst.bbox_min, inst.bbox_max
             local cx = (mn[1] + mx[1]) * 0.5
             local cy = (mn[2] + mx[2]) * 0.5
@@ -738,6 +772,7 @@ local function draw_object_boxes(px, py, pz)
                     end
                 end
             end
+            ::continue::
         end
     end)
 
@@ -1090,14 +1125,6 @@ ashita.events.register('command', 'mapper_cmd', function(e)
 
     local cmd = args[2] and args[2]:lower() or 'help'
 
-    local function get_player_pos()
-        local ok, player = pcall(GetPlayerEntity)
-        if not ok or not player then return nil end
-        return player.Movement.LocalPosition.X,
-               player.Movement.LocalPosition.Y,
-               player.Movement.LocalPosition.Z
-    end
-
     local function parse_name(args_tbl, start_idx)
         if #args_tbl < start_idx then return nil end
         local rest = table.concat(args_tbl, ' ', start_idx)
@@ -1256,7 +1283,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
             if #args >= 5 then
                 local zone_name = table.concat(args, ' ', 5)
                 zone_name = zone_name:gsub('\xEF.', '')
-                local zone_id = resolve_zone_name(zone_name)
+                local zone_id, resolved_name = resolve_zone_name(zone_name)
                 if not zone_id then
                     msg(string.format('Unknown zone: %s', zone_name))
                     state.preview_mode = false
@@ -1267,9 +1294,24 @@ ashita.events.register('command', 'mapper_cmd', function(e)
                     state.preview_mode = true
                     request_path(px, py, pz, tx, ty)
                 else
-                    msg('Cross-zone preview not supported; previewing within current zone only.')
-                    state.preview_mode = false
-                    return
+                    -- Cross-zone preview: ask server to plan route, then
+                    -- show the first segment (zone exit) as a preview path.
+                    cancel_all()
+                    state.last_seq = state.last_seq + 1
+                    local seq = state.last_seq
+                    write_json(ipc_path('nav_request.json'), {
+                        action = 'cross_zone_goto',
+                        zone_id = state.zone_id,
+                        player = { px, py, pz },
+                        target = { tx, ty, 0 },
+                        target_zone = zone_id,
+                        preview = true,
+                        seq = seq,
+                    })
+                    state.pending_seq = seq
+                    state.preview_mode = true
+                    msg(string.format('Previewing route to (%.0f, %.0f) in %s...',
+                        tx, ty, resolved_name))
                 end
             else
                 cancel_all()
@@ -1279,10 +1321,32 @@ ashita.events.register('command', 'mapper_cmd', function(e)
         else
             local name = parse_name(args, 3)
             if not name or name == '' then
-                msg('Usage: /mapper preview <x> <y> [zone] | preview "entity"')
+                msg('Usage: /mapper preview <x> <y> [zone] | preview <zone> | preview "entity"')
                 state.preview_mode = false
                 return
             end
+
+            -- Try zone name first (same resolution order as /mapper goto)
+            local zone_id, resolved_name = resolve_zone_name(name)
+            if zone_id and zone_id ~= state.zone_id then
+                cancel_all()
+                state.last_seq = state.last_seq + 1
+                local seq = state.last_seq
+                write_json(ipc_path('nav_request.json'), {
+                    action = 'cross_zone_goto',
+                    zone_id = state.zone_id,
+                    player = { px, py, pz },
+                    target_zone = zone_id,
+                    preview = true,
+                    seq = seq,
+                })
+                state.pending_seq = seq
+                state.preview_mode = true
+                msg(string.format('Previewing route to %s...', resolved_name))
+                return
+            end
+
+            -- Fall back to entity search
             local match = entities.find_by_name(state.zone_id, name, px, py)
             if match then
                 cancel_all()
@@ -1290,7 +1354,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
                 request_path(px, py, pz, match.x, match.y)
                 msg(string.format('Previewing path to %s at (%.0f, %.0f).', match.name, match.x, match.y))
             else
-                msg(string.format('No entity "%s" in current zone.', name))
+                msg(string.format('No zone or entity "%s" found.', name))
                 state.preview_mode = false
             end
         end

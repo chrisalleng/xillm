@@ -113,7 +113,11 @@ def load_collision_with_walls(zone_id: int):
     return verts, tris_fixed, verts, wall_tris
 
 
-def make_settings():
+def make_settings(zone_id=None):
+    """Navmesh settings matching NavServer.get_mesh(). Applies the same
+    per-zone override (ZONE_NAV_OVERRIDES) so the detector's navmesh is
+    consistent with the server's — otherwise drop-off connections could
+    reference polys that don't exist in the production navmesh."""
     s = navmesh.NavSettings()
     s.cell_size = 0.20
     s.cell_height = 0.12
@@ -123,6 +127,13 @@ def make_settings():
     s.region_min_size = 2
     s.region_merge_size = 20
     s.tile_size = 1024
+    if zone_id is not None:
+        # Import lazily to avoid pulling in the full server stack at module
+        # load time (dropoff_detect is also runnable standalone).
+        from navserver.server import NavServer
+        overrides = NavServer.ZONE_NAV_OVERRIDES.get(zone_id, {})
+        for k, v in overrides.items():
+            setattr(s, k, v)
     return s
 
 
@@ -202,6 +213,152 @@ def load_hitwall_bboxes_rc(zone_id, ffxi_path):
             min(zs) - 0.5, max(zs) + 0.5,
         ))
     return bboxes
+
+
+def build_terrain_grid(verts_rc, tris, cell_size=5.0):
+    """Spatial index of collision triangles keyed by XZ cell (Recast space).
+    Each triangle is appended to every cell its XZ AABB overlaps. Returns
+    (dict[(cx,cz)]=list-of-tri-index, cell_size). Used for fast vertical-
+    segment-vs-triangle blocking checks in the drop-off detector."""
+    grid: dict[tuple[int, int], list[int]] = {}
+    n = len(tris)
+    if n == 0:
+        return grid, cell_size
+    # Compute per-triangle XZ bbox in one vectorized pass.
+    v0 = verts_rc[tris[:, 0]]
+    v1 = verts_rc[tris[:, 1]]
+    v2 = verts_rc[tris[:, 2]]
+    x_min = np.minimum(np.minimum(v0[:, 0], v1[:, 0]), v2[:, 0])
+    x_max = np.maximum(np.maximum(v0[:, 0], v1[:, 0]), v2[:, 0])
+    z_min = np.minimum(np.minimum(v0[:, 2], v1[:, 2]), v2[:, 2])
+    z_max = np.maximum(np.maximum(v0[:, 2], v1[:, 2]), v2[:, 2])
+    cx0 = np.floor(x_min / cell_size).astype(np.int32)
+    cx1 = np.floor(x_max / cell_size).astype(np.int32)
+    cz0 = np.floor(z_min / cell_size).astype(np.int32)
+    cz1 = np.floor(z_max / cell_size).astype(np.int32)
+    for i in range(n):
+        for cx in range(int(cx0[i]), int(cx1[i]) + 1):
+            for cz in range(int(cz0[i]), int(cz1[i]) + 1):
+                grid.setdefault((cx, cz), []).append(i)
+    return grid, cell_size
+
+
+def has_overhead_rock(grid_tuple, verts_rc, tris, x, z, y_floor,
+                      max_overhead=30.0, margin=0.2):
+    """Return True if there is a near-horizontal collision triangle whose
+    plane at (x, z) sits between `y_floor + margin` and `y_floor +
+    max_overhead`. Used to reject drop-off candidates whose START poly
+    is sitting under solid rock — Recast voxelizes the rock's underside
+    or sides as a walkable poly at slightly the wrong height, creating
+    a phantom drop that arrows through the rock to whatever's below.
+
+    Filters to triangles within 60° of horizontal (`ny²/|n|² > 0.25`):
+    walls and slopes are ignored, only floors/ceilings count."""
+    grid, cell_size = grid_tuple
+    cx = int(math.floor(x / cell_size))
+    cz = int(math.floor(z / cell_size))
+    tri_ids = grid.get((cx, cz), ())
+    y_min = y_floor + margin
+    y_max = y_floor + max_overhead
+    for idx in tri_ids:
+        a = verts_rc[tris[idx, 0]]
+        b = verts_rc[tris[idx, 1]]
+        c = verts_rc[tris[idx, 2]]
+        ax, az = a[0], a[2]
+        bx, bz = b[0], b[2]
+        cx2, cz2 = c[0], c[2]
+        d1 = (x - bx) * (az - bz) - (ax - bx) * (z - bz)
+        d2 = (x - cx2) * (bz - cz2) - (bx - cx2) * (z - cz2)
+        d3 = (x - ax) * (cz2 - az) - (cx2 - ax) * (z - az)
+        neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+        pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+        if neg and pos:
+            continue
+        e1x = b[0] - a[0]; e1y = b[1] - a[1]; e1z = b[2] - a[2]
+        e2x = c[0] - a[0]; e2y = c[1] - a[1]; e2z = c[2] - a[2]
+        nx = e1y * e2z - e1z * e2y
+        ny = e1z * e2x - e1x * e2z
+        nz = e1x * e2y - e1y * e2x
+        n_len_sq = nx * nx + ny * ny + nz * nz
+        if n_len_sq < 1e-12:
+            continue
+        if (ny * ny) / n_len_sq < 0.25:
+            continue
+        if abs(ny) < 1e-6:
+            continue
+        y_hit = a[1] - (nx * (x - ax) + nz * (z - az)) / ny
+        if y_min < y_hit < y_max:
+            return True
+    return False
+
+
+def segment_blocked(grid_tuple, verts_rc, tris, s, e, margin=0.5):
+    """Return True if the 3D line segment `s`→`e` (Recast space) is
+    intersected by any collision triangle strictly between the endpoints
+    (a margin of `margin` yalms is excluded at each end to avoid self-
+    intersection with the top-cliff and landing polys). Catches drop-off
+    candidates whose straight fall line passes through solid geometry —
+    cave ceilings, overhanging rock, or floors between two stacked
+    levels — which means the "drop" can't actually happen.
+
+    Implementation: walk XZ grid cells along the segment; for each
+    collected triangle run Möller-Trumbore ray-triangle intersection."""
+    grid, cell_size = grid_tuple
+    dx = e[0] - s[0]
+    dy = e[1] - s[1]
+    dz = e[2] - s[2]
+    seg_len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if seg_len < 1e-6:
+        return False
+    t_lo = margin / seg_len
+    t_hi = 1.0 - t_lo
+    if t_hi <= t_lo:
+        return False
+
+    # Visit every XZ cell the segment crosses. Step at half cell_size so
+    # we don't miss any cell for diagonal paths.
+    steps = max(2, int(seg_len / (cell_size * 0.5)) + 1)
+    cells_seen = set()
+    inv_steps = 1.0 / steps
+    for i in range(steps + 1):
+        t = i * inv_steps
+        cx = int(math.floor((s[0] + t * dx) / cell_size))
+        cz = int(math.floor((s[2] + t * dz) / cell_size))
+        cells_seen.add((cx, cz))
+
+    tested = set()
+    for key in cells_seen:
+        for idx in grid.get(key, ()):
+            if idx in tested:
+                continue
+            tested.add(idx)
+            a = verts_rc[tris[idx, 0]]
+            b = verts_rc[tris[idx, 1]]
+            c = verts_rc[tris[idx, 2]]
+            # Möller-Trumbore ray/triangle intersection (adapted for segment).
+            e1x = b[0] - a[0]; e1y = b[1] - a[1]; e1z = b[2] - a[2]
+            e2x = c[0] - a[0]; e2y = c[1] - a[1]; e2z = c[2] - a[2]
+            px = dy * e2z - dz * e2y
+            py = dz * e2x - dx * e2z
+            pz = dx * e2y - dy * e2x
+            det = e1x * px + e1y * py + e1z * pz
+            if -1e-8 < det < 1e-8:
+                continue
+            inv_det = 1.0 / det
+            tx = s[0] - a[0]; ty = s[1] - a[1]; tz = s[2] - a[2]
+            u = (tx * px + ty * py + tz * pz) * inv_det
+            if u < 0.0 or u > 1.0:
+                continue
+            qx = ty * e1z - tz * e1y
+            qy = tz * e1x - tx * e1z
+            qz = tx * e1y - ty * e1x
+            v = (dx * qx + dy * qy + dz * qz) * inv_det
+            if v < 0.0 or u + v > 1.0:
+                continue
+            t_hit = (e2x * qx + e2y * qy + e2z * qz) * inv_det
+            if t_lo < t_hit < t_hi:
+                return True
+    return False
 
 
 def build_hitwall_grid(hitwall_bboxes, cell_size=5.0):
@@ -312,7 +469,8 @@ def detect_dropoffs(
 
     print(f"[dropoff_detect] building navmesh...")
     t0 = time.time()
-    mesh = navmesh.build_navmesh(verts, tris, make_settings())
+    settings = make_settings(zone_id)
+    mesh = navmesh.build_navmesh(verts, tris, settings)
     ground, off = navmesh.count_polys(mesh)
     print(f"  built in {time.time()-t0:.1f}s  ({ground} ground + {off} off-mesh polys)")
 
@@ -321,17 +479,26 @@ def detect_dropoffs(
     print(f"  found {len(hitwall_bboxes)} hitwall instances")
     wall_grid = build_hitwall_grid(hitwall_bboxes, cell_size=5.0)
 
+    # Terrain-intersection grid: catches drops whose straight vertical fall
+    # passes through solid geometry (cave ceilings, overhangs). Zone 7 has
+    # no hitwall markers but dense cave structure; the terrain check is
+    # what distinguishes a real cliff from a drop-through-the-ceiling.
+    print(f"[dropoff_detect] building terrain-intersection grid...")
+    terrain_grid = build_terrain_grid(verts, tris, cell_size=5.0)
+    print(f"  {sum(len(v) for v in terrain_grid[0].values())} tri-cell entries "
+          f"across {len(terrain_grid[0])} cells")
+
     print(f"[dropoff_detect] enumerating border edges...")
     edges = navmesh.enumerate_border_edges(mesh)
     print(f"  {len(edges)} border edges")
 
     # Each edge: (p1x, p1y, p1z, p2x, p2y, p2z, nx, nz, poly_ref)
-    agent_radius = 1.5
+    agent_radius = settings.agent_radius
 
     candidates = []
     skipped = {"wall_blocked": 0,
                "same_poly": 0, "no_landing": 0, "too_shallow": 0, "too_far": 0,
-               "already_reachable": 0}
+               "already_reachable": 0, "terrain_between": 0, "start_overhung": 0}
 
     for i, edge in enumerate(edges):
         p1x, p1y, p1z, p2x, p2y, p2z, nx, nz, top_ref = edge
@@ -404,6 +571,27 @@ def detect_dropoffs(
                 skipped["already_reachable"] += 1
                 continue
 
+        # Terrain-intersection filter: does the straight 3D drop path
+        # (start→landing, diagonal through air) pass through solid
+        # geometry? Covers cave ceilings, overhangs, and inter-level
+        # floors that stand between the top poly and the landing poly.
+        if segment_blocked(terrain_grid, verts, tris,
+                           start_rc, end_rc, margin=0.5):
+            skipped["terrain_between"] += 1
+            continue
+
+        # Overhead-rock filter: a real cliff has clear sky above the
+        # step-off point. If there's a ceiling triangle (downward-facing
+        # surface) within max_overhead yalms above the start, the start
+        # poly is sitting under solid rock — a navmesh artifact, not a
+        # genuine cliff edge. Drops emitted here would arrow through
+        # the cave/overhang ceiling into the room below.
+        if has_overhead_rock(terrain_grid, verts, tris,
+                             start_rc[0], start_rc[2], start_rc[1],
+                             max_overhead=30.0, margin=0.2):
+            skipped["start_overhung"] += 1
+            continue
+
         candidates.append({
             "start_rc": start_rc,
             "end_rc": end_rc,
@@ -462,6 +650,19 @@ def write_output(zone_id: int, connections: list, max_fall: float):
     with open(out_path, "w") as f:
         json.dump(payload, f, indent=2)
     print(f"[dropoff_detect] wrote {out_path} ({len(connections)} connections)")
+
+    # Auto-deploy to the Ashita addon folder so /mapper dropoffs reload
+    # picks up the new connections without a separate deploy step. Mirrors
+    # the instances-JSON auto-deploy in extract_collision.py.
+    deploy_dir = Path(
+        "/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/"
+        "config/addons/mapper/dropoffs"
+    )
+    if deploy_dir.parent.is_dir():
+        deploy_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(out_path, deploy_dir / f"{zone_id}.json")
+        print(f"[dropoff_detect] deployed to {deploy_dir / f'{zone_id}.json'}")
 
 
 def main():

@@ -379,6 +379,17 @@ class NavServer:
     ZONE_NAV_OVERRIDES = {
         # Add entries like `106: {'agent_radius': 1.8}` to override per-zone
         # NavSettings fields when a specific zone needs different tuning.
+        # Attohwa Chasm: steep mountain trails + dense instance collision.
+        # These aggressive settings make the main trail system reachable;
+        # currently paired with a temporary terrain-only collision JSON for
+        # zone 7 (see 7.json.withinstances.bak) while we identify which
+        # instance objects are incorrectly blocking traversal.
+        7: {
+            'agent_radius': 0.25,
+            'agent_max_slope': 45.0,
+            'agent_max_climb': 0.6,
+            'cell_height': 0.06,
+        },
     }
 
     def get_mesh(self, zone_id: int):
