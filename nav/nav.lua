@@ -16,7 +16,7 @@
 
 addon.name    = 'nav'
 addon.author  = 'xillm'
-addon.version = '.37'
+addon.version = '.38'
 addon.desc    = 'Navigation client for FFXI (Python agent_core backend)'
 addon.link    = ''
 
@@ -61,6 +61,12 @@ local state = {
     -- Request/response handshake
     pending_seq = nil,   -- sequence number of request awaiting response
     last_seq    = 0,     -- monotonic counter
+    -- Highest nav_path.json seq we've consumed. Used so we don't re-
+    -- process the same response on every poll, and so the orchestrator
+    -- can push a fresh path (e.g., from an LLM goal-manager directive)
+    -- without us having a pending_seq on file: any seq > consumed_seq
+    -- AND > last_seq is treated as an orchestrator-initiated command.
+    consumed_seq = 0,
     -- Weather
     weather_id  = 0,
     -- Search mode
@@ -520,16 +526,25 @@ local function retry_or_fail(px, py, pz)
 end
 
 local function check_path_response()
-    if state.pending_seq == nil then return end
-
     local data = read_json(ipc_path('nav_path.json'))
     if not data then return end
+    local seq = data.seq
+    if seq == nil then return end
 
-    -- Only accept responses matching our pending request
-    if data.seq ~= state.pending_seq then return end
-
-    -- Response received - clear pending
-    state.pending_seq = nil
+    -- Two acceptance modes:
+    --   1. We have a pending request and this response matches it.
+    --   2. We have NO pending request and this is a fresh seq we haven't
+    --      seen before — the orchestrator (goal manager / LLM planner)
+    --      pushed a path for us to follow.
+    -- consumed_seq tracks the last response we've already processed so
+    -- we don't re-handle stale responses on every poll.
+    if state.pending_seq ~= nil then
+        if seq ~= state.pending_seq then return end
+        state.pending_seq = nil
+    else
+        if seq <= state.consumed_seq then return end
+    end
+    state.consumed_seq = seq
 
     -- Handle cross_zone_goto response
     if data.action == 'cross_zone_goto' then
