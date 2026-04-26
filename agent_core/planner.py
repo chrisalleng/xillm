@@ -54,6 +54,14 @@ Goal types you can emit:
                   Optional: target_pos: [x, y, z]
   goto            { target_pos: [x, y, z], target_zone: <int>? }
                   same-zone goto; completes within ~8y of target_pos
+  farm            { target_name: <str>,
+                    stop_when:   { kill_count: <int> },
+                    rest_hp_pct: <int> }                # default 70
+                  drive a kill loop on the named mob in the player's
+                  CURRENT zone; the agent /ta's the mob, /attacks, rests
+                  when low HP, repeats until stop_when fires.
+                  MVP supports kill_count stop only; the player must
+                  already be near spawn points for the named mob.
   wait            { seconds: <float> }
 
 Each goal: id (short string), title, origin ("user" / "auto"),
@@ -137,7 +145,7 @@ UPDATE_GOALS_TOOL = {
                             'state': {'type': 'string', 'enum': ['pending']},
                             'type': {
                                 'type': 'string',
-                                'enum': ['composite', 'travel', 'goto', 'wait'],
+                                'enum': ['composite', 'travel', 'goto', 'farm', 'wait'],
                             },
                             'subgoals': {
                                 'type': 'array',
@@ -151,6 +159,12 @@ UPDATE_GOALS_TOOL = {
                                 'maxItems': 3,
                             },
                             'seconds': {'type': 'number'},
+                            'target_name': {'type': 'string'},
+                            'stop_when': {
+                                'type': 'object',
+                                'properties': {'kill_count': {'type': 'integer'}},
+                            },
+                            'rest_hp_pct': {'type': 'integer'},
                         },
                         'required': ['id', 'title', 'type', 'state'],
                     },

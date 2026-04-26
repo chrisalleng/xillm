@@ -69,6 +69,7 @@ class GoalManager:
         cfg: _config.Config,
         dispatch_goto: Callable[[dict[str, Any]], None],
         snapshot_provider: Callable[[], _Snapshot],
+        farming_director: Any | None = None,
     ):
         self.cfg = cfg
         self._dispatch = dispatch_goto
@@ -87,6 +88,9 @@ class GoalManager:
         # Cache of the active leaf id so external callers can ask without
         # re-walking the tree.
         self._active_leaf_id: str | None = None
+        # Farming director (Phase 3c). Optional; if absent, `farm` leaves
+        # complete immediately as a no-op so older configs don't wedge.
+        self.farming = farming_director
 
     # ---- tree helpers --------------------------------------------------
 
@@ -182,6 +186,10 @@ class GoalManager:
                 if started is None:
                     return False
                 return time.time() - started >= leaf.get('seconds', 0)
+            if t == 'farm':
+                # The farming director marks itself completed when the
+                # `stop_when` directive fires (e.g. kill_count reached).
+                return self.farming is not None and self.farming.is_done()
             return False
         # Explicit completion clauses.
         ctype = completion.get('type')
@@ -221,6 +229,18 @@ class GoalManager:
             return
         if t == 'composite':
             return  # nothing to dispatch directly
+        if t == 'farm':
+            # Farm leaves are stateful — handed once to the director,
+            # which then drives /ta + /attack + /heal cycles tick-by-tick.
+            # `_should_dispatch` still gates the *first* hand-off so we
+            # don't restart the director on every tick.
+            if not self._should_dispatch(gid, snap, now):
+                return
+            if self.farming is not None:
+                self.farming.start(leaf)
+                self._last_dispatch[gid] = now
+                self._dispatched_zone[gid] = snap.zone_id
+            return
         if not self._should_dispatch(gid, snap, now):
             return
         if t == 'travel':
@@ -274,6 +294,11 @@ class GoalManager:
                 )
             self._active_leaf_id = leaf_id
         if leaf_id is None:
+            # No active leaf: if the farming director was running for a
+            # previous leaf, tell it to stop so /attack doesn't keep
+            # firing after the goal tree was cleared.
+            if self.farming is not None and self.farming.is_active():
+                self.farming.stop()
             return
         leaf = self._node(leaf_id)
         if leaf is None:
@@ -283,6 +308,11 @@ class GoalManager:
         if leaf.get('state', 'pending') == 'pending':
             leaf['state'] = 'active'
             self._save()
+        # The farming director is a long-running state machine. Tick it
+        # before the completion check so a kill that just happened gets
+        # counted before we evaluate stop_when.
+        if leaf.get('type') == 'farm' and self.farming is not None and self.farming.is_active():
+            self.farming.tick()
         if self._is_complete(leaf, snap):
             leaf['state'] = 'completed'
             self._last_dispatch.pop(leaf_id, None)

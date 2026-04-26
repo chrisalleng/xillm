@@ -63,22 +63,32 @@ class NavServer:
         self.transitions: dict[int, list] = {}
         self.reachability: dict[int, dict] = {}
         self._load_transitions()
-        # Phase 2 scaffolding: load config + goal manager + LLM planner.
-        # The goal manager runs alongside the request handler and
-        # dispatches its directives by calling handle_request directly
-        # (no round-trip through nav_request.json). The planner consumes
-        # free-text user goals from agent_request.json and writes a
-        # decomposed tree to the goal manager's persistent file.
+        # Phase 2 + 3c scaffolding: load config + goal manager +
+        # farming director + LLM planner. The goal manager runs
+        # alongside the request handler and dispatches its directives
+        # by calling handle_request directly (no round-trip through
+        # nav_request.json). The farming director handles long-running
+        # `farm` leaves via the combat addon's state file. The planner
+        # consumes free-text user goals from agent_request.json and
+        # writes a decomposed tree (and optional gambit list) to the
+        # goal manager's persistent file.
         from . import config as _config
+        from . import farming as _farming
         from . import goal_manager as _gm
         from . import llm_gateway as _llm
         from . import planner as _planner
         self.cfg = _config.load()
         self.llm = _llm.LLMGateway(self.cfg)
+        self.farming = _farming.FarmingDirector(
+            cfg=self.cfg,
+            snapshot_provider=self._read_combat_snapshot,
+            issue_command=self._issue_command,
+        )
         self.goal_manager = _gm.GoalManager(
             cfg=self.cfg,
             dispatch_goto=self.handle_request,
             snapshot_provider=self._read_player_snapshot,
+            farming_director=self.farming,
         )
         self.planner = _planner.Planner(self.cfg, self.llm, self.goal_manager)
         self._last_agent_request_seq = 0
@@ -103,6 +113,38 @@ class NavServer:
             y=s.get('y'),
             z=s.get('z'),
             moving=bool(s.get('moving', False)),
+        )
+
+    def _read_combat_snapshot(self):
+        """Build the farming director's snapshot from combat.json.
+        Returns a _Snapshot with all fields possibly None — the director
+        treats nil as "no info yet, retry"."""
+        from . import farming as _farming
+        path = self.cfg.paths.state_dir(self.cfg.character) / 'combat.json'
+        if not path.exists():
+            return _farming._Snapshot(
+                self_hp_pct=None, self_status=None,
+                target_name=None, target_alive=None, target_hp_pct=None,
+                engaged=False,
+            )
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return _farming._Snapshot(
+                self_hp_pct=None, self_status=None,
+                target_name=None, target_alive=None, target_hp_pct=None,
+                engaged=False,
+            )
+        s = d.get('self') or {}
+        t = d.get('target') or {}
+        return _farming._Snapshot(
+            self_hp_pct=s.get('hp_pct'),
+            self_status=s.get('status'),
+            target_name=t.get('name') if t else None,
+            target_alive=t.get('alive') if t else None,
+            target_hp_pct=t.get('hp_pct') if t else None,
+            engaged=bool(d.get('engaged', False)),
         )
 
     def _load_transitions(self):
