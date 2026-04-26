@@ -18,6 +18,10 @@ cp /home/chris/workspace/xillm/combat/combat.lua $ASHITA/addons/combat/
 mkdir -p $ASHITA/addons/chat
 cp /home/chris/workspace/xillm/chat/chat.lua $ASHITA/addons/chat/
 
+# inventory addon (Phase 6): per-container item snapshot + equipped gear
+mkdir -p $ASHITA/addons/inventory
+cp /home/chris/workspace/xillm/inventory/inventory.lua $ASHITA/addons/inventory/
+
 # cmdrelay (relays cmd_inbox.txt lines as /commands inside Ashita).
 # Kept under our deployment so we can fix bugs in it without manual
 # copies. Reloaded BEFORE issuing any other commands below so the
@@ -40,5 +44,7 @@ sleep 2
     echo '/addon reload combat'
     echo '/addon load chat'
     echo '/addon reload chat'
+    echo '/addon load inventory'
+    echo '/addon reload inventory'
 } > $ASHITA/config/addons/nav/cmd_inbox.txt
 echo "Deployed and reloaded."

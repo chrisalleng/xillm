@@ -1055,6 +1055,17 @@ class NavServer:
         except Exception as e:
             print(f'Error handling request: {e}')
             self.write_response({'status': 'error', 'message': str(e), 'timestamp': time.time()})
+        finally:
+            # nav_request.json is a one-shot trigger, NOT a state file.
+            # Without this delete, an addon-issued goto persists on disk
+            # forever — and after an agent_core restart (which resets
+            # last_request_mtime to 0) the same stale request gets
+            # treated as fresh and replayed. Same fix we applied to
+            # agent_request.json earlier this session.
+            try:
+                REQUEST_FILE.unlink()
+            except OSError:
+                pass
 
     def poll_agent_request(self):
         """Watch the addon's agent_request.json for new top-level user

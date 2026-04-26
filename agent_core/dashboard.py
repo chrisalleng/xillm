@@ -189,8 +189,10 @@ def _build_snapshot(cfg: _config.Config) -> dict[str, Any]:
                 nav = {}
     combat = ws.get('combat') or {}
     chat = ws.get('chat') or {}
+    inventory = ws.get('inventory') or {}
     self_ = combat.get('self') or {}
     target = combat.get('target') or {}
+    inv_main = (inventory.get('containers') or {}).get('inventory') or {}
     world = {
         'zone':       f"{nav.get('zone_id', '?')} ({nav.get('zone_name', '?')})",
         'pos':        f"({nav.get('x'):.1f}, {nav.get('y'):.1f}, {nav.get('z'):.1f})"
@@ -205,6 +207,8 @@ def _build_snapshot(cfg: _config.Config) -> dict[str, Any]:
         'target':     target.get('name', '—') if target else '—',
         'target_hp':  f"{target.get('hp_pct', '?')}%" if target else '—',
         'chat_lines': len(chat.get('lines', [])) if chat else 0,
+        'inv_used':   f"{inv_main.get('used', 0)}/{inv_main.get('capacity', 0)}"
+                       if inv_main else '—',
     }
 
     # Persistent files
