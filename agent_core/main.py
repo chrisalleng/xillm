@@ -63,18 +63,25 @@ class NavServer:
         self.transitions: dict[int, list] = {}
         self.reachability: dict[int, dict] = {}
         self._load_transitions()
-        # Phase 2 scaffolding: load config + goal manager. The goal
-        # manager runs alongside the request handler and dispatches its
-        # directives by calling handle_request directly (no round-trip
-        # through nav_request.json).
+        # Phase 2 scaffolding: load config + goal manager + LLM planner.
+        # The goal manager runs alongside the request handler and
+        # dispatches its directives by calling handle_request directly
+        # (no round-trip through nav_request.json). The planner consumes
+        # free-text user goals from agent_request.json and writes a
+        # decomposed tree to the goal manager's persistent file.
         from . import config as _config
         from . import goal_manager as _gm
+        from . import llm_gateway as _llm
+        from . import planner as _planner
         self.cfg = _config.load()
+        self.llm = _llm.LLMGateway(self.cfg)
         self.goal_manager = _gm.GoalManager(
             cfg=self.cfg,
             dispatch_goto=self.handle_request,
             snapshot_provider=self._read_player_snapshot,
         )
+        self.planner = _planner.Planner(self.cfg, self.llm, self.goal_manager)
+        self._last_agent_request_seq = 0
 
     def _read_player_snapshot(self):
         """Build the goal-manager snapshot from the addon's nav_status.json.
@@ -958,6 +965,39 @@ class NavServer:
             print(f'Error handling request: {e}')
             self.write_response({'status': 'error', 'message': str(e), 'timestamp': time.time()})
 
+    def poll_agent_request(self):
+        """Watch the addon's agent_request.json for new top-level user
+        goals. Each request is a JSON object with `seq` (monotonic) and
+        `goal` (free-text). On a new seq, hand the goal to the LLM
+        planner; the planner replaces the persistent goal tree."""
+        agent_req = IPC_DIR / 'agent_request.json'
+        if not agent_req.exists():
+            return
+        try:
+            with open(agent_req) as f:
+                req = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+        seq = req.get('seq', 0)
+        if not seq or seq == self._last_agent_request_seq:
+            return
+        self._last_agent_request_seq = seq
+        action = req.get('action')
+        if action == 'set_goal':
+            text = (req.get('goal') or '').strip()
+            if not text:
+                return
+            print(f'[agent_request #{seq}] set_goal: {text!r}')
+            self.planner.plan(text, self.zone_names)
+        elif action == 'clear_goals':
+            print(f'[agent_request #{seq}] clear_goals')
+            from . import persistence as _persistence
+            empty = _persistence.Goals()
+            empty.save(self.goal_manager._goals_path)
+            self.goal_manager.goals = empty
+            self.goal_manager._last_dispatch.clear()
+            self.goal_manager._active_leaf_id = None
+
     VERSION = '.8'
 
     def run(self):
@@ -973,6 +1013,7 @@ class NavServer:
         try:
             while True:
                 self.poll()
+                self.poll_agent_request()
                 tick_counter += 1
                 if tick_counter >= ticks_per_goal_run:
                     tick_counter = 0
