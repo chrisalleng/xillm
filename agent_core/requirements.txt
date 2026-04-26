@@ -1,0 +1,6 @@
+# agent_core runtime dependencies.
+# Install with: <venv>/bin/pip install -r agent_core/requirements.txt
+numpy>=1.26
+openai>=1.40   # OpenAI-compatible client; works with Groq, OpenAI, Anthropic, etc.
+# tomli is only needed on Python <3.11; tomllib ships with the stdlib otherwise.
+tomli>=2.0;python_version<"3.11"

@@ -1,8 +1,9 @@
 """Runtime configuration for agent_core.
 
 Sources, in priority order:
-    1. environment variables (`AGENT_CHARACTER`, `AGENT_LLM_REACTIVE_MODEL`, ...)
-    2. `agent_core/config.toml` (created on first run with defaults if absent)
+    1. environment variables (`AGENT_CHARACTER`, `AGENT_LLM_API_KEY`,
+       `AGENT_LLM_BASE_URL`, `AGENT_LLM_REACTIVE_MODEL`, ...)
+    2. `agent_core/config.toml` (gitignored — write API keys here)
     3. compiled-in defaults below
 
 The character name is the namespace key for every per-character state /
@@ -30,11 +31,21 @@ DEFAULT_ASHITA_BASE = Path(
 
 @dataclass
 class LLMConfig:
-    # Per-tier model defaults; tune via env vars or config.toml. The tiers
-    # are described in docs/agent-architecture.md ("LLM integration").
-    reactive: str = 'claude-haiku-4-5'
-    periodic: str = 'claude-sonnet-4-6'
-    deliberative: str = 'claude-opus-4-7'
+    # The orchestrator talks to any OpenAI-compatible API: Groq (default
+    # for free-tier dev), OpenAI, Together, llama.cpp's own server, etc.
+    # Anthropic also exposes an OpenAI-compat shim — point base_url at it
+    # to use Claude. base_url is provider-specific; api_key is always
+    # required.
+    base_url: str = 'https://api.groq.com/openai/v1'
+    api_key: str = ''  # set via env var or config.toml; never commit
+
+    # Per-tier model defaults. Tiers are described in
+    # docs/agent-architecture.md ("LLM integration"). Groq's free tier
+    # offers llama-3.1-8b-instant (fast) and llama-3.3-70b-versatile
+    # (smarter); we default to those. Override via env or config.toml.
+    reactive: str = 'llama-3.1-8b-instant'
+    periodic: str = 'llama-3.3-70b-versatile'
+    deliberative: str = 'llama-3.3-70b-versatile'
 
 
 @dataclass
@@ -78,14 +89,17 @@ def load() -> Config:
             data = tomllib.load(f)
         if 'character' in data:
             cfg.character = data['character']
-        if 'llm' in data:
-            for tier in ('reactive', 'periodic', 'deliberative'):
-                if tier in data['llm']:
-                    setattr(cfg.llm, tier, data['llm'][tier])
         if 'ipc_base' in data:
             cfg.paths.ipc_base = Path(data['ipc_base'])
+        if 'llm' in data:
+            llm = data['llm']
+            for key in ('base_url', 'api_key', 'reactive', 'periodic', 'deliberative'):
+                if key in llm:
+                    setattr(cfg.llm, key, llm[key])
 
     cfg.character = os.environ.get('AGENT_CHARACTER', cfg.character)
+    cfg.llm.api_key = os.environ.get('AGENT_LLM_API_KEY', cfg.llm.api_key)
+    cfg.llm.base_url = os.environ.get('AGENT_LLM_BASE_URL', cfg.llm.base_url)
     for tier in ('reactive', 'periodic', 'deliberative'):
         env_key = f'AGENT_LLM_{tier.upper()}_MODEL'
         if env_key in os.environ:

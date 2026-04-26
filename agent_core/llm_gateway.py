@@ -1,27 +1,31 @@
-"""LLM gateway: the only place agent_core talks to Anthropic.
+"""LLM gateway: the only place agent_core talks to the model provider.
 
-Every tier (reactive / periodic / deliberative) uses the same client
-but with a different default model. Each call:
-    - records prompt & response token counts and latency to the event log
-    - serialises tool-use turns into structured commands the orchestrator
-      then dispatches into `commands/<character>/*.json`
+We use the OpenAI Python SDK pointed at any OpenAI-compatible endpoint
+(Groq for free-tier dev, OpenAI proper, Anthropic's OpenAI-compat shim,
+Together, a local llama.cpp server, etc). The provider URL and API key
+come from `Config.llm.base_url` / `Config.llm.api_key`.
 
-Phase 1 scope: a working client that can call the API with a tiny
-"are you alive?" prompt — enough to verify creds + model IDs at
-startup. The full tool surface (read_world_state, update_goals, etc.)
-arrives in Phase 2 alongside the goal manager.
+Each call:
+    - selects the per-tier model from Config.llm
+    - records token counts + latency to `events.jsonl` so the dashboard
+      can show running cost
+    - returns text + the usage figures to the caller
+
+Phase 1 scope: a working `call()` that takes a plain prompt and returns
+text, plus a `healthcheck()` that does one cheap reactive-tier call.
+The full tool surface (read_world_state, update_goals, etc.) lands in
+Phase 2 alongside the goal manager — tool calls go through the same
+client, just with a `tools=[...]` param.
 """
 from __future__ import annotations
 
-import os
+import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 
 try:
-    import anthropic  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover - dependency optional during early dev
-    anthropic = None  # type: ignore[assignment]
+    from openai import OpenAI  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    OpenAI = None  # type: ignore[assignment]
 
 from . import config as _config
 from . import events as _events
@@ -37,15 +41,17 @@ class CallResult:
 
 
 class LLMGateway:
-    """Thin wrapper around the Anthropic SDK with our tiering + logging."""
+    """Thin wrapper around an OpenAI-compatible client with our tiering + logging."""
 
     def __init__(self, cfg: _config.Config):
         self.cfg = cfg
-        if anthropic is None:
+        if OpenAI is None or not cfg.llm.api_key:
             self.client = None
         else:
-            api_key = os.environ.get('ANTHROPIC_API_KEY')
-            self.client = anthropic.Anthropic(api_key=api_key) if api_key else None
+            self.client = OpenAI(
+                api_key=cfg.llm.api_key,
+                base_url=cfg.llm.base_url,
+            )
 
     @property
     def available(self) -> bool:
@@ -60,25 +66,27 @@ class LLMGateway:
         helper — no tools, no streaming. Tools come in Phase 2."""
         if self.client is None:
             raise RuntimeError(
-                'Anthropic client unavailable. Install `anthropic` and '
-                'set ANTHROPIC_API_KEY to use the LLM gateway.'
+                'LLM client unavailable. Install `openai` and set '
+                'AGENT_LLM_API_KEY (or put it in agent_core/config.toml) '
+                'to use the LLM gateway.'
             )
-        import time
         model = self._model_for(tier)
         t0 = time.time()
-        resp = self.client.messages.create(
+        resp = self.client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,
             messages=[{'role': 'user', 'content': prompt}],
         )
         latency = time.time() - t0
-        text = ''.join(
-            block.text for block in resp.content if getattr(block, 'type', None) == 'text'
-        )
+        text = (resp.choices[0].message.content or '') if resp.choices else ''
+        # Groq + OpenAI both populate `usage`; some providers omit it.
+        usage = getattr(resp, 'usage', None)
+        in_tok = getattr(usage, 'prompt_tokens', 0) if usage else 0
+        out_tok = getattr(usage, 'completion_tokens', 0) if usage else 0
         result = CallResult(
             text=text,
-            input_tokens=resp.usage.input_tokens,
-            output_tokens=resp.usage.output_tokens,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
             latency_s=latency,
             model=model,
         )
@@ -95,12 +103,16 @@ class LLMGateway:
         )
         return result
 
-    def healthcheck(self) -> bool:
-        """One quick reactive-tier call to confirm creds + model ID work."""
+    def healthcheck(self) -> CallResult | None:
+        """One reactive-tier round trip to confirm creds + model ID work.
+        Returns the CallResult on success, None on any failure."""
         if not self.available:
-            return False
+            return None
         try:
-            r = self.call('reactive', 'Reply with the single word: ok', max_tokens=8)
+            return self.call(
+                'reactive',
+                'Reply with the single word: ok',
+                max_tokens=8,
+            )
         except Exception:
-            return False
-        return 'ok' in r.text.lower()
+            return None
