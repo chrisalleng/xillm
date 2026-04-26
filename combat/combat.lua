@@ -19,7 +19,7 @@
 
 addon.name    = 'combat'
 addon.author  = 'xillm'
-addon.version = '0.1'
+addon.version = '0.4'
 addon.desc    = 'Combat state publisher (Tier 1 addon for the agent_core orchestrator)'
 
 require('common')
@@ -73,26 +73,35 @@ local function msg(text)
 end
 
 local function ensure_dir(path)
-    -- io.popen(mkdir -p) is portable enough for our deploy target;
-    -- Ashita's lua doesn't ship LuaFileSystem.
-    local cmd = 'mkdir -p "' .. path .. '"'
-    pcall(function() os.execute(cmd) end)
+    -- ashita.fs.create_directory is recursive (creates intermediate
+    -- parents) per Ashita's annotations. Available on every Ashita v4
+    -- build we'd target.
+    pcall(function() ashita.fs.create_directory(path) end)
 end
 
-local function write_json_atomic(path, data)
-    -- temp + rename like agent_core's persistence layer; readers never
-    -- see a partial file.
-    local tmp = path .. '.tmp'
-    local f, err = io.open(tmp, 'w')
+-- Simple writer. We don't bother with temp+rename on Windows because
+-- os.rename fails when the target exists (it's not POSIX atomic-replace),
+-- and the readers (agent_core) already tolerate a partial JSON read by
+-- pcalling json.load and skipping on failure. Combat state refreshes
+-- every ~100ms anyway, so a single missed parse is invisible.
+local last_encode_error = nil
+local function write_json(path, data)
+    local ok, encoded = pcall(json.encode, data)
+    if not ok or encoded == nil then
+        local err_str = tostring(encoded)
+        if err_str ~= last_encode_error then
+            msg('json.encode failed: ' .. err_str)
+            last_encode_error = err_str
+        end
+        return
+    end
+    local f, err = io.open(path, 'w')
     if not f then
         msg('write fail: ' .. tostring(err))
         return
     end
-    f:write(json.stringify(data))
+    f:write(encoded)
     f:close()
-    -- io.rename in a Lua sandbox is missing on some Ashita builds; fall
-    -- back to os.rename which exists everywhere.
-    os.rename(tmp, path)
 end
 
 -------------------------------------------------------------------------------
@@ -241,7 +250,7 @@ local function publish()
     payload.target    = read_target()
     payload.party     = read_party()
     local path = get_data_path() .. 'state/' .. char .. '/combat.json'
-    write_json_atomic(path, payload)
+    write_json(path, payload)
 end
 
 -------------------------------------------------------------------------------

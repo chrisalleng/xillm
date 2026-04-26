@@ -9,7 +9,7 @@
 
 addon.name    = 'cmdrelay'
 addon.author  = 'xillm'
-addon.version = '1.0'
+addon.version = '1.1'
 addon.desc    = 'Polls cmd_inbox.txt to relay commands (survives nav crashes)'
 
 require('common')
@@ -33,17 +33,25 @@ local function inbox_path()
 end
 
 local function poll()
+    -- Consume every command in the inbox per poll, not just the first.
+    -- Producers (e.g. agent_core/deploy.sh) often need to issue several
+    -- commands together — `/addon reload nav` + `/addon load combat`
+    -- + `/addon reload combat` for instance — and the previous one-line
+    -- behaviour silently dropped all but the first.
     local path = inbox_path()
     local f = io.open(path, 'r')
     if not f then return end
-    local cmd = f:read('*l')
+    local body = f:read('*a') or ''
     f:close()
-    -- Clear before executing so a reload doesn't re-trigger.
+    -- Clear immediately so a reload-during-execute doesn't re-trigger.
     local wf = io.open(path, 'w')
     if wf then wf:close() end
-    if cmd and cmd ~= '' then
-        print(string.format('[cmdrelay] exec: %s', cmd))
-        AshitaCore:GetChatManager():QueueCommand(1, cmd)
+    if body == '' then return end
+    for line in body:gmatch('[^\r\n]+') do
+        if line ~= '' then
+            print(string.format('[cmdrelay] exec: %s', line))
+            AshitaCore:GetChatManager():QueueCommand(1, line)
+        end
     end
 end
 
