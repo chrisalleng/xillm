@@ -479,12 +479,22 @@ class NavServer:
             self._apply_obstacle_blocking(zone_id, self.meshes[key])
         return self.meshes[key]
 
+    # When True, _load_dropoffs ignores the on-disk JSON entirely and
+    # returns an empty list. We're parking the auto-detected drop-offs
+    # for now (too many false positives in tight zones, and wide-radius
+    # routing already handles most legitimate cliff routes); known-good
+    # drops will be hand-added back later via the overrides.added block
+    # once we re-enable loading.
+    USE_AUTO_DROPOFFS = False
+
     def _load_dropoffs(self, zone_id: int):
         """Read nav/data/dropoffs/<zone_id>.json and return a list of
         off-mesh connections in Recast space, suitable for
         navmesh.build_navmesh(). Applies the overrides block: 'added' entries
         are appended and 'removed' entries (matched by approximate start XY)
         are filtered from the auto-detected set."""
+        if not self.USE_AUTO_DROPOFFS:
+            return []
         path = DROPOFF_DIR / f'{zone_id}.json'
         if not path.exists():
             return []
