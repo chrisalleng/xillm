@@ -1,5 +1,5 @@
 --[[
-* mapper - entities.lua
+* nav - entities.lua
 * Entity tracking: records mob positions, wander ranges, time-of-day, and weather.
 * Keyed by ServerId (unique per spawn point). Ignores claimed and dead entities.
 --]]

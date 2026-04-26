@@ -2,15 +2,15 @@
 * cmdrelay - Ashita v4 addon
 *
 * Polls cmd_inbox.txt every 30 frames and executes any command found.
-* Runs independently of mapper so it can reload mapper after a crash.
+* Runs independently of nav so it can reload nav after a crash.
 *
-* Inbox file: <ashita>/config/addons/mapper/cmd_inbox.txt
+* Inbox file: <ashita>/config/addons/nav/cmd_inbox.txt
 --]]
 
 addon.name    = 'cmdrelay'
 addon.author  = 'xillm'
 addon.version = '1.0'
-addon.desc    = 'Polls cmd_inbox.txt to relay commands (survives mapper crashes)'
+addon.desc    = 'Polls cmd_inbox.txt to relay commands (survives nav crashes)'
 
 require('common')
 
@@ -29,7 +29,7 @@ local function inbox_path()
     if base ~= '' and base:sub(-1) ~= '/' and base:sub(-1) ~= '\\' then
         base = base .. '/'
     end
-    return base .. 'config/addons/mapper/cmd_inbox.txt'
+    return base .. 'config/addons/nav/cmd_inbox.txt'
 end
 
 local function poll()

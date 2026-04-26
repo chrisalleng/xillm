@@ -7,7 +7,7 @@ downward within `max_fall` for the nearest walkable polygon. If a landing is
 found at least `min_drop` below the edge, emit a one-way connection from the
 top edge (slightly inside the source polygon) to the landing point.
 
-The output JSON shape matches `mapper/data/dropoffs/<zone_id>.json`:
+The output JSON shape matches `nav/data/dropoffs/<zone_id>.json`:
     {
       "zone_id": 110,
       "max_fall": 60.0,
@@ -43,10 +43,10 @@ sys.path.insert(0, str(Path(__file__).parent / "recast_wrapper" / "build"))
 import navmesh  # type: ignore
 
 ROOT = Path(__file__).parent.parent
-COLLISION_DIR = ROOT / "mapper" / "data" / "collision"
-DROPOFF_DIR = ROOT / "mapper" / "data" / "dropoffs"
+COLLISION_DIR = ROOT / "nav" / "data" / "collision"
+DROPOFF_DIR = ROOT / "nav" / "data" / "dropoffs"
 
-# The extractor and MZB parser live in the mapper tools directory. Import
+# The extractor and MZB parser live in the nav tools directory. Import
 # lazily (inside the function) so the module can still be imported without
 # those tools available (e.g. in the navserver).
 
@@ -120,10 +120,10 @@ def make_settings(zone_id=None):
     reference polys that don't exist in the production navmesh."""
     s = navmesh.NavSettings()
     s.cell_size = 0.20
-    s.cell_height = 0.12
-    s.agent_radius = 1.5
+    s.cell_height = 0.06
+    s.agent_radius = 0.25
     s.agent_max_slope = 45.0
-    s.agent_max_climb = 0.3
+    s.agent_max_climb = 0.6
     s.region_min_size = 2
     s.region_merge_size = 20
     s.tile_size = 1024
@@ -156,7 +156,7 @@ def load_hitwall_bboxes_rc(zone_id, ffxi_path):
       `hitwall_*` name prefix is the precise signal; regular solid models
       like `pl_sta_coi1_m` must not block a drop-off candidate."""
     import sys
-    tools = str(Path(__file__).parent.parent / "mapper" / "tools" / "extract_collision")
+    tools = str(Path(__file__).parent.parent / "nav" / "tools" / "extract_collision")
     if tools not in sys.path:
         sys.path.insert(0, tools)
     import extract_collision as ec  # type: ignore
@@ -470,7 +470,17 @@ def detect_dropoffs(
     print(f"[dropoff_detect] building navmesh...")
     t0 = time.time()
     settings = make_settings(zone_id)
-    mesh = navmesh.build_navmesh(verts, tris, settings)
+    try:
+        mesh = navmesh.build_navmesh(verts, tris, settings)
+    except RuntimeError as e:
+        # Indoor city zones, BCNM arenas, and similar have no walkable
+        # ground terrain — Recast refuses to build with "No tiles built".
+        # Such zones can't have drop-offs by definition; emit an empty
+        # connections list and exit gracefully so a sweep over all 255
+        # zones doesn't bail at the first interior.
+        print(f"[dropoff_detect] zone {zone_id} has no walkable geometry "
+              f"({e}); emitting empty dropoffs.")
+        return []
     ground, off = navmesh.count_polys(mesh)
     print(f"  built in {time.time()-t0:.1f}s  ({ground} ground + {off} off-mesh polys)")
 
@@ -651,12 +661,12 @@ def write_output(zone_id: int, connections: list, max_fall: float):
         json.dump(payload, f, indent=2)
     print(f"[dropoff_detect] wrote {out_path} ({len(connections)} connections)")
 
-    # Auto-deploy to the Ashita addon folder so /mapper dropoffs reload
+    # Auto-deploy to the Ashita addon folder so /nav dropoffs reload
     # picks up the new connections without a separate deploy step. Mirrors
     # the instances-JSON auto-deploy in extract_collision.py.
     deploy_dir = Path(
         "/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/"
-        "config/addons/mapper/dropoffs"
+        "config/addons/nav/dropoffs"
     )
     if deploy_dir.parent.is_dir():
         deploy_dir.mkdir(parents=True, exist_ok=True)

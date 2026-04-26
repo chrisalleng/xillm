@@ -2,7 +2,7 @@
 """Monitor nav client position and path progress in real-time."""
 import json, time, os, sys
 
-IPC_DIR = '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/mapper'
+IPC_DIR = '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/nav'
 STATUS = os.path.join(IPC_DIR, 'nav_status.json')
 PATH = os.path.join(IPC_DIR, 'nav_path.json')
 REQUEST = os.path.join(IPC_DIR, 'nav_request.json')

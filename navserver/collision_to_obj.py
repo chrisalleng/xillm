@@ -69,7 +69,7 @@ if __name__ == '__main__':
 
     zone_id = int(sys.argv[1])
     collision_dir = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
-        os.path.dirname(__file__), '..', 'mapper', 'data', 'collision')
+        os.path.dirname(__file__), '..', 'nav', 'data', 'collision')
     output_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.join(
         os.path.dirname(__file__), 'data', 'obj')
 

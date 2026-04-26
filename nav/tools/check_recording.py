@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-check_recording.py — compare a mapper.lua /mapper record session against what
+check_recording.py — compare a nav.lua /nav record session against what
 the navserver's Recast navmesh thinks about those same positions.
 
 Usage:
     python3 check_recording.py                 # reads nav_record.json from
-                                                # the default config/addons/mapper/ path
+                                                # the default config/addons/nav/ path
     python3 check_recording.py <path>          # explicit recording file
 
 For each recorded player sample, reports:
@@ -33,7 +33,7 @@ import navmesh  # noqa: E402
 import server as server_mod  # noqa: E402
 
 DEFAULT_RECORD = Path(
-    '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/mapper/nav_record.json')
+    '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/nav/nav_record.json')
 # Samples farther than this from ANY poly center are "far" — poly centers
 # can legitimately be 5-10y from an interior point, so tune high.
 OFF_MESH_THRESHOLD_Y = 15.0
@@ -45,7 +45,7 @@ STRIDE_Y = 3.0
 def main():
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_RECORD
     if not path.exists():
-        print(f'No recording at {path}. Run /mapper record start / stop in-game first.')
+        print(f'No recording at {path}. Run /nav record start / stop in-game first.')
         sys.exit(1)
 
     rec = json.load(open(path))
@@ -58,7 +58,7 @@ def main():
     centers = np.array(navmesh.get_poly_centers(mesh))
     print(f'Zone {zone_id} navmesh: {len(centers)} polys')
 
-    inst_path = REPO / 'mapper' / 'data' / 'instances' / f'{zone_id}.json'
+    inst_path = REPO / 'nav' / 'data' / 'instances' / f'{zone_id}.json'
     instances = []
     if inst_path.exists():
         instances = json.load(open(inst_path)).get('instances', [])
@@ -146,7 +146,7 @@ def main():
         print('→ Every consecutive recording pair is routable on the navmesh. The recording')
         print('  alone does not expose a coord/wall bug; the 12/36 cross-transition problem')
         print('  is likely specific to the endpoints zone_transitions.json picks, not the')
-        print('  middle of the path. Try /mapper goto between two transitions that fail.')
+        print('  middle of the path. Try /nav goto between two transitions that fail.')
 
 
 if __name__ == '__main__':

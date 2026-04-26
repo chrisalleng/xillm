@@ -1,8 +1,8 @@
 __pycache__/
 *.pyc
 navserver/recast_wrapper/build/
-mapper/data/obstacles/
-mapper/data/collision/
-mapper/data/instances/
-mapper/data/dropoffs/
+nav/data/obstacles/
+nav/data/collision/
+nav/data/instances/
+nav/data/dropoffs/
 .claude/

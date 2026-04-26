@@ -3,7 +3,7 @@
 extract_collision.py
 
 Extracts MZB collision geometry from FFXI DAT files and writes
-data/collision/<zone_id>.json for use by the mapper Lua addon.
+data/collision/<zone_id>.json for use by the nav Lua addon.
 
 Usage:
     python3 extract_collision.py --ffxi-path "/path/to/FFXI" --zone 107
@@ -24,7 +24,7 @@ Coordinate system output:
     then write coords as (vx, tz, vy) / (wx, wz, -wy) so the final values
     are in true Ashita with *no* residual sign flips.
 
-    Anything downstream (navserver, mapper addon, zone_transitions.json,
+    Anything downstream (navserver, nav addon, zone_transitions.json,
     obstacles/*.json) should also be in true Ashita. See
     ~/.claude/skills/ffxi-coordinates for the full convention rules.
 
@@ -327,6 +327,23 @@ def _parse_grid_mesh(data, visentryoffset, geometryoffset, all_vertices, all_tri
         vx = m[0] * lx + m[4] * ly + m[8]  * lz + m[12] * w
         vy = -(m[1] * lx + m[5] * ly + m[9]  * lz + m[13] * w)
         # vz = tz = m[2]*lx + m[6]*ly + m[10]*lz + m[14] (already computed)
+
+        # Sanity filter: zone 108 (Konschtat Highlands) and similar have
+        # MZB grid entries whose vertex bytes decode as out-of-range
+        # values (≥1.77e31 from uninitialized memory, or sentinel
+        # values like ±999/±1000/±1787 that look almost-valid). FFXI
+        # outdoor zones are bounded to ±1500y horizontally and ±400y
+        # vertically; anything past those is corrupt. Even one
+        # corrupt vert at ±1000 in elevation stretches the navmesh
+        # bbox so the cell_height=0.06 voxel column overflows and
+        # Recast collapses all walkable polys onto a single Y floor.
+        # Note the axis mapping: vx → Ashita.X, tz → Ashita.Y (NS),
+        # vy → engine.Y (becomes Ashita.Z elevation when negated below).
+        # Elevation gets the tighter cap; horizontal axes get 1500y.
+        if (abs(vx) > 1500.0 or abs(tz) > 1500.0 or abs(vy) > 400.0
+                or vx != vx or tz != tz or vy != vy):  # NaN check via self-compare
+            all_vertices.append(None)
+            continue
 
         # Emit vertices in Ashita LocalPosition convention:
         #   Ashita.X = engine.X      → vx
@@ -1118,7 +1135,7 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
     with open(out_path, 'w') as f:
         json.dump(out, f, separators=(',', ':'))
 
-    # Also emit a thin per-zone instance file for the Ashita mapper addon to
+    # Also emit a thin per-zone instance file for the Ashita nav addon to
     # draw object bounding boxes. Small enough to parse in-game; the full
     # collision JSON is too big for that.
     if instance_records:
@@ -1129,11 +1146,12 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
             json.dump({'zone_id': zone_id, 'instances': instance_records},
                       f, separators=(',', ':'))
         # Mirror the instances JSON to the Ashita addon's live config folder so
-        # the mapper picks up rule changes (e.g. `collides` flag) immediately
-        # without a manual re-run of deploy.sh. The target path is hardcoded
-        # to match deploy.sh; if it doesn't exist, skip silently.
+        # the nav addon picks up rule changes (e.g. `collides` flag)
+        # immediately without a manual re-run of deploy.sh. The target
+        # path is hardcoded to match deploy.sh; if it doesn't exist,
+        # skip silently.
         deploy_inst = ('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/'
-                       'config/addons/mapper/instances')
+                       'config/addons/nav/instances')
         if os.path.isdir(os.path.dirname(deploy_inst)):
             os.makedirs(deploy_inst, exist_ok=True)
             shutil.copy2(inst_path, os.path.join(deploy_inst, f"{zone_id}.json"))

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Navigation server for FFXI mapper addon.
+Navigation server for FFXI nav addon.
 
 Builds Recast navmeshes from collision data and provides pathfinding.
 Communicates with the Lua addon via JSON files:
@@ -21,11 +21,11 @@ import navmesh
 
 sys.stdout.reconfigure(line_buffering=True)
 
-COLLISION_DIR = SCRIPT_DIR.parent / 'mapper' / 'data' / 'collision'
-OBSTACLE_DIR = SCRIPT_DIR.parent / 'mapper' / 'data' / 'obstacles'
-DROPOFF_DIR = SCRIPT_DIR.parent / 'mapper' / 'data' / 'dropoffs'
-TRANSITIONS_FILE = SCRIPT_DIR.parent / 'mapper' / 'data' / 'zone_transitions.json'
-IPC_DIR = Path('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/mapper')
+COLLISION_DIR = SCRIPT_DIR.parent / 'nav' / 'data' / 'collision'
+OBSTACLE_DIR = SCRIPT_DIR.parent / 'nav' / 'data' / 'obstacles'
+DROPOFF_DIR = SCRIPT_DIR.parent / 'nav' / 'data' / 'dropoffs'
+TRANSITIONS_FILE = SCRIPT_DIR.parent / 'nav' / 'data' / 'zone_transitions.json'
+IPC_DIR = Path('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/nav')
 REQUEST_FILE = IPC_DIR / 'nav_request.json'
 PATH_FILE = IPC_DIR / 'nav_path.json'
 POLL_INTERVAL = 0.1
@@ -37,8 +37,18 @@ import heapq
 
 
 class NavServer:
+    # Fallback agent radius used when a request sets `wider_radius=true`.
+    # The default mesh is built with agent_radius=0.75 (the global default
+    # in get_mesh) — when the addon's first attempt at a goto fails
+    # because the path threads a too-narrow gap, it retries with this
+    # much larger value to force a clearly-conservative route.
+    FALLBACK_AGENT_RADIUS = 1.5
+
     def __init__(self):
-        self.meshes: dict[int, object] = {}
+        # meshes are keyed by (zone_id, radius) so the navserver can keep
+        # both the default-radius mesh and the wider-radius fallback in
+        # cache without rebuilding on every retry.
+        self.meshes: dict[tuple[int, float], object] = {}
         self.obstacles: dict[int, list] = {}
         self.last_request_mtime = 0
         self.zone_names: dict[int, str] = {}
@@ -375,58 +385,54 @@ class NavServer:
 
     # Per-zone NavSettings overrides. Keys match navmesh.NavSettings field
     # names (cell_size, agent_radius, agent_max_slope, agent_max_climb, ...).
-    # Defaults apply to every zone not listed here.
-    ZONE_NAV_OVERRIDES = {
-        # Add entries like `106: {'agent_radius': 1.8}` to override per-zone
-        # NavSettings fields when a specific zone needs different tuning.
-        # Attohwa Chasm: steep mountain trails + dense instance collision.
-        # These aggressive settings make the main trail system reachable;
-        # currently paired with a temporary terrain-only collision JSON for
-        # zone 7 (see 7.json.withinstances.bak) while we identify which
-        # instance objects are incorrectly blocking traversal.
-        7: {
-            'agent_radius': 0.25,
-            'agent_max_slope': 45.0,
-            'agent_max_climb': 0.6,
-            'cell_height': 0.06,
-        },
-    }
+    # Defaults (set in get_mesh) apply to every zone not listed here. Add
+    # entries like `106: {'agent_radius': 1.8}` to override specific zones.
+    ZONE_NAV_OVERRIDES: dict = {}
 
-    def get_mesh(self, zone_id: int):
-        if zone_id not in self.meshes:
-            print(f'Building navmesh for zone {zone_id}...')
+    def get_mesh(self, zone_id: int, wider_radius: bool = False):
+        # Defaults derived from end-to-end tuning in Attohwa Chasm
+        # (zone 7 — narrowest trails + densest instance collision):
+        #   - agent_radius=0.25 opens 1y-wide ledges and cliff trails;
+        #     larger values fragment the navmesh.
+        #   - agent_max_slope=45° matches FFXI's actual walkable angle.
+        #   - agent_max_climb=0.6 absorbs low rocks and small steps
+        #     without merging cliff terraces.
+        #   - cell_height=0.06 keeps stacked floors (cave levels,
+        #     bridges, multi-tier zones) as separate polys.
+        radius = self.FALLBACK_AGENT_RADIUS if wider_radius else 0.75
+        overrides = self.ZONE_NAV_OVERRIDES.get(zone_id, {})
+        if 'agent_radius' in overrides and not wider_radius:
+            radius = overrides['agent_radius']
+        key = (zone_id, radius)
+        if key not in self.meshes:
+            print(f'Building navmesh for zone {zone_id} (radius={radius})...')
             t0 = time.time()
             verts, tris = self.load_collision(zone_id)
             settings = navmesh.NavSettings()
             settings.cell_size = 0.20
-            settings.cell_height = 0.12
-            settings.agent_radius = 1.5
+            settings.cell_height = 0.06
+            settings.agent_radius = radius
             settings.agent_max_slope = 45.0
-            # Default agent_max_climb = 0.3y. Zone 110 recording shows real
-            # natural-terrain single-step climbs max out at ~0.37y with 95th
-            # percentile at 0.13y; 0.3 keeps 1y+ railings/walls as obstacles
-            # (previous 1.0y let rcFilterLowHangingWalkableObstacles smooth
-            # them into "tiny steps"). Bump per-zone if specific terrain
-            # ends up with holes.
-            settings.agent_max_climb = 0.3
+            settings.agent_max_climb = 0.6
             settings.region_min_size = 2
             settings.region_merge_size = 20
             settings.tile_size = 1024
-            overrides = self.ZONE_NAV_OVERRIDES.get(zone_id, {})
             for k, v in overrides.items():
+                if k == 'agent_radius' and wider_radius:
+                    continue  # honor the fallback radius, not the override
                 setattr(settings, k, v)
                 print(f'  Override {k}={v}')
             dropoffs = self._load_dropoffs(zone_id)
-            self.meshes[zone_id] = navmesh.build_navmesh(
+            self.meshes[key] = navmesh.build_navmesh(
                 verts, tris, settings,
                 off_mesh_connections=dropoffs,
             )
             print(f'  Built in {time.time()-t0:.1f}s')
-            self._apply_obstacle_blocking(zone_id, self.meshes[zone_id])
-        return self.meshes[zone_id]
+            self._apply_obstacle_blocking(zone_id, self.meshes[key])
+        return self.meshes[key]
 
     def _load_dropoffs(self, zone_id: int):
-        """Read mapper/data/dropoffs/<zone_id>.json and return a list of
+        """Read nav/data/dropoffs/<zone_id>.json and return a list of
         off-mesh connections in Recast space, suitable for
         navmesh.build_navmesh(). Applies the overrides block: 'added' entries
         are appended and 'removed' entries (matched by approximate start XY)
@@ -492,11 +498,13 @@ class NavServer:
         obstacles.append([round(x, 1), round(y, 1), round(z, 1)])
         self.save_obstacles(zone_id)
         print(f'  Stored obstacle at ({x:.1f}, {y:.1f}) for zone {zone_id} ({len(obstacles)} total)')
-        if zone_id in self.meshes:
-            center_rc = self.game_to_recast(x, y, z)
-            n = navmesh.mark_polys_blocked(self.meshes[zone_id], center_rc, OBSTACLE_BLOCK_RADIUS)
+        center_rc = self.game_to_recast(x, y, z)
+        for key, mesh in self.meshes.items():
+            if key[0] != zone_id:
+                continue
+            n = navmesh.mark_polys_blocked(mesh, center_rc, OBSTACLE_BLOCK_RADIUS)
             if n > 0:
-                print(f'  Blocked {n} polys near new obstacle')
+                print(f'  Blocked {n} polys near new obstacle (radius={key[1]})')
 
     def _apply_obstacle_blocking(self, zone_id: int, mesh):
         obstacles = self.load_obstacles(zone_id)
@@ -578,8 +586,9 @@ class NavServer:
 
         return waypoints
 
-    def find_path(self, zone_id, start_game, end_game, avoid_zone_exits=True):
-        mesh = self.get_mesh(zone_id)
+    def find_path(self, zone_id, start_game, end_game, avoid_zone_exits=True,
+                  wider_radius: bool = False):
+        mesh = self.get_mesh(zone_id, wider_radius=wider_radius)
         start_rc = self.game_to_recast(*start_game)
         end_rc = self.game_to_recast(*end_game)
         tx, ty = end_game[0], end_game[1]
@@ -733,13 +742,16 @@ class NavServer:
 
             player = req['player']
             target = req['target']
-            print(f'[#{seq}] goto zone={zone_id} from=({player[0]:.1f}, {player[1]:.1f}) to=({target[0]:.1f}, {target[1]:.1f})')
+            wider = bool(req.get('wider_radius'))
+            tag = ' [wider_radius]' if wider else ''
+            print(f'[#{seq}] goto zone={zone_id} from=({player[0]:.1f}, {player[1]:.1f}) to=({target[0]:.1f}, {target[1]:.1f}){tag}')
 
             try:
                 waypoints = self.find_path(
                     zone_id,
                     (player[0], player[1], player[2]),
                     (target[0], target[1], target[2]),
+                    wider_radius=wider,
                 )
 
                 if not waypoints:
@@ -851,11 +863,14 @@ class NavServer:
 
         elif action == 'clear_cache':
             zone = req.get('zone_id')
-            if zone and zone in self.meshes:
-                del self.meshes[zone]
+            if zone:
+                evicted = [k for k in self.meshes if k[0] == zone]
+                for k in evicted:
+                    del self.meshes[k]
                 self.reachability.pop(zone, None)
-                print(f'Cleared cache for zone {zone}')
-            elif not zone:
+                if evicted:
+                    print(f'Cleared cache for zone {zone} ({len(evicted)} mesh variant(s))')
+            else:
                 self.meshes.clear()
                 self.reachability.clear()
                 print('Cleared all caches')
@@ -864,8 +879,9 @@ class NavServer:
 
         elif action == 'clear_blocks':
             zone = req.get('zone_id')
-            if zone and zone in self.meshes:
-                n = navmesh.clear_blocked(self.meshes[zone])
+            if zone and any(k[0] == zone for k in self.meshes):
+                n = sum(navmesh.clear_blocked(mesh)
+                        for k, mesh in self.meshes.items() if k[0] == zone)
                 print(f'Cleared {n} blocked polys in zone {zone}')
                 self.write_response({'status': 'ok', 'action': 'clear_blocks',
                                      'zone_id': zone, 'cleared': n,

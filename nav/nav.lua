@@ -1,22 +1,22 @@
 --[[
-* mapper - mapper.lua
+* nav - nav.lua
 *
 * Ashita v4 addon: thin movement client for Python navigation server.
 *
 * Commands:
-*   /mapper goto <x> <y>              - navigate to coordinates
-*   /mapper goto <x> <y> <zone name>  - cross-zone navigation
-*   /mapper goto <zone name>           - navigate to zone
-*   /mapper goto "entity name"         - navigate to known entity
-*   /mapper find "entity name"         - search zone for entity
-*   /mapper stop                       - stop movement/search
-*   /mapper pos                        - print current position
-*   /mapper status                     - show state + entity count
+*   /nav goto <x> <y>              - navigate to coordinates
+*   /nav goto <x> <y> <zone name>  - cross-zone navigation
+*   /nav goto <zone name>           - navigate to zone
+*   /nav goto "entity name"         - navigate to known entity
+*   /nav find "entity name"         - search zone for entity
+*   /nav stop                       - stop movement/search
+*   /nav pos                        - print current position
+*   /nav status                     - show state + entity count
 --]]
 
-addon.name    = 'mapper'
+addon.name    = 'nav'
 addon.author  = 'xillm'
-addon.version = '.30'
+addon.version = '.36'
 addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
 addon.link    = ''
 
@@ -81,6 +81,24 @@ local state = {
     record_zone   = nil,
     record_last_x = nil,
     record_last_y = nil,
+    -- Retry state machine for stuck/no-route fallback. Lifecycle:
+    --   1. Fresh `/nav goto` arms `retry.target` and `phase='normal'`.
+    --   2. On stuck or no_path, escalate phase: 'normal' -> 'wide' (re-request
+    --      with wider_radius=true), then up to 3 random-walk attempts before
+    --      giving up and appending the failure to nav_failures.json.
+    --   3. Reaching the destination resets phase + walks to 0.
+    retry = {
+        phase   = 'normal',  -- 'normal' | 'wide' | 'walking' | 'failed'
+        target  = nil,       -- { x, y, zone_id } — current retry goal (becomes detour resume point during wide-detour)
+        walks   = 0,         -- number of random-walk attempts (0..3)
+        is_walk = false,     -- true while the active path is a random walk, not the real goal
+    },
+    -- Detour state: when wide-radius retry fires, we save the in-progress
+    -- default-radius waypoints + the index 5 ahead and only re-plan the
+    -- short stretch around the stuck point at 1.0 radius. Once the detour
+    -- arrives at that 5-ahead point, we splice the remainder of the
+    -- saved waypoints back in and continue the original long path.
+    detour = nil,  -- { saved_waypoints, resume_idx, original_target }
 }
 
 -------------------------------------------------------------------------------
@@ -95,13 +113,13 @@ local function get_data_path()
         if path:sub(-1) ~= '/' and path:sub(-1) ~= '\\' then
             path = path .. '/'
         end
-        return path .. 'config/addons/mapper/'
+        return path .. 'config/addons/nav/'
     end
     return ''
 end
 
 local function msg(text)
-    print('\30\06[mapper]\30\01 ' .. text)
+    print('\30\06[nav]\30\01 ' .. text)
 end
 
 local function ipc_path(filename)
@@ -140,8 +158,11 @@ end
 local function stop_movement()
     stop_autofollow()
     state.moving = false
-    state.waypoints = nil
-    state.wp_idx = 1
+    -- Don't clear state.waypoints here. The retry detour logic needs
+    -- to read the in-progress waypoint chain when a stuck triggers
+    -- retry_or_fail (which calls stop_movement first). Stale waypoints
+    -- are inert with state.moving=false and get overwritten when the
+    -- next path response arrives, so leaving them is safe.
 end
 
 local function cancel_all()
@@ -151,6 +172,14 @@ local function cancel_all()
     state.stuck_count = 0
     state.search = nil
     state.route = nil
+    -- Clear retry state on user-initiated cancel. Internal escalations
+    -- (retry_or_fail) call cancel_all only after exhausting retries, so
+    -- losing the retry target here is also correct in that case.
+    state.retry.phase = 'normal'
+    state.retry.target = nil
+    state.retry.walks = 0
+    state.retry.is_walk = false
+    state.detour = nil
 end
 
 local function dist2d(ax, ay, bx, by)
@@ -358,7 +387,7 @@ end
 -- Navigation requests
 -------------------------------------------------------------------------------
 
-local function request_path(px, py, pz, tx, ty, obstacle)
+local function request_path(px, py, pz, tx, ty, obstacle, wider_radius)
     state.last_seq = state.last_seq + 1
     local seq = state.last_seq
     local data = {
@@ -371,10 +400,123 @@ local function request_path(px, py, pz, tx, ty, obstacle)
     if obstacle then
         data.new_obstacle = obstacle
     end
+    if wider_radius then
+        data.wider_radius = true
+    end
     write_json(ipc_path('nav_request.json'), data)
     state.pending_seq = seq
     state.goal = { x = tx, y = ty }
-    msg(string.format('Requesting path to (%.0f, %.0f)... [#%d]', tx, ty, seq))
+    local tag = wider_radius and ' [wide]' or ''
+    msg(string.format('Requesting path to (%.0f, %.0f)... [#%d]%s', tx, ty, seq, tag))
+end
+
+-- Reset the retry state machine and arm it for a new top-level goal.
+-- Called whenever the user issues a fresh /nav goto.
+local function arm_retry(tx, ty, zone_id)
+    state.retry.phase = 'normal'
+    state.retry.target = { x = tx, y = ty, zone_id = zone_id }
+    state.retry.walks = 0
+    state.retry.is_walk = false
+end
+
+local function clear_retry()
+    state.retry.phase = 'normal'
+    state.retry.target = nil
+    state.retry.walks = 0
+    state.retry.is_walk = false
+end
+
+-- Append a failed-route record so we can review and repair these later.
+-- One JSON-per-line file is easier than maintaining a single array.
+local function log_failure(px, py, pz)
+    local tgt = state.retry.target
+    if not tgt then return end
+    local entry = {
+        time      = os.time(),
+        zone_id   = state.zone_id,
+        target    = { tgt.x, tgt.y, tgt.zone_id },
+        last_pos  = { px, py, pz },
+        attempts  = state.retry.walks,
+    }
+    -- Read existing list, append, write back.
+    local path = ipc_path('nav_failures.json')
+    local existing = read_json(path) or { failures = {} }
+    if type(existing.failures) ~= 'table' then
+        existing.failures = {}
+    end
+    existing.failures[#existing.failures + 1] = entry
+    write_json(path, existing)
+end
+
+-- Called when the active goto cannot make progress (no_path returned, or
+-- stuck-detection fired). Walks the retry state machine and either issues
+-- the next attempt or gives up + logs the failure.
+local function retry_or_fail(px, py, pz)
+    local tgt = state.retry.target
+    if not tgt or state.retry.phase == 'failed' then
+        cancel_all()
+        return
+    end
+    if state.retry.phase == 'normal' then
+        -- First fallback: keep most of the original default-radius path
+        -- intact, only re-plan the short stretch around the stuck point
+        -- at the wider FALLBACK_AGENT_RADIUS. Pick a target ~5 waypoints
+        -- past the stuck spot, save the in-progress waypoints, and
+        -- request a wide-radius detour to that intermediate point. Once
+        -- the detour arrives, on_destination_reached splices the saved
+        -- waypoints back in and continues the original long route.
+        local DETOUR_AHEAD = 5
+        if state.waypoints and state.wp_idx and not state.detour then
+            local resume_idx = math.min(state.wp_idx + DETOUR_AHEAD, #state.waypoints)
+            local resume_wp = state.waypoints[resume_idx]
+            if resume_wp then
+                state.detour = {
+                    saved_waypoints = state.waypoints,
+                    resume_idx      = resume_idx,
+                    original_target = tgt,
+                }
+                state.retry.target = { x = resume_wp[1], y = resume_wp[2],
+                                       zone_id = state.zone_id }
+                state.retry.phase = 'wide'
+                state.retry.is_walk = false
+                msg(string.format('Retry: wide-radius detour to wp %d/%d (%.0f, %.0f).',
+                    resume_idx, #state.detour.saved_waypoints, resume_wp[1], resume_wp[2]))
+                request_path(px, py, pz, resume_wp[1], resume_wp[2], nil, true)
+                return
+            end
+        end
+        -- Fallback: no waypoints to detour-splice. Re-plan the full path
+        -- with the wider radius (legacy behaviour).
+        state.retry.phase = 'wide'
+        state.retry.is_walk = false
+        msg('Retry: rerouting full path with wider agent radius.')
+        request_path(px, py, pz, tgt.x, tgt.y, nil, true)
+        return
+    end
+    -- Either 'wide' (the wider-radius attempt also failed) or 'walking'
+    -- (we just finished a random walk and the resumed goal failed again).
+    if state.retry.walks >= 3 then
+        msg('Giving up after 3 random-walk retries; logged for repair.')
+        log_failure(px, py, pz)
+        state.retry.phase = 'failed'
+        cancel_all()
+        return
+    end
+    state.retry.walks = state.retry.walks + 1
+    state.retry.phase = 'walking'
+    state.retry.is_walk = true
+    -- Pick a random nearby point in unobstructed direction; keep it short
+    -- (~5y) so we don't strand the agent far from the original waypoint.
+    local angle = math.random() * 2 * math.pi
+    local dist  = 5.0
+    local wx = px + math.cos(angle) * dist
+    local wy = py + math.sin(angle) * dist
+    msg(string.format('Retry %d/3: short walk to (%.1f, %.1f) then resume goal.',
+        state.retry.walks, wx, wy))
+    -- This sub-goto MUST NOT recursively trigger retries — request_path
+    -- alone re-arms `state.goal`, but `state.retry.target` keeps the real
+    -- destination so on completion we know where to go next.
+    request_path(px, py, pz, wx, wy, nil, false)
 end
 
 local function check_path_response()
@@ -486,6 +628,14 @@ local function check_path_response()
     elseif data.status == 'no_path' then
         if state.search then
             msg('Search point unreachable - skipping.')
+        elseif state.retry.target then
+            msg('No path found - escalating retry.')
+            local px, py, pz = get_player_pos()
+            if px then
+                retry_or_fail(px, py, pz)
+            else
+                cancel_all()
+            end
         else
             msg('No path found - destination may be unreachable.')
             cancel_all()
@@ -504,16 +654,69 @@ end
 -- Movement tick
 -------------------------------------------------------------------------------
 
+-- Called when the active waypoint chain is exhausted. Decides whether
+-- this was a random-walk sub-goal (resume the real target), a wide-
+-- radius detour (splice the saved long path back in), or the real
+-- target (clear retry state, let search/route progress, or announce).
+local function on_destination_reached(px, py, pz)
+    state.goal = nil
+    -- A random-walk sub-goal *always* takes priority — the agent
+    -- reached the random helper waypoint, not the real target.
+    -- Reissue the active goal (may be the detour resume point or the
+    -- original target) so the route eventually completes.
+    if state.retry.is_walk and state.retry.target then
+        local tgt = state.retry.target
+        state.retry.is_walk = false
+        msg(string.format('Random walk done - resuming goal (%.0f, %.0f).',
+            tgt.x, tgt.y))
+        request_path(px, py, pz, tgt.x, tgt.y, nil, false)
+        return
+    end
+    -- Detour complete: we just arrived at the 5-ahead resume point on
+    -- the saved default-radius path. Splice the remainder back in and
+    -- restore the original retry target. No new server round-trip
+    -- needed — the original waypoints are already valid for this
+    -- stretch onward.
+    if state.detour then
+        local d = state.detour
+        state.detour = nil
+        state.retry.target = d.original_target
+        state.retry.phase = 'normal'
+        state.retry.walks = 0
+        local remaining = {}
+        for i = d.resume_idx, #d.saved_waypoints do
+            remaining[#remaining + 1] = d.saved_waypoints[i]
+        end
+        if #remaining > 0 then
+            state.waypoints = remaining
+            state.wp_idx = 1
+            state.moving = true
+            state.stuck_count = 0
+            state.check_x = px
+            state.check_y = py
+            state.check_frame = state.frame
+            msg(string.format('Detour complete - resuming original path (%d wps remaining).',
+                #remaining))
+            return
+        end
+        msg('Detour reached final goal.')
+        clear_retry()
+        return
+    end
+    if state.search or state.route then
+        return  -- search/route loops handle their own progression
+    end
+    msg('Reached destination.')
+    clear_retry()
+end
+
 local function movement_tick(px, py, pz)
     if not state.moving or not state.waypoints then return end
 
     local wp = state.waypoints[state.wp_idx]
     if not wp then
         stop_movement()
-        if not state.search and not state.route then
-            msg('Reached destination.')
-        end
-        state.goal = nil
+        on_destination_reached(px, py, pz)
         return
     end
 
@@ -526,13 +729,18 @@ local function movement_tick(px, py, pz)
         state.check_x = px
         state.check_y = py
         state.check_frame = state.frame
+        -- Forward progress on the active path means whatever escalation
+        -- got us here worked — reset the retry chain so a *new* stuck
+        -- later in the path starts fresh from 'normal' (wider radius
+        -- first, walks 0/3) instead of immediately giving up.
+        if state.retry.phase ~= 'normal' and not state.retry.is_walk then
+            state.retry.phase = 'normal'
+            state.retry.walks = 0
+        end
 
         if state.wp_idx > #state.waypoints then
             stop_movement()
-            if not state.search and not state.route then
-                msg('Reached destination.')
-            end
-            state.goal = nil
+            on_destination_reached(px, py, pz)
             return
         end
         wp = state.waypoints[state.wp_idx]
@@ -551,9 +759,16 @@ local function movement_tick(px, py, pz)
         state.check_frame = state.frame
 
         if wp_progress < 3 and pos_progress < 3.0 then
-            msg(string.format('Stuck at (%.1f, %.1f) elev=%.1f wp %d/%d - pausing.',
-                px, py, pz, state.wp_idx, #state.waypoints))
-            stop_movement()
+            if state.retry.target and not state.search then
+                msg(string.format('Stuck at (%.1f, %.1f) elev=%.1f wp %d/%d - escalating retry.',
+                    px, py, pz, state.wp_idx, #state.waypoints))
+                stop_movement()
+                retry_or_fail(px, py, pz)
+            else
+                msg(string.format('Stuck at (%.1f, %.1f) elev=%.1f wp %d/%d - pausing (retry.target=%s).',
+                    px, py, pz, state.wp_idx, #state.waypoints, tostring(state.retry.target ~= nil)))
+                stop_movement()
+            end
         end
     end
 end
@@ -654,7 +869,7 @@ local function draw_object_boxes(px, py, pz)
         -- Snapshot view/proj matrices into plain Lua locals. Ashita's d3d8
         -- binding returns a live object whose fields can go nil between the
         -- validation pass and subsequent reads (observed when stepping
-        -- through many instances on /mapper objects on). Copying to locals
+        -- through many instances on /nav objects on). Copying to locals
         -- up front ensures the projection math always sees numbers. If any
         -- field is nil at snapshot time, skip this frame — next frame will
         -- try again.
@@ -702,7 +917,7 @@ local function draw_object_boxes(px, py, pz)
             -- Only show objects that still carry collision in the navmesh.
             -- Decorations (single-submesh `_m`, `_col` suffix, `col_*` prefix)
             -- are tagged collides=false by the extractor and hidden here so
-            -- /mapper objects matches what the pathfinder actually sees.
+            -- /nav objects matches what the pathfinder actually sees.
             if inst.collides == false then
                 goto continue
             end
@@ -905,7 +1120,7 @@ end
 -- Events
 -------------------------------------------------------------------------------
 
-ashita.events.register('load', 'mapper_load', function()
+ashita.events.register('load', 'nav_load', function()
     state.data_path = get_data_path()
     local f = io.open(ipc_path('nav_path.json'), 'w')
     if f then f:write('{}') f:close() end
@@ -916,15 +1131,15 @@ ashita.events.register('load', 'mapper_load', function()
         load_instances(zone_id)
         load_dropoffs(zone_id)
     end
-    msg('Loaded v' .. addon.version .. '. /mapper goto <x> <y> [zone] | goto <zone> | find "name"')
+    msg('Loaded v' .. addon.version .. '. /nav goto <x> <y> [zone] | goto <zone> | find "name"')
 end)
 
-ashita.events.register('unload', 'mapper_unload', function()
+ashita.events.register('unload', 'nav_unload', function()
     save_entities(state.zone_id)
     cancel_all()
 end)
 
-ashita.events.register('packet_in', 'mapper_packet', function(e)
+ashita.events.register('packet_in', 'nav_packet', function(e)
     if e.id == 0x057 then
         local ok, weather = pcall(struct.unpack, 'H', e.data, 0x04 + 1)
         if ok and weather then
@@ -934,7 +1149,7 @@ ashita.events.register('packet_in', 'mapper_packet', function(e)
     end
 end)
 
-ashita.events.register('d3d_present', 'mapper_render', function()
+ashita.events.register('d3d_present', 'nav_render', function()
     state.frame = state.frame + 1
 
     local ok, player = pcall(GetPlayerEntity)
@@ -1033,12 +1248,16 @@ ashita.events.register('d3d_present', 'mapper_render', function()
         check_path_response()
     end
 
-    -- Route tick: request path for current cross-zone segment
+    -- Route tick: request path for current cross-zone segment. Arm the
+    -- retry state machine on the segment's target so a stuck/no-path
+    -- inside this segment escalates (wider radius, then random walks)
+    -- instead of just pausing.
     if state.route and state.route.needs_path and not state.pending_seq then
         local r = state.route
         local seg = r.segments[r.seg_idx]
         if seg and seg.target then
             r.needs_path = false
+            arm_retry(seg.target[1], seg.target[2], state.zone_id)
             request_path(px, py, pz, seg.target[1], seg.target[2])
         end
     end
@@ -1118,9 +1337,9 @@ ashita.events.register('d3d_present', 'mapper_render', function()
     draw_dropoff_arrows(px, py, pz)
 end)
 
-ashita.events.register('command', 'mapper_cmd', function(e)
+ashita.events.register('command', 'nav_cmd', function(e)
     local args = e.command:args()
-    if #args == 0 or args[1] ~= '/mapper' then return end
+    if #args == 0 or args[1] ~= '/nav' then return end
     e.blocked = true
 
     local cmd = args[2] and args[2]:lower() or 'help'
@@ -1133,7 +1352,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
 
     if cmd == 'goto' then
         if #args < 3 then
-            msg('Usage: /mapper goto <x> <y> [zone] | goto <zone> | goto "entity"')
+            msg('Usage: /nav goto <x> <y> [zone] | goto <zone> | goto "entity"')
             return
         end
 
@@ -1158,6 +1377,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
                 end
                 if zone_id == state.zone_id then
                     cancel_all()
+                    arm_retry(tx, ty, state.zone_id)
                     request_path(px, py, pz, tx, ty)
                 else
                     cancel_all()
@@ -1176,12 +1396,13 @@ ashita.events.register('command', 'mapper_cmd', function(e)
                 end
             else
                 cancel_all()
+                arm_retry(tx, ty, state.zone_id)
                 request_path(px, py, pz, tx, ty)
             end
         else
             local name = parse_name(args, 3)
             if not name or name == '' then
-                msg('Usage: /mapper goto <x> <y> [zone] | goto <zone> | goto "entity"')
+                msg('Usage: /nav goto <x> <y> [zone] | goto <zone> | goto "entity"')
                 return
             end
 
@@ -1208,6 +1429,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
             if match then
                 msg(string.format('Navigating to %s at (%.0f, %.0f).', match.name, match.x, match.y))
                 cancel_all()
+                arm_retry(match.x, match.y, state.zone_id)
                 request_path(px, py, pz, match.x, match.y)
             else
                 msg(string.format('No zone or entity "%s" found.', name))
@@ -1217,7 +1439,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
     elseif cmd == 'find' then
         local name = parse_name(args, 3)
         if not name or name == '' then
-            msg('Usage: /mapper find "entity name"')
+            msg('Usage: /nav find "entity name"')
             return
         end
 
@@ -1231,6 +1453,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
         if match then
             msg(string.format('Already know %s at (%.0f, %.0f). Navigating.', match.name, match.x, match.y))
             cancel_all()
+            arm_retry(match.x, match.y, state.zone_id)
             request_path(px, py, pz, match.x, match.y)
             return
         end
@@ -1268,7 +1491,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
         -- Same syntax as `goto` but loads waypoints for visualization only
         -- (does not move the character).
         if #args < 3 then
-            msg('Usage: /mapper preview <x> <y> [zone] | preview <zone> | preview "entity"')
+            msg('Usage: /nav preview <x> <y> [zone] | preview <zone> | preview "entity"')
             return
         end
         local tx = tonumber(args[3])
@@ -1321,12 +1544,12 @@ ashita.events.register('command', 'mapper_cmd', function(e)
         else
             local name = parse_name(args, 3)
             if not name or name == '' then
-                msg('Usage: /mapper preview <x> <y> [zone] | preview <zone> | preview "entity"')
+                msg('Usage: /nav preview <x> <y> [zone] | preview <zone> | preview "entity"')
                 state.preview_mode = false
                 return
             end
 
-            -- Try zone name first (same resolution order as /mapper goto)
+            -- Try zone name first (same resolution order as /nav goto)
             local zone_id, resolved_name = resolve_zone_name(name)
             if zone_id and zone_id ~= state.zone_id then
                 cancel_all()
@@ -1478,7 +1701,7 @@ ashita.events.register('command', 'mapper_cmd', function(e)
             state.record_zone = state.zone_id
             state.record_last_x = nil
             state.record_last_y = nil
-            msg(string.format('Recording started for zone %d. Walk the route, then /mapper record stop.',
+            msg(string.format('Recording started for zone %d. Walk the route, then /nav record stop.',
                 state.zone_id or 0))
         elseif sub == 'stop' then
             if state.record_path and #state.record_path > 0 then
