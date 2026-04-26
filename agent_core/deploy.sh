@@ -1,5 +1,5 @@
 #!/bin/bash
-# Deploy nav addon + restart navserver + reload addon
+# Deploy nav addon + restart agent_core + reload addon
 cp /home/chris/workspace/xillm/nav/nav.lua /home/chris/Faugus/xillm/drive_c/Ashita-v4beta/addons/nav/
 cp /home/chris/workspace/xillm/nav/entities.lua /home/chris/Faugus/xillm/drive_c/Ashita-v4beta/addons/nav/
 mkdir -p /home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/nav/instances/

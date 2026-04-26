@@ -24,7 +24,7 @@ Coordinate system output:
     then write coords as (vx, tz, vy) / (wx, wz, -wy) so the final values
     are in true Ashita with *no* residual sign flips.
 
-    Anything downstream (navserver, nav addon, zone_transitions.json,
+    Anything downstream (agent_core, nav addon, zone_transitions.json,
     obstacles/*.json) should also be in true Ashita. See
     ~/.claude/skills/ffxi-coordinates for the full convention rules.
 

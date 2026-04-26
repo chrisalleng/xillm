@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 check_recording.py — compare a nav.lua /nav record session against what
-the navserver's Recast navmesh thinks about those same positions.
+agent_core's Recast navmesh thinks about those same positions.
 
 Usage:
     python3 check_recording.py                 # reads nav_record.json from
@@ -27,10 +27,10 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(REPO / 'navserver'))
-sys.path.insert(0, str(REPO / 'navserver' / 'recast_wrapper' / 'build'))
+sys.path.insert(0, str(REPO / 'agent_core'))
+sys.path.insert(0, str(REPO / 'agent_core' / 'recast_wrapper' / 'build'))
 import navmesh  # noqa: E402
-import server as server_mod  # noqa: E402
+import main as server_mod  # noqa: E402
 
 DEFAULT_RECORD = Path(
     '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/nav/nav_record.json')

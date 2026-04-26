@@ -17,7 +17,7 @@
 addon.name    = 'nav'
 addon.author  = 'xillm'
 addon.version = '.36'
-addon.desc    = 'Navigation client for FFXI (Python navserver backend)'
+addon.desc    = 'Navigation client for FFXI (Python agent_core backend)'
 addon.link    = ''
 
 require('common')

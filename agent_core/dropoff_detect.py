@@ -1,5 +1,5 @@
 """Detect one-way drop-off cliffs in a zone's navmesh and emit a connections
-JSON that the navserver merges into the Detour off-mesh connection table.
+JSON that agent_core merges into the Detour off-mesh connection table.
 
 Approach: for every border edge of the navmesh (edge with no neighboring
 walkable polygon), probe outward in the edge's outward direction, then search
@@ -20,11 +20,11 @@ The output JSON shape matches `nav/data/dropoffs/<zone_id>.json`:
     }
 
 All coordinates stored in the JSON are in **runtime Ashita** space
-(x=EW, y=NS, z=elev). The navserver converts to Recast at load time via
+(x=EW, y=NS, z=elev). agent_core converts to Recast at load time via
 game_to_recast().
 
 Usage:
-    python -m navserver.dropoff_detect --zone 110
+    python -m agent_core.dropoff_detect --zone 110
 """
 
 from __future__ import annotations
@@ -48,13 +48,13 @@ DROPOFF_DIR = ROOT / "nav" / "data" / "dropoffs"
 
 # The extractor and MZB parser live in the nav tools directory. Import
 # lazily (inside the function) so the module can still be imported without
-# those tools available (e.g. in the navserver).
+# those tools available (e.g. inside agent_core).
 
 
 def load_collision(zone_id: int):
     """Load a zone's collision JSON and convert to Recast-space verts/tris.
-    Mirrors NavServer.load_collision in server.py (kept standalone so this
-    module runs without importing server.py)."""
+    Mirrors NavServer.load_collision in main.py (kept standalone so this
+    module runs without importing main.py)."""
     verts, tris, _, _ = load_collision_with_walls(zone_id)
     return verts, tris
 
@@ -130,7 +130,7 @@ def make_settings(zone_id=None):
     if zone_id is not None:
         # Import lazily to avoid pulling in the full server stack at module
         # load time (dropoff_detect is also runnable standalone).
-        from navserver.server import NavServer
+        from agent_core.main import NavServer
         overrides = NavServer.ZONE_NAV_OVERRIDES.get(zone_id, {})
         for k, v in overrides.items():
             setattr(s, k, v)

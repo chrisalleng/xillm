@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-navserver/recast_wrapper/build/
+agent_core/recast_wrapper/build/
+agent_core/config.toml
 nav/data/obstacles/
 nav/data/collision/
 nav/data/instances/

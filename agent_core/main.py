@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-Navigation server for FFXI nav addon.
+agent_core entrypoint — currently the navmesh / pathfinding service.
 
-Builds Recast navmeshes from collision data and provides pathfinding.
+Phase 1 of the agent architecture (docs/agent-architecture.md): the
+existing navserver code lives here unchanged in behaviour; the package
+gains stub modules (config, state, events, persistence, llm_gateway)
+that future phases will fill in. Existing nav IPC files
+(`nav_request.json`, `nav_path.json`, `nav_status.json`) continue to
+work as-is until Phase 1b migrates them to `state/<char>/nav.json`
+and `commands/<char>/nav.json`.
+
 Communicates with the Lua addon via JSON files:
   - nav_request.json: Lua writes goto requests
   - nav_path.json: server writes waypoint paths
@@ -45,7 +52,7 @@ class NavServer:
     FALLBACK_AGENT_RADIUS = 1.5
 
     def __init__(self):
-        # meshes are keyed by (zone_id, radius) so the navserver can keep
+        # meshes are keyed by (zone_id, radius) so agent_core can keep
         # both the default-radius mesh and the wider-radius fallback in
         # cache without rebuilding on every retry.
         self.meshes: dict[tuple[int, float], object] = {}
