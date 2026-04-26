@@ -73,12 +73,20 @@ class NavServer:
         # writes a decomposed tree (and optional gambit list) to the
         # goal manager's persistent file.
         from . import config as _config
+        from . import dashboard as _dashboard
         from . import farming as _farming
         from . import goal_manager as _gm
         from . import llm_gateway as _llm
         from . import planner as _planner
         self.cfg = _config.load()
         self.llm = _llm.LLMGateway(self.cfg)
+        # Dashboard runs on a daemon thread so it doesn't add to the
+        # poll-loop critical path. Best-effort; if the port is in use
+        # we just log and continue (server is read-only, not required).
+        try:
+            _dashboard.start(self.cfg)
+        except OSError as e:
+            print(f'  dashboard: not started: {e}')
         self.farming = _farming.FarmingDirector(
             cfg=self.cfg,
             snapshot_provider=self._read_combat_snapshot,

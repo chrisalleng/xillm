@@ -157,6 +157,15 @@ def _validate_gambit(g: Any, errors: list[str], idx: int) -> None:
         errors.append(f'{base}.priority must be a number')
     if 'cooldown' in g and not isinstance(g['cooldown'], (int, float)):
         errors.append(f'{base}.cooldown must be a number')
+    # Floor the cooldown at 0.5s. A zero-cooldown gambit fires every
+    # 100ms tick; if the action is something with no in-game cooldown
+    # (e.g., /attack off, /echo) the result is hundreds of duplicate
+    # commands per second and chat is unusable. Real abilities have
+    # their own recast timers, but the gambit cooldown is our backstop
+    # against runaway loops.
+    cd = g.get('cooldown')
+    if isinstance(cd, (int, float)) and cd < 0.5:
+        g['cooldown'] = 0.5
     if 'trigger' not in g:
         errors.append(f'{base}.trigger is required')
     else:

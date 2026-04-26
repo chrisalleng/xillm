@@ -16,7 +16,7 @@
 
 addon.name    = 'nav'
 addon.author  = 'xillm'
-addon.version = '.38'
+addon.version = '.39'
 addon.desc    = 'Navigation client for FFXI (Python agent_core backend)'
 addon.link    = ''
 
@@ -1507,15 +1507,23 @@ ashita.events.register('command', 'nav_cmd', function(e)
         --                              to the LLM planner. The planner
         --                              decomposes it and the goal manager
         --                              executes the resulting tree.
-        -- /nav goal clear              — wipe the persistent goal tree.
+        -- /nav goal clear|stop|halt   — wipe the persistent goal tree
+        --                              and stop nav. Aliased so the
+        --                              user doesn't have to remember
+        --                              "clear" specifically; if the
+        --                              entire instruction is a single
+        --                              stop-word we short-circuit the
+        --                              LLM and just clear.
         if #args < 3 then
             msg('Usage: /nav goal <text> | goal clear')
             return
         end
-        local sub = args[3]
+        local sub = args[3]:lower()
         state.last_seq = state.last_seq + 1
         local seq = state.last_seq
-        if sub == 'clear' then
+        local stopwords = { clear = true, stop = true, halt = true,
+                            cancel = true, abort = true, reset = true }
+        if #args == 3 and stopwords[sub] then
             write_json(ipc_path('agent_request.json'), {
                 action = 'clear_goals',
                 seq = seq,
