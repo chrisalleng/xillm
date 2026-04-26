@@ -63,6 +63,40 @@ class NavServer:
         self.transitions: dict[int, list] = {}
         self.reachability: dict[int, dict] = {}
         self._load_transitions()
+        # Phase 2 scaffolding: load config + goal manager. The goal
+        # manager runs alongside the request handler and dispatches its
+        # directives by calling handle_request directly (no round-trip
+        # through nav_request.json).
+        from . import config as _config
+        from . import goal_manager as _gm
+        self.cfg = _config.load()
+        self.goal_manager = _gm.GoalManager(
+            cfg=self.cfg,
+            dispatch_goto=self.handle_request,
+            snapshot_provider=self._read_player_snapshot,
+        )
+
+    def _read_player_snapshot(self):
+        """Build the goal-manager snapshot from the addon's nav_status.json.
+
+        Phase 1b will move this to state/<char>/nav.json; for now we read
+        the legacy file so nav doesn't have to change."""
+        from . import goal_manager as _gm
+        status_file = IPC_DIR / 'nav_status.json'
+        if not status_file.exists():
+            return _gm._Snapshot(zone_id=None, x=None, y=None, z=None, moving=False)
+        try:
+            with open(status_file) as f:
+                s = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return _gm._Snapshot(zone_id=None, x=None, y=None, z=None, moving=False)
+        return _gm._Snapshot(
+            zone_id=s.get('zone_id'),
+            x=s.get('x'),
+            y=s.get('y'),
+            z=s.get('z'),
+            moving=bool(s.get('moving', False)),
+        )
 
     def _load_transitions(self):
         if not TRANSITIONS_FILE.exists():
@@ -929,9 +963,23 @@ class NavServer:
     def run(self):
         print(f'Nav server v{self.VERSION} started. Watching {REQUEST_FILE}')
         print(f'Collision data: {COLLISION_DIR}')
+        print(f'Character: {self.cfg.character}  goals: {len(self.goal_manager.goals.nodes)} nodes / '
+              f'{len(self.goal_manager.goals.roots)} root(s)')
+        # Goal-tick cadence: every Nth poll, not every poll. Polls are
+        # 100ms; 5 polls = 0.5s tick rate, which matches the architecture
+        # doc's Tier-2 budget.
+        ticks_per_goal_run = 5
+        tick_counter = 0
         try:
             while True:
                 self.poll()
+                tick_counter += 1
+                if tick_counter >= ticks_per_goal_run:
+                    tick_counter = 0
+                    try:
+                        self.goal_manager.tick()
+                    except Exception as e:
+                        print(f'goal_manager tick error: {e}')
                 time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             print('\nShutting down.')

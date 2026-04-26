@@ -1,0 +1,279 @@
+"""Goal manager — picks the active leaf goal and dispatches it.
+
+The persistent goal tree lives in `persistent/<char>/goals.json` (loaded
+via `persistence.Goals`). Each tick the manager:
+    1. scans the tree DFS for the first leaf in `pending` or `active` state,
+    2. if that leaf has no in-flight directive or its directive has been
+       satisfied, dispatches the next directive (or marks it complete),
+    3. updates the on-disk file when state changes.
+
+Phase 2a scope: deterministic execution — no LLM in this loop. The
+LLM planner (Phase 2b) writes / mutates the goal tree; the manager
+just walks it. Goals supported in 2a:
+
+    type=travel         { target_zone: int, target_pos: [x, y, z]? }
+    type=goto           { target_pos: [x, y, z] }                       (same-zone)
+    type=composite      no directive; container for subgoals
+    type=wait           { seconds: float }                              (debug)
+
+Each goal also carries an optional `completion` block that defines how
+to detect completion (`type=in_zone, zone_id`, `type=near_pos, ...`).
+If `completion` is omitted we infer it from `type` (travel→arrival in
+target_zone, goto→within 5y of target_pos, etc.).
+"""
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+from . import config as _config
+from . import events as _events
+from . import persistence as _persistence
+
+
+# How close to a target position counts as "arrived" in same-zone gotos.
+ARRIVAL_RADIUS_Y = 8.0
+
+
+@dataclass
+class _Snapshot:
+    """The bits of world state the goal manager actually needs each tick.
+
+    Pulled from the existing nav_status.json the addon publishes — when
+    the IPC migration lands (Phase 1b) this will read state/<char>/nav.json
+    instead, but the shape of the data we care about is the same.
+    """
+    zone_id: int | None
+    x: float | None
+    y: float | None
+    z: float | None
+    moving: bool
+
+
+class GoalManager:
+    """Walks the persistent goal tree and dispatches directives via a
+    caller-provided dispatch function (so the manager doesn't depend on
+    NavServer directly — easier to test, easier to swap the dispatch
+    target if/when we move off nav_request.json)."""
+
+    # Min seconds between two redispatches of the same goal — protects
+    # against tight retry loops if dispatch keeps failing.
+    REDISPATCH_COOLDOWN_S = 2.0
+
+    def __init__(
+        self,
+        cfg: _config.Config,
+        dispatch_goto: Callable[[dict[str, Any]], None],
+        snapshot_provider: Callable[[], _Snapshot],
+    ):
+        self.cfg = cfg
+        self._dispatch = dispatch_goto
+        self._snapshot = snapshot_provider
+        self._goals_path = cfg.paths.persistent_dir(cfg.character) / 'goals.json'
+        self.goals = _persistence.Goals.load(self._goals_path)
+        # Per-leaf bookkeeping: when did we last dispatch its directive?
+        self._last_dispatch: dict[str, float] = {}
+        # Cache of the active leaf id so external callers can ask without
+        # re-walking the tree.
+        self._active_leaf_id: str | None = None
+
+    # ---- tree helpers --------------------------------------------------
+
+    def _node(self, gid: str) -> dict[str, Any] | None:
+        return self.goals.nodes.get(gid)
+
+    def _children(self, gid: str) -> list[str]:
+        n = self._node(gid)
+        return list(n.get('subgoals', [])) if n else []
+
+    def _is_leaf(self, gid: str) -> bool:
+        return not self._children(gid)
+
+    def _find_active_leaf(self) -> str | None:
+        """DFS through `roots`, return the first leaf that is pending or
+        active (skipping completed/failed/abandoned). Composite parents
+        whose children are all done auto-advance to `completed` here."""
+        def visit(gid: str) -> str | None:
+            node = self._node(gid)
+            if node is None:
+                return None
+            state = node.get('state', 'pending')
+            if state in ('completed', 'failed', 'abandoned'):
+                return None
+            if self._is_leaf(gid):
+                return gid
+            unresolved_children = []
+            for cid in self._children(gid):
+                cnode = self._node(cid)
+                if cnode is None:
+                    continue
+                if cnode.get('state') in ('completed', 'failed', 'abandoned'):
+                    continue
+                unresolved_children.append(cid)
+            if not unresolved_children:
+                # All children done: parent is also done. Mark + persist.
+                node['state'] = 'completed'
+                self._save()
+                _events.append(
+                    self.cfg.paths.events_file(),
+                    character=self.cfg.character,
+                    source='goal_manager',
+                    type_='goal_completed',
+                    goal_id=gid,
+                    title=node.get('title', ''),
+                )
+                return None
+            for cid in unresolved_children:
+                hit = visit(cid)
+                if hit is not None:
+                    return hit
+            return None
+
+        for rid in self.goals.roots:
+            hit = visit(rid)
+            if hit is not None:
+                return hit
+        return None
+
+    def _save(self) -> None:
+        self.goals.save(self._goals_path)
+
+    # ---- completion detection -----------------------------------------
+
+    def _is_complete(self, leaf: dict[str, Any], snap: _Snapshot) -> bool:
+        completion = leaf.get('completion')
+        if completion is None:
+            # Infer from type.
+            t = leaf.get('type', '')
+            if t == 'travel':
+                tz = leaf.get('target_zone')
+                tp = leaf.get('target_pos')
+                if snap.zone_id != tz:
+                    return False
+                if tp is None:
+                    return True
+                if snap.x is None or snap.y is None:
+                    return False
+                dx = snap.x - tp[0]
+                dy = snap.y - tp[1]
+                return (dx * dx + dy * dy) ** 0.5 < ARRIVAL_RADIUS_Y
+            if t == 'goto':
+                tp = leaf.get('target_pos')
+                if tp is None or snap.x is None or snap.y is None:
+                    return False
+                if leaf.get('target_zone') is not None and snap.zone_id != leaf['target_zone']:
+                    return False
+                dx = snap.x - tp[0]
+                dy = snap.y - tp[1]
+                return (dx * dx + dy * dy) ** 0.5 < ARRIVAL_RADIUS_Y
+            if t == 'wait':
+                started = leaf.get('_started_at')
+                if started is None:
+                    return False
+                return time.time() - started >= leaf.get('seconds', 0)
+            return False
+        # Explicit completion clauses.
+        ctype = completion.get('type')
+        if ctype == 'in_zone':
+            return snap.zone_id == completion.get('zone_id')
+        if ctype == 'near_pos':
+            tp = completion.get('pos')
+            if tp is None or snap.x is None or snap.y is None:
+                return False
+            r = completion.get('radius', ARRIVAL_RADIUS_Y)
+            dx = snap.x - tp[0]
+            dy = snap.y - tp[1]
+            return (dx * dx + dy * dy) ** 0.5 < r
+        return False
+
+    # ---- dispatch -----------------------------------------------------
+
+    def _dispatch_leaf(self, gid: str, leaf: dict[str, Any], snap: _Snapshot) -> None:
+        t = leaf.get('type', '')
+        now = time.time()
+        last = self._last_dispatch.get(gid, 0.0)
+        if now - last < self.REDISPATCH_COOLDOWN_S:
+            return
+        if t == 'travel':
+            target_zone = leaf.get('target_zone')
+            if target_zone is None or snap.x is None:
+                return
+            req: dict[str, Any] = {
+                'action': 'cross_zone_goto',
+                'zone_id': snap.zone_id,
+                'target_zone': target_zone,
+                'player': [snap.x, snap.y, snap.z],
+                'seq': int(now * 1000),
+            }
+            if leaf.get('target_pos') is not None:
+                req['target'] = leaf['target_pos']
+            self._dispatch(req)
+        elif t == 'goto':
+            target_pos = leaf.get('target_pos')
+            if target_pos is None or snap.x is None:
+                return
+            req = {
+                'action': 'goto',
+                'zone_id': snap.zone_id,
+                'player': [snap.x, snap.y, snap.z],
+                'target': target_pos,
+                'seq': int(now * 1000),
+            }
+            self._dispatch(req)
+        elif t == 'wait':
+            if '_started_at' not in leaf:
+                leaf['_started_at'] = now
+                self._save()
+            return
+        elif t == 'composite':
+            return  # nothing to dispatch directly
+        self._last_dispatch[gid] = now
+
+    # ---- the loop -----------------------------------------------------
+
+    def tick(self) -> None:
+        """One tick of the goal loop. Cheap; safe to call every poll."""
+        if not self.goals.roots:
+            self._active_leaf_id = None
+            return
+        snap = self._snapshot()
+        leaf_id = self._find_active_leaf()
+        # Detect transition into a new leaf.
+        if leaf_id != self._active_leaf_id:
+            if leaf_id is not None:
+                _events.append(
+                    self.cfg.paths.events_file(),
+                    character=self.cfg.character,
+                    source='goal_manager',
+                    type_='goal_active',
+                    goal_id=leaf_id,
+                    title=(self._node(leaf_id) or {}).get('title', ''),
+                )
+            self._active_leaf_id = leaf_id
+        if leaf_id is None:
+            return
+        leaf = self._node(leaf_id)
+        if leaf is None:
+            return
+        # Lazily mark the leaf as active so the dashboard / event log
+        # reflect what we're currently working on.
+        if leaf.get('state', 'pending') == 'pending':
+            leaf['state'] = 'active'
+            self._save()
+        if self._is_complete(leaf, snap):
+            leaf['state'] = 'completed'
+            self._last_dispatch.pop(leaf_id, None)
+            self._save()
+            _events.append(
+                self.cfg.paths.events_file(),
+                character=self.cfg.character,
+                source='goal_manager',
+                type_='goal_completed',
+                goal_id=leaf_id,
+                title=leaf.get('title', ''),
+            )
+            return
+        self._dispatch_leaf(leaf_id, leaf, snap)
