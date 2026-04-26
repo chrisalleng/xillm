@@ -14,6 +14,10 @@ cp /home/chris/workspace/xillm/nav/data/dropoffs/*.json  $ASHITA/config/addons/n
 mkdir -p $ASHITA/addons/combat
 cp /home/chris/workspace/xillm/combat/combat.lua $ASHITA/addons/combat/
 
+# chat addon (Phase 5): rolling chat buffer + chat_received events
+mkdir -p $ASHITA/addons/chat
+cp /home/chris/workspace/xillm/chat/chat.lua $ASHITA/addons/chat/
+
 # cmdrelay (relays cmd_inbox.txt lines as /commands inside Ashita).
 # Kept under our deployment so we can fix bugs in it without manual
 # copies. Reloaded BEFORE issuing any other commands below so the
@@ -34,5 +38,7 @@ sleep 2
     echo '/addon reload nav'
     echo '/addon load combat'
     echo '/addon reload combat'
+    echo '/addon load chat'
+    echo '/addon reload chat'
 } > $ASHITA/config/addons/nav/cmd_inbox.txt
 echo "Deployed and reloaded."
