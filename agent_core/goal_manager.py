@@ -59,9 +59,10 @@ class GoalManager:
     NavServer directly — easier to test, easier to swap the dispatch
     target if/when we move off nav_request.json)."""
 
-    # Min seconds between two redispatches of the same goal — protects
-    # against tight retry loops if dispatch keeps failing.
-    REDISPATCH_COOLDOWN_S = 2.0
+    # Hard cap between two redispatches of the same leaf, even when
+    # we believe a redispatch is justified (zone change, no nav status,
+    # etc.). Stops tight loops if some condition flickers.
+    REDISPATCH_COOLDOWN_S = 5.0
 
     def __init__(
         self,
@@ -74,8 +75,15 @@ class GoalManager:
         self._snapshot = snapshot_provider
         self._goals_path = cfg.paths.persistent_dir(cfg.character) / 'goals.json'
         self.goals = _persistence.Goals.load(self._goals_path)
-        # Per-leaf bookkeeping: when did we last dispatch its directive?
+        # Per-leaf bookkeeping for redispatch decisions:
+        #   _last_dispatch[gid]      → wall-clock of last dispatch
+        #   _dispatched_zone[gid]    → zone_id we dispatched FROM
+        # We only redispatch a leaf if the player has crossed a zone
+        # boundary since the previous dispatch (route-segment changed)
+        # or if the cooldown has elapsed and we still have no path
+        # (recovery from a missed response).
         self._last_dispatch: dict[str, float] = {}
+        self._dispatched_zone: dict[str, int | None] = {}
         # Cache of the active leaf id so external callers can ask without
         # re-walking the tree.
         self._active_leaf_id: str | None = None
@@ -191,11 +199,29 @@ class GoalManager:
 
     # ---- dispatch -----------------------------------------------------
 
+    def _should_dispatch(self, gid: str, snap: _Snapshot, now: float) -> bool:
+        """Decide whether to (re)dispatch this leaf's directive on this
+        tick. Dispatch once per leaf-activation, period.
+
+        The addon already handles all in-flight concerns: cross-zone
+        segment progression, stuck-detection, wider-radius retry, even
+        random walks on persistent failure (see nav.lua's retry chain).
+        Once we hand it a cross_zone_goto with a route, our job is to
+        watch for completion and advance to the next leaf — not to
+        keep poking the addon."""
+        return self._last_dispatch.get(gid) is None
+
     def _dispatch_leaf(self, gid: str, leaf: dict[str, Any], snap: _Snapshot) -> None:
         t = leaf.get('type', '')
         now = time.time()
-        last = self._last_dispatch.get(gid, 0.0)
-        if now - last < self.REDISPATCH_COOLDOWN_S:
+        if t == 'wait':
+            if '_started_at' not in leaf:
+                leaf['_started_at'] = now
+                self._save()
+            return
+        if t == 'composite':
+            return  # nothing to dispatch directly
+        if not self._should_dispatch(gid, snap, now):
             return
         if t == 'travel':
             target_zone = leaf.get('target_zone')
@@ -223,14 +249,8 @@ class GoalManager:
                 'seq': int(now * 1000),
             }
             self._dispatch(req)
-        elif t == 'wait':
-            if '_started_at' not in leaf:
-                leaf['_started_at'] = now
-                self._save()
-            return
-        elif t == 'composite':
-            return  # nothing to dispatch directly
         self._last_dispatch[gid] = now
+        self._dispatched_zone[gid] = snap.zone_id
 
     # ---- the loop -----------------------------------------------------
 
@@ -266,6 +286,7 @@ class GoalManager:
         if self._is_complete(leaf, snap):
             leaf['state'] = 'completed'
             self._last_dispatch.pop(leaf_id, None)
+            self._dispatched_zone.pop(leaf_id, None)
             self._save()
             _events.append(
                 self.cfg.paths.events_file(),
