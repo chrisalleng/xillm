@@ -19,8 +19,8 @@
 
 addon.name    = 'combat'
 addon.author  = 'xillm'
-addon.version = '0.4'
-addon.desc    = 'Combat state publisher (Tier 1 addon for the agent_core orchestrator)'
+addon.version = '0.5'
+addon.desc    = 'Combat state publisher + gambit engine (Tier 1 for agent_core)'
 
 require('common')
 local json = require('json')
@@ -66,6 +66,14 @@ local state = {
     -- in-place every tick avoids GC pressure from rebuilding nested
     -- tables 10x/sec.
     payload = {},
+    -- Gambit engine state (Phase 3b).
+    -- gambits: ordered list of validated gambits from the orchestrator
+    -- gambits_seq: last commands seq we processed (idempotency)
+    -- gambit_cooldowns: per-gambit-id last-fired timestamp
+    gambits = nil,
+    gambits_seq = 0,
+    gambit_cooldowns = {},
+    last_gambit_load_check = 0,
 }
 
 local function msg(text)
@@ -231,6 +239,159 @@ local function read_engaged()
 end
 
 -------------------------------------------------------------------------------
+-- Gambit engine (Phase 3b)
+-------------------------------------------------------------------------------
+
+-- The orchestrator writes a gambit list here:
+--    <ipc_base>/commands/<character>/combat.json
+-- Schema documented in agent_core/gambits.py. The reader is idempotent:
+-- it re-reads only when the file's seq is greater than the one we
+-- already loaded.
+local function load_gambits()
+    local char = state.last_character
+    if char == nil then return end
+    local path = get_data_path() .. 'commands/' .. char .. '/combat.json'
+    local f = io.open(path, 'r')
+    if not f then return end
+    local body = f:read('*a')
+    f:close()
+    if body == nil or body == '' then return end
+    local ok, data = pcall(json.decode, body)
+    if not ok or type(data) ~= 'table' then return end
+    local seq = data.seq or 0
+    if seq <= state.gambits_seq then return end
+    state.gambits = data.gambits or {}
+    state.gambits_seq = seq
+    state.gambit_cooldowns = {}  -- new list = fresh cooldowns
+    msg(string.format('Loaded %d gambit(s) (seq %d)', #state.gambits, seq))
+end
+
+-- Walk a dotted path into the publish payload (`self.hp_pct`,
+-- `target.distance`, `party.0.hp_pct`). Returns nil for any miss
+-- (no field, intermediate nil, etc) — comparisons against nil all
+-- evaluate false, which is the right semantics for "no target → don't
+-- fire target-conditional gambits".
+local function resolve_ref(payload, path)
+    local cur = payload
+    for segment in path:gmatch('[^.]+') do
+        if cur == nil then return nil end
+        local idx = tonumber(segment)
+        if idx ~= nil then
+            -- arrays in our JSON are 0-indexed in agent_core but Lua's
+            -- json decoder gives 1-based tables. translate.
+            cur = cur[idx + 1]
+        else
+            cur = cur[segment]
+        end
+    end
+    return cur
+end
+
+-- Recursive expression evaluator. Operates on the already-published
+-- payload (state.payload) so triggers see exactly the world the
+-- orchestrator sees. Numeric comparisons treat nil as "always false."
+local function eval_expr(expr, payload)
+    if type(expr) ~= 'table' then return false end
+    local op = expr.op
+    if op == 'lit' then return expr.value end
+    if op == 'ref' then return resolve_ref(payload, expr.path or '') end
+    if op == 'and' then
+        local args = expr.args or {}
+        for i = 1, #args do
+            if not eval_expr(args[i], payload) then return false end
+        end
+        return true
+    end
+    if op == 'or' then
+        local args = expr.args or {}
+        for i = 1, #args do
+            if eval_expr(args[i], payload) then return true end
+        end
+        return false
+    end
+    if op == 'not' then
+        return not eval_expr(expr.a, payload)
+    end
+    if op == 'in' then
+        local needle = eval_expr(expr.needle, payload)
+        local hay = eval_expr(expr.haystack, payload)
+        if type(hay) ~= 'table' then return false end
+        for i = 1, #hay do
+            if hay[i] == needle then return true end
+        end
+        return false
+    end
+    -- comparison ops
+    local a = eval_expr(expr.a, payload)
+    local b = eval_expr(expr.b, payload)
+    if a == nil or b == nil then return false end
+    if op == 'lt'  then return a <  b end
+    if op == 'lte' then return a <= b end
+    if op == 'gt'  then return a >  b end
+    if op == 'gte' then return a >= b end
+    if op == 'eq'  then return a == b end
+    if op == 'ne'  then return a ~= b end
+    return false
+end
+
+-- Format an action node into a single Ashita /command line and queue it.
+-- Targets default to <t> for magic/weaponskill, <me> for ability when
+-- omitted — these match how a player would type the command by hand.
+local function fire_action(action)
+    if type(action) ~= 'table' then return end
+    local cmd = nil
+    local kind = action.kind
+    if kind == 'ability' then
+        local target = action.target or '<me>'
+        cmd = string.format('/ja "%s" %s', action.name, target)
+    elseif kind == 'magic' then
+        local target = action.target or '<t>'
+        cmd = string.format('/ma "%s" %s', action.name, target)
+    elseif kind == 'weaponskill' then
+        local target = action.target or '<t>'
+        cmd = string.format('/ws "%s" %s', action.name, target)
+    elseif kind == 'engage' then
+        cmd = '/attack on'
+    elseif kind == 'disengage' then
+        cmd = '/attack off'
+    elseif kind == 'raw' then
+        cmd = action.command
+    end
+    if cmd ~= nil and cmd ~= '' then
+        AshitaCore:GetChatManager():QueueCommand(1, cmd)
+    end
+end
+
+-- One pass over the gambit list. Fires the first matching gambit whose
+-- cooldown has elapsed, then stops (one action per tick is enough; the
+-- next tick will re-evaluate after game state updates).
+local function gambit_tick(payload)
+    local gambits = state.gambits
+    if gambits == nil or #gambits == 0 then return end
+    local now = os.time()
+    -- Sort-stable by priority (lower = higher priority). We don't sort
+    -- in place every tick; the orchestrator should send them ordered.
+    -- Instead we evaluate in list order, which the orchestrator can
+    -- guarantee.
+    for i = 1, #gambits do
+        local g = gambits[i]
+        if type(g) == 'table' then
+            local cd = g.cooldown or 0
+            local last = state.gambit_cooldowns[g.id] or 0
+            if cd <= 0 or now - last >= cd then
+                local ok, hit = pcall(eval_expr, g.trigger, payload)
+                if ok and hit then
+                    fire_action(g.action)
+                    state.gambit_cooldowns[g.id] = now
+                    msg(string.format('gambit fired: %s', g.id))
+                    return
+                end
+            end
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Publish loop
 -------------------------------------------------------------------------------
 
@@ -251,6 +412,15 @@ local function publish()
     payload.party     = read_party()
     local path = get_data_path() .. 'state/' .. char .. '/combat.json'
     write_json(path, payload)
+    -- Re-read the gambit command file once a second (every 10 ticks at
+    -- our 10 Hz cadence). The orchestrator overwrites it atomically;
+    -- if the seq hasn't bumped, load_gambits is a cheap no-op.
+    if state.frame - state.last_gambit_load_check >= 60 then
+        state.last_gambit_load_check = state.frame
+        load_gambits()
+    end
+    -- Evaluate the gambit list against the just-published world state.
+    gambit_tick(payload)
 end
 
 -------------------------------------------------------------------------------
