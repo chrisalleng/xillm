@@ -948,6 +948,18 @@ class NavServer:
                 self.write_response({'status': 'no_mesh', 'action': 'clear_blocks',
                                      'zone_id': zone, 'seq': req.get('seq')})
 
+    def _issue_command(self, command: str) -> None:
+        """Append a single Ashita /command to cmd_inbox.txt for cmdrelay
+        to relay. Multi-line — cmdrelay v1.1+ consumes every line per
+        poll, so we can queue several without losing any. Best-effort:
+        a missing cmdrelay just means the line sits unread, no error."""
+        inbox = IPC_DIR / 'cmd_inbox.txt'
+        try:
+            with open(inbox, 'a') as f:
+                f.write(command + '\n')
+        except OSError as e:
+            print(f'  cmd_inbox write failed: {e}')
+
     def write_response(self, data):
         # Unique temp filename per call. A shared "<file>.tmp" raced
         # whenever two write_responses fired in quick succession (addon
@@ -998,7 +1010,13 @@ class NavServer:
         """Watch the addon's agent_request.json for new top-level user
         goals. Each request is a JSON object with `seq` (monotonic) and
         `goal` (free-text). On a new seq, hand the goal to the LLM
-        planner; the planner replaces the persistent goal tree."""
+        planner; the planner replaces the persistent goal tree.
+
+        agent_request.json is a one-shot trigger, NOT a state file —
+        we delete it after consuming so a server restart can't
+        replay a stale request. The seq counter is also a guard for
+        rapid double-polls but the on-disk delete is the source of
+        truth for "this command has been handled"."""
         agent_req = IPC_DIR / 'agent_request.json'
         if not agent_req.exists():
             return
@@ -1012,20 +1030,33 @@ class NavServer:
             return
         self._last_agent_request_seq = seq
         action = req.get('action')
-        if action == 'set_goal':
-            text = (req.get('goal') or '').strip()
-            if not text:
-                return
-            print(f'[agent_request #{seq}] set_goal: {text!r}')
-            self.planner.plan(text, self.zone_names)
-        elif action == 'clear_goals':
-            print(f'[agent_request #{seq}] clear_goals')
-            from . import persistence as _persistence
-            empty = _persistence.Goals()
-            empty.save(self.goal_manager._goals_path)
-            self.goal_manager.goals = empty
-            self.goal_manager._last_dispatch.clear()
-            self.goal_manager._active_leaf_id = None
+        try:
+            if action == 'set_goal':
+                text = (req.get('goal') or '').strip()
+                if text:
+                    print(f'[agent_request #{seq}] set_goal: {text!r}')
+                    self.planner.plan(text, self.zone_names)
+            elif action == 'clear_goals':
+                print(f'[agent_request #{seq}] clear_goals')
+                from . import persistence as _persistence
+                empty = _persistence.Goals()
+                empty.save(self.goal_manager._goals_path)
+                self.goal_manager.goals = empty
+                self.goal_manager._last_dispatch.clear()
+                self.goal_manager._active_leaf_id = None
+                # The nav addon may still be following a route the
+                # previous goal dispatched — tell it to stop. cmdrelay
+                # picks the line up and executes /nav stop in-game.
+                self._issue_command('/nav stop')
+        finally:
+            # Always remove the trigger file once consumed. Survives
+            # the planner / persister failing — without this, a stale
+            # request with a high seq sits on disk forever and replays
+            # on every restart.
+            try:
+                agent_req.unlink()
+            except OSError:
+                pass
 
     VERSION = '.8'
 

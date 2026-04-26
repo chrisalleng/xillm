@@ -200,6 +200,8 @@ def deploy(cfg: _config.Config, gambits: list[dict[str, Any]]) -> Path:
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(payload, f, indent=2)
+        # mkstemp creates 0600; the Lua addon may need 0644 under Wine.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except Exception:
         try:

@@ -19,7 +19,7 @@
 
 addon.name    = 'combat'
 addon.author  = 'xillm'
-addon.version = '0.5'
+addon.version = '0.6'
 addon.desc    = 'Combat state publisher + gambit engine (Tier 1 for agent_core)'
 
 require('common')
@@ -247,22 +247,32 @@ end
 -- Schema documented in agent_core/gambits.py. The reader is idempotent:
 -- it re-reads only when the file's seq is greater than the one we
 -- already loaded.
+-- One-shot diagnostic so we know which branch load_gambits exited on
+-- when we expect gambits but they aren't firing. Each unique reason
+-- prints once per addon-load, then quietens.
+local _load_gambits_logged = {}
+local function _load_diag(reason)
+    if _load_gambits_logged[reason] then return end
+    _load_gambits_logged[reason] = true
+    msg('load_gambits: ' .. reason)
+end
+
 local function load_gambits()
     local char = state.last_character
-    if char == nil then return end
+    if char == nil then _load_diag('no character yet'); return end
     local path = get_data_path() .. 'commands/' .. char .. '/combat.json'
     local f = io.open(path, 'r')
-    if not f then return end
+    if not f then _load_diag('file missing: ' .. path); return end
     local body = f:read('*a')
     f:close()
-    if body == nil or body == '' then return end
+    if body == nil or body == '' then _load_diag('file empty'); return end
     local ok, data = pcall(json.decode, body)
-    if not ok or type(data) ~= 'table' then return end
+    if not ok or type(data) ~= 'table' then _load_diag('json decode failed'); return end
     local seq = data.seq or 0
-    if seq <= state.gambits_seq then return end
+    if seq <= state.gambits_seq then return end  -- silent: re-poll noise
     state.gambits = data.gambits or {}
     state.gambits_seq = seq
-    state.gambit_cooldowns = {}  -- new list = fresh cooldowns
+    state.gambit_cooldowns = {}
     msg(string.format('Loaded %d gambit(s) (seq %d)', #state.gambits, seq))
 end
 

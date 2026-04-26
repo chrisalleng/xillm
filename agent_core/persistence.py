@@ -31,9 +31,13 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, sort_keys=True)
             f.write('\n')
+        # mkstemp creates 0600; bump to 0644 so the Lua addon (running
+        # under Wine but as the same Linux user) can still read it.
+        # In practice 0600 should also work — but we hit a case where
+        # Wine's filesystem layer cared, so be permissive.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except Exception:
-        # Best-effort cleanup if write or replace failed.
         try:
             os.unlink(tmp)
         except OSError:
