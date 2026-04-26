@@ -949,10 +949,29 @@ class NavServer:
                                      'zone_id': zone, 'seq': req.get('seq')})
 
     def write_response(self, data):
-        tmp = str(PATH_FILE) + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(data, f)
-        os.replace(tmp, PATH_FILE)
+        # Unique temp filename per call. A shared "<file>.tmp" raced
+        # whenever two write_responses fired in quick succession (addon
+        # goto + goal_manager dispatch on the same tick): both opened
+        # the same .tmp, the first os.replace consumed it, and the
+        # second failed with [Errno 2]. tempfile.mkstemp gives each
+        # caller its own .tmp.<random> in the same directory; os.replace
+        # is still atomic.
+        import tempfile
+        out = PATH_FILE
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=out.parent, prefix=out.name + '.', suffix='.tmp'
+        )
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f)
+            os.replace(tmp, out)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def poll(self):
         if not REQUEST_FILE.exists():
