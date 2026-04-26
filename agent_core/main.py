@@ -69,17 +69,27 @@ class NavServer:
         # by calling handle_request directly (no round-trip through
         # nav_request.json). The farming director handles long-running
         # `farm` leaves via the combat addon's state file. The planner
-        # consumes free-text user goals from agent_request.json and
-        # writes a decomposed tree (and optional gambit list) to the
-        # goal manager's persistent file.
+        # consumes free-text user goals from <repo>/user_goal.txt
+        # (mtime-watched) and writes a decomposed tree (and optional
+        # gambit list) to the goal manager's persistent file.
+        from . import chat_handler as _chat_handler
         from . import config as _config
         from . import dashboard as _dashboard
         from . import farming as _farming
+        from . import gambits as _gambits
         from . import goal_manager as _gm
         from . import llm_gateway as _llm
+        from . import persistence as _persistence
         from . import planner as _planner
         self.cfg = _config.load()
         self.llm = _llm.LLMGateway(self.cfg)
+        # Persistent gambit library — keyed by (job/subjob/party) context.
+        # Loaded once at startup; the planner mutates it via tool calls,
+        # the context watcher resolves the right set for the current
+        # job/party state and redeploys when context changes.
+        self.gambits_store = _persistence.Gambits.load(_gambits.store_path(self.cfg))
+        self._gambits_mod = _gambits  # cached reference for the watcher
+        self._last_gambit_ctx: dict[str, str] | None = None
         # Dashboard runs on a daemon thread so it doesn't add to the
         # poll-loop critical path. Best-effort; if the port is in use
         # we just log and continue (server is read-only, not required).
@@ -91,6 +101,14 @@ class NavServer:
             cfg=self.cfg,
             snapshot_provider=self._read_combat_snapshot,
             issue_command=self._issue_command,
+            # Nav snapshot drives the locate/approach states. The goal
+            # manager's snapshot has the same fields (zone_id/x/y/z/moving)
+            # so we reuse it — duck-typed inside FarmingDirector via getattr.
+            nav_snapshot_provider=self._read_player_snapshot,
+            # Same dispatch_goto callable the goal manager uses, so the
+            # approach state's request goes through handle_request and
+            # rides the existing nav addon's path-following retry chain.
+            dispatch_goto=self.handle_request,
         )
         self.goal_manager = _gm.GoalManager(
             cfg=self.cfg,
@@ -98,8 +116,34 @@ class NavServer:
             snapshot_provider=self._read_player_snapshot,
             farming_director=self.farming,
         )
-        self.planner = _planner.Planner(self.cfg, self.llm, self.goal_manager)
-        self._last_agent_request_seq = 0
+        self.planner = _planner.Planner(
+            self.cfg, self.llm, self.goal_manager,
+            gambits_store=self.gambits_store,
+            current_ctx_provider=self._current_gambit_ctx,
+        )
+        # Reactive chat layer — polls events.jsonl for chat_received,
+        # auto-accretes interactions to the relationship store, and
+        # LLM-dispatches lines worth a reply. Outbound replies ride
+        # the same cmd_inbox.txt path as nav commands. Initialised
+        # last so it can borrow _issue_command from the server.
+        self.chat = _chat_handler.ChatHandler(
+            self.cfg, self.llm,
+            issue_command=self._issue_command,
+        )
+        # User-edited goal file: the user types a free-text instruction
+        # into <repo>/user_goal.txt and saves. We watch its mtime; on
+        # change we hand the contents to the planner (or clear, if empty).
+        # The current mtime at startup is treated as "already applied"
+        # so an existing file doesn't replay on every restart — the
+        # persistent goal tree on disk is the source of truth for what
+        # the agent is currently doing.
+        self._user_goal_mtime = 0.0
+        ugf = self.cfg.paths.user_goal_file()
+        if ugf.exists():
+            try:
+                self._user_goal_mtime = ugf.stat().st_mtime
+            except OSError:
+                pass
 
     def _read_player_snapshot(self):
         """Build the goal-manager snapshot from the addon's nav_status.json.
@@ -131,7 +175,7 @@ class NavServer:
         path = self.cfg.paths.state_dir(self.cfg.character) / 'combat.json'
         if not path.exists():
             return _farming._Snapshot(
-                self_hp_pct=None, self_status=None,
+                self_hp_pct=None, self_hp=None, self_status=None,
                 target_name=None, target_alive=None, target_hp_pct=None,
                 engaged=False,
             )
@@ -140,7 +184,7 @@ class NavServer:
                 d = json.load(f)
         except (json.JSONDecodeError, OSError):
             return _farming._Snapshot(
-                self_hp_pct=None, self_status=None,
+                self_hp_pct=None, self_hp=None, self_status=None,
                 target_name=None, target_alive=None, target_hp_pct=None,
                 engaged=False,
             )
@@ -148,12 +192,52 @@ class NavServer:
         t = d.get('target') or {}
         return _farming._Snapshot(
             self_hp_pct=s.get('hp_pct'),
+            self_hp=s.get('hp'),
             self_status=s.get('status'),
             target_name=t.get('name') if t else None,
             target_alive=t.get('alive') if t else None,
             target_hp_pct=t.get('hp_pct') if t else None,
             engaged=bool(d.get('engaged', False)),
         )
+
+    def _read_combat_state(self) -> dict | None:
+        """Best-effort full-payload read of combat.json. Used for context
+        derivation (job/sub/party); returns None on missing/malformed."""
+        path = self.cfg.paths.state_dir(self.cfg.character) / 'combat.json'
+        if not path.exists():
+            return None
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _current_gambit_ctx(self) -> dict[str, str]:
+        """Build the live (main_job, sub_job, in_party) context from
+        combat.json. Falls back to all-wildcard if combat.json is
+        missing — that selects the universal `*/*/*` set, if any."""
+        state = self._read_combat_state()
+        return self._gambits_mod.context_from_combat(state)
+
+    def poll_gambit_context(self):
+        """Recompute the current context from combat.json; if it
+        changed since last tick, redeploy the resolved gambit list.
+        Always cheap — usually a single dict-eq check after one JSON
+        read; the actual resolve+write only fires on real changes
+        (zoning, /sj <job>, party invite/leave)."""
+        ctx = self._current_gambit_ctx()
+        if ctx == self._last_gambit_ctx:
+            return
+        self._last_gambit_ctx = ctx
+        try:
+            merged = self._gambits_mod.deploy_active(
+                self.cfg, self.gambits_store, ctx,
+            )
+        except Exception as e:
+            print(f'  gambits: deploy_active failed: {e}')
+            return
+        print(f'  gambits: ctx={ctx["main_job"]}/{ctx["sub_job"]}/{ctx["in_party"]}'
+              f'  active={len(merged)}')
 
     def _load_transitions(self):
         if not TRANSITIONS_FILE.exists():
@@ -1060,70 +1144,60 @@ class NavServer:
             # Without this delete, an addon-issued goto persists on disk
             # forever — and after an agent_core restart (which resets
             # last_request_mtime to 0) the same stale request gets
-            # treated as fresh and replayed. Same fix we applied to
-            # agent_request.json earlier this session.
+            # treated as fresh and replayed.
             try:
                 REQUEST_FILE.unlink()
             except OSError:
                 pass
 
-    def poll_agent_request(self):
-        """Watch the addon's agent_request.json for new top-level user
-        goals. Each request is a JSON object with `seq` (monotonic) and
-        `goal` (free-text). On a new seq, hand the goal to the LLM
-        planner; the planner replaces the persistent goal tree.
+    def poll_user_goal_file(self):
+        """Watch <repo>/user_goal.txt for changes. Whenever the user saves
+        a new instruction we re-plan; if the file is empty (or whitespace
+        only) we treat that as "stop everything" — clear the goal tree,
+        wipe gambits, and tell the nav addon to stop.
 
-        agent_request.json is a one-shot trigger, NOT a state file —
-        we delete it after consuming so a server restart can't
-        replay a stale request. The seq counter is also a guard for
-        rapid double-polls but the on-disk delete is the source of
-        truth for "this command has been handled"."""
-        agent_req = IPC_DIR / 'agent_request.json'
-        if not agent_req.exists():
+        Mtime tracking is in-memory only. The persistent goal tree on
+        disk is the source of truth for what the agent is doing across
+        restarts; the file just triggers re-planning when the user
+        wants to change direction."""
+        ugf = self.cfg.paths.user_goal_file()
+        if not ugf.exists():
             return
         try:
-            with open(agent_req) as f:
-                req = json.load(f)
-        except (json.JSONDecodeError, OSError):
+            mtime = ugf.stat().st_mtime
+        except OSError:
             return
-        seq = req.get('seq', 0)
-        if not seq or seq == self._last_agent_request_seq:
+        if mtime <= self._user_goal_mtime:
             return
-        self._last_agent_request_seq = seq
-        action = req.get('action')
+        self._user_goal_mtime = mtime
         try:
-            if action == 'set_goal':
-                text = (req.get('goal') or '').strip()
-                if text:
-                    print(f'[agent_request #{seq}] set_goal: {text!r}')
-                    self.planner.plan(text, self.zone_names)
-            elif action == 'clear_goals':
-                print(f'[agent_request #{seq}] clear_goals')
-                from . import persistence as _persistence
-                empty = _persistence.Goals()
-                empty.save(self.goal_manager._goals_path)
-                self.goal_manager.goals = empty
-                self.goal_manager._last_dispatch.clear()
-                self.goal_manager._active_leaf_id = None
-                # The nav addon may still be following a route the
-                # previous goal dispatched — tell it to stop. cmdrelay
-                # picks the line up and executes /nav stop in-game.
-                self._issue_command('/nav stop')
-        finally:
-            # Always remove the trigger file once consumed. Survives
-            # the planner / persister failing — without this, a stale
-            # request with a high seq sits on disk forever and replays
-            # on every restart.
-            try:
-                agent_req.unlink()
-            except OSError:
-                pass
+            text = ugf.read_text(encoding='utf-8', errors='replace').strip()
+        except OSError as e:
+            print(f'  user_goal: read failed: {e}')
+            return
+        if text:
+            print(f'[user_goal] {text!r}')
+            self.planner.plan(text, self.zone_names)
+        else:
+            print('[user_goal] empty — clearing goals (gambits untouched)')
+            from . import persistence as _persistence
+            empty = _persistence.Goals()
+            empty.save(self.goal_manager._goals_path)
+            self.goal_manager.goals = empty
+            self.goal_manager._last_dispatch.clear()
+            self.goal_manager._active_leaf_id = None
+            # Gambits intentionally NOT wiped — they are context-bound
+            # combat reactions (per job/subjob/party state) that should
+            # outlive any single user goal. The agent itself has to ask
+            # for a clear if it wants one.
+            self._issue_command('/nav stop')
 
-    VERSION = '.8'
+    VERSION = '.9'
 
     def run(self):
         print(f'Nav server v{self.VERSION} started. Watching {REQUEST_FILE}')
         print(f'Collision data: {COLLISION_DIR}')
+        print(f'User goal file: {self.cfg.paths.user_goal_file()}')
         print(f'Character: {self.cfg.character}  goals: {len(self.goal_manager.goals.nodes)} nodes / '
               f'{len(self.goal_manager.goals.roots)} root(s)')
         # Goal-tick cadence: every Nth poll, not every poll. Polls are
@@ -1134,7 +1208,7 @@ class NavServer:
         try:
             while True:
                 self.poll()
-                self.poll_agent_request()
+                self.poll_user_goal_file()
                 tick_counter += 1
                 if tick_counter >= ticks_per_goal_run:
                     tick_counter = 0
@@ -1142,6 +1216,14 @@ class NavServer:
                         self.goal_manager.tick()
                     except Exception as e:
                         print(f'goal_manager tick error: {e}')
+                    try:
+                        self.poll_gambit_context()
+                    except Exception as e:
+                        print(f'gambit_context error: {e}')
+                    try:
+                        self.chat.tick()
+                    except Exception as e:
+                        print(f'chat tick error: {e}')
                 time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             print('\nShutting down.')

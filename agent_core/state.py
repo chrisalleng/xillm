@@ -57,7 +57,11 @@ def aggregate(state_dir: Path, character: str) -> WorldState:
             ws.channels[channel] = None
             continue
         try:
-            with open(path, encoding='utf-8') as f:
+            # FFXI chat occasionally smuggles non-UTF-8 control bytes
+            # past chat.lua's cleaner; errors='replace' keeps the read
+            # alive (a single bad line in a 200-line buffer shouldn't
+            # blank the whole channel).
+            with open(path, encoding='utf-8', errors='replace') as f:
                 ws.channels[channel] = json.load(f)
         except (json.JSONDecodeError, OSError):
             ws.channels[channel] = None

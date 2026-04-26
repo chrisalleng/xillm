@@ -312,23 +312,68 @@ Both surfaces read from the same `state/<char>/*.json` and `events.jsonl` files 
 
 Each phase will get its own implementation plan once we lock the architecture.
 
-**Phase 0 — Architecture sign-off (this document).**
+**Phase 0 — Architecture sign-off (this document).** ✅
 
-**Phase 1 — `agent_core` skeleton.** Refactor `navserver/` into `agent_core/` with the new IPC layout (`state/<char>/`, `commands/<char>/`, `events.jsonl`, persistent files). State aggregator + character-namespaced channel registry + LLM gateway stub (real Anthropic API but only stub tools). nav still works exactly as today.
+**Phase 1 — `agent_core` skeleton.** ✅ navserver renamed to agent_core, Groq LLM gateway with healthcheck, per-character path helpers in `Config`, persistence helpers, state aggregator, event log. nav unchanged in behaviour. **Phase 1b** (full IPC migration of nav onto `state/<char>/nav.json` + `commands/<char>/nav.json`) deferred.
 
-**Phase 2 — Goal manager + LLM planner.** Persistent goal tree, planner loop, tool surface (`read_world_state`, `update_goals`, `set_directive`, `query_knowledge`). Demo: hand the agent "travel Sandy → Selbina → Mhaura → Kazham"; agent decomposes into per-zone gotos and executes via the existing nav pipeline. No new addons — we exercise the planning brain on nav alone.
+**Phase 2 — Goal manager + LLM planner.** ✅ Persistent goal tree, planner with `update_goals` tool, deterministic dispatch loop, dispatch-once-per-leaf guard. The user feeds free-text instructions by saving `<repo>/user_goal.txt`; the orchestrator's mtime watcher hands the contents to the planner (empty file = clear goals + gambits + `/nav stop`).
 
-**Phase 3 — Combat addon + gambit engine + farming director.** Demo: "farm Bumblebees outside Sandy until level 10."
+**Phase 3 — Combat addon + gambit engine + farming director.**
+  - **3a** ✅ `combat.lua` publishes `state/<char>/combat.json` (self/target/party HP/MP/TP/buffs) at 10 Hz.
+  - **3b** ✅ Gambit AST validator + `update_gambits` LLM tool + Lua evaluator + action executor; cooldown floor at 0.5s.
+  - **3c** ✅ `FarmingDirector` state machine (acquire → engage → killed → resting → loop) driven by `farm` goal type with `target_name`, `stop_when.kill_count`, `rest_hp_pct`.
 
-**Phase 4 — Interact addon + NPC menu navigation.** Demo: "talk to gate guard, accept signet."
+**Phase 4 — Interact addon + NPC menu navigation.** ⏭ Deferred. One addon (`interact.lua`) covers all packet-level UI: NPC dialog progression, menu introspection, vendor buy/sell, trade, AND death recovery (home-point menu pick). See "Phase 4 detail" below for scope. Until this lands, the agent dies → `farming` enters `failed` → goal tree marked `failed` → orchestrator sits and waits for the user to re-touch `user_goal.txt` or for a nearby player to /raise. This is the "Option 1" recovery path locked in 2026-04-26.
 
-**Phase 5 — Chat addon.** Demo: agent responds to /tells reasonably; party-chat directed at agent gets handled.
+### Phase 4 detail (resume notes)
 
-**Phase 6 — Inventory addon (luashitacast/packer config writer).** Demo: agent equips appropriate gear when leveling/changing job.
+Packets to hook (verify against the target server build before committing):
 
-**Phase 7 — Observability dashboard.**
+  - **Incoming**: `0x05B` (dialog/menu open — NPC, death, vendor, trade share this shape with different `menu_id`); `0x052` event update; `0x05E` event finish; `0x03A` vendor item list; `0x021` trade window state.
+  - **Outgoing**: `0x05B` dialog response (`selected_option`); `0x05A` cutscene action; `0x036` trade NPC items; `0x033` trade player; `0x03B` vendor buy; `0x085` vendor sell.
 
-After Phase 4 we have the full "unlock a subjob" loop end-to-end.
+Components when this lands:
+
+  - `interact.lua` — hooks the packet pairs above; publishes `state/<char>/menu.json` on every menu change; polls `commands/<char>/interact.json` for actions (`pick_menu_option`, `buy_item`, `trade_drop`, ...).
+  - `agent_core/interact.py` — generic `pick_option_by_text(menu_kind, target_text)` helper.
+  - `agent_core/death_recovery.py` — watches `farming.state == 'failed'` post-death, waits ~30s for the death menu to activate + nearby raise window, then calls `interact.pick_option_by_text(menu_kind='death', target='Home Point')`. On success clears the failed goal tree.
+
+Existing pieces that already accommodate this:
+
+  - Chat handler's addon-prefix filter is generic — add `'[interact]'` to `_ADDON_PREFIXES` when the addon ships.
+  - Goal manager propagates `failed` up composite parents (landed 2026-04-26).
+  - Eternity (loaded today) handles some cutscene auto-progression — check overlap before duplicating.
+
+**Phase 5 — Chat addon + reactive chat layer.** ✅ `chat.lua` hooks `text_in`, publishes `state/<char>/chat.json` (rolling 200 lines), emits `chat_received` events for every line. `agent_core/chat_handler.py` polls those events, parses sender + channel, auto-accretes interactions to `persistent/<char>/relationships/<player>.json`, and runs a multi-turn LLM tool-loop (`query_player` / `update_player` / `send_chat` / `ignore`) on lines worth a reply. Per-channel outbound cooldowns enforce rate limits; outbound replies ride the existing `cmd_inbox.txt` → cmdrelay path.
+
+**Phase 6 — Inventory addon.** ✅ `inventory.lua` reads all 12 standard containers, publishes `state/<char>/inventory.json` at 2 Hz. Equipped-gear introspection + luashitacast/packer config writer deferred.
+
+**Phase 7 — Observability dashboard.** ✅ `http://127.0.0.1:7777/` serves a single-file dashboard rendering world state, goals, gambits, recent events, LLM session cost.
+
+After Phase 6 the agent can navigate, plan, fight, watch chat, and account for inventory — the full minus Phase 4 (NPC dialog).
+
+## Outstanding work
+
+- **Phase 1b** — nav onto the unified `state/<char>/nav.json` + `commands/<char>/nav.json` layout.
+- **Phase 4** — Interact addon (NPC menus, vendor, trade).
+- **Inventory equipped-gear read** + action channel (luashitacast/packer config generation).
+- **Combat-log emission** — `combat.lua` should append events for damage dealt/taken, ability use, exp gained, kills, deaths, and level-ups so the review loop has something to read.
+- **Combat-log analysis loop** — periodic LLM call (every 5–10 min during active combat) reviewing `events.jsonl` to tune gambits via the incremental `add_gambit` / `modify_gambit` / `remove_gambit` tools. Lives on top of the new `LLMGateway.run_tool_loop` helper.
+- **Persistent dedup keys** — `nav_request.json` is deleted after consume to defeat replay; the in-memory seq guard could migrate to disk for robustness.
+
+## Persistence layout
+
+Persistent (survives crashes) under `<ipc_base>/persistent/<character>/`:
+
+  - `goals.json` — goal tree
+  - `gambits.json` — context-keyed gambit library (`{sets: {"<main>/<sub>/<party>": [...]}}`)
+  - `relationships/<player>.json` — per-player record (tone, favors, interactions, notes)
+  - `knowledge.json` — open-schema fact store (vendor prices, quest hints, mob data) — **planned, not yet wired**
+
+## LLM patterns
+
+- **Single-turn `Planner.plan()`** for "decide and commit" calls (set goals, deploy gambits) where the LLM doesn't need to read state mid-decision. Tools collected, tool calls applied at end-of-response.
+- **Multi-turn `LLMGateway.run_tool_loop()`** for surfaces that need to query, decide, possibly act, possibly query more. Used by the chat handler today; the future combat-log review loop will reuse it.
 
 ## What this plan does NOT cover
 

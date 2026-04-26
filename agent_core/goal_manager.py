@@ -126,14 +126,21 @@ class GoalManager:
                     continue
                 unresolved_children.append(cid)
             if not unresolved_children:
-                # All children done: parent is also done. Mark + persist.
-                node['state'] = 'completed'
+                # All children terminal — propagate failure if any child
+                # failed (a composite isn't "completed" if its subgoal
+                # died). Otherwise the parent is completed.
+                child_states = [
+                    (self._node(cid) or {}).get('state', 'pending')
+                    for cid in self._children(gid)
+                ]
+                terminal = 'failed' if 'failed' in child_states else 'completed'
+                node['state'] = terminal
                 self._save()
                 _events.append(
                     self.cfg.paths.events_file(),
                     character=self.cfg.character,
                     source='goal_manager',
-                    type_='goal_completed',
+                    type_=f'goal_{terminal}',
                     goal_id=gid,
                     title=node.get('title', ''),
                 )
@@ -314,7 +321,15 @@ class GoalManager:
         if leaf.get('type') == 'farm' and self.farming is not None and self.farming.is_active():
             self.farming.tick()
         if self._is_complete(leaf, snap):
-            leaf['state'] = 'completed'
+            # Distinguish completed vs failed for farm leaves so death
+            # (FarmingDirector → 'failed') doesn't masquerade as success.
+            # `is_done()` covers both terminal states; `state == 'failed'`
+            # is the disambiguator.
+            terminal = 'completed'
+            if leaf.get('type') == 'farm' and self.farming is not None \
+                    and getattr(self.farming, 'state', None) == 'failed':
+                terminal = 'failed'
+            leaf['state'] = terminal
             self._last_dispatch.pop(leaf_id, None)
             self._dispatched_zone.pop(leaf_id, None)
             self._save()
@@ -322,7 +337,7 @@ class GoalManager:
                 self.cfg.paths.events_file(),
                 character=self.cfg.character,
                 source='goal_manager',
-                type_='goal_completed',
+                type_=f'goal_{terminal}',
                 goal_id=leaf_id,
                 title=leaf.get('title', ''),
             )

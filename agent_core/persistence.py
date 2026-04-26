@@ -72,16 +72,32 @@ class Goals:
 
 @dataclass
 class Gambits:
-    """Persistent gambit library. Phase 3 will fill in the AST schema."""
-    gambits: list[dict[str, Any]] = field(default_factory=list)
+    """Persistent gambit library, keyed by execution context.
+
+    Schema:
+        { "sets": { "<context_key>": [ <gambit>, ... ], ... } }
+
+    `context_key` is "<main_job>/<sub_job>/<party>" with `*` for any
+    wildcard segment (e.g. "WAR/NIN/solo", "*/*/*"). At deploy time the
+    orchestrator picks the current context, finds every matching set,
+    merges them (more-specific overrides less-specific by gambit id),
+    and writes the resolved list to `commands/<char>/combat.json`.
+
+    Migration: a legacy file with a flat `{"gambits": [...]}` shape is
+    auto-promoted to `{"sets": {"*/*/*": [...]}}` on first load so older
+    deployments don't lose their tuning.
+    """
+    sets: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> 'Gambits':
-        data = _read_json(path, {'gambits': []})
-        return cls(gambits=data.get('gambits', []))
+        data = _read_json(path, {'sets': {}})
+        if 'sets' not in data and isinstance(data.get('gambits'), list) and data['gambits']:
+            return cls(sets={'*/*/*': list(data['gambits'])})
+        return cls(sets=data.get('sets', {}) or {})
 
     def save(self, path: Path) -> None:
-        _atomic_write_json(path, {'gambits': self.gambits})
+        _atomic_write_json(path, {'sets': self.sets})
 
 
 @dataclass

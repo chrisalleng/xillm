@@ -45,10 +45,14 @@ def append(path: Path, character: str, source: str, type_: str, **fields: Any) -
 
 
 def iter_since(path: Path, since_ts: float) -> Iterator[dict]:
-    """Yield event records with ts >= since_ts. Skips malformed lines."""
+    """Yield event records with ts >= since_ts. Skips malformed lines.
+
+    Uses errors='replace' on the underlying read because FFXI chat text
+    occasionally smuggles color/control bytes past the addon's cleaner;
+    a single byte sequence shouldn't sink the whole iteration."""
     if not path.exists():
         return
-    with open(path, encoding='utf-8') as f:
+    with open(path, encoding='utf-8', errors='replace') as f:
         for raw in f:
             raw = raw.strip()
             if not raw:
@@ -66,7 +70,7 @@ def tail(path: Path, n: int = 100) -> list[dict]:
     larger logs we'll add a seek-from-end implementation later."""
     if not path.exists():
         return []
-    with open(path, encoding='utf-8') as f:
+    with open(path, encoding='utf-8', errors='replace') as f:
         lines = f.readlines()
     out: list[dict] = []
     for raw in lines[-n:]:

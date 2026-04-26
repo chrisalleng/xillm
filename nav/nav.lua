@@ -16,7 +16,7 @@
 
 addon.name    = 'nav'
 addon.author  = 'xillm'
-addon.version = '.39'
+addon.version = '.40'
 addon.desc    = 'Navigation client for FFXI (Python agent_core backend)'
 addon.link    = ''
 
@@ -1501,46 +1501,6 @@ ashita.events.register('command', 'nav_cmd', function(e)
     elseif cmd == 'stop' then
         cancel_all()
         msg('Stopped.')
-
-    elseif cmd == 'goal' then
-        -- /nav goal <text>            — hand a free-text high-level goal
-        --                              to the LLM planner. The planner
-        --                              decomposes it and the goal manager
-        --                              executes the resulting tree.
-        -- /nav goal clear|stop|halt   — wipe the persistent goal tree
-        --                              and stop nav. Aliased so the
-        --                              user doesn't have to remember
-        --                              "clear" specifically; if the
-        --                              entire instruction is a single
-        --                              stop-word we short-circuit the
-        --                              LLM and just clear.
-        if #args < 3 then
-            msg('Usage: /nav goal <text> | goal clear')
-            return
-        end
-        local sub = args[3]:lower()
-        state.last_seq = state.last_seq + 1
-        local seq = state.last_seq
-        local stopwords = { clear = true, stop = true, halt = true,
-                            cancel = true, abort = true, reset = true }
-        if #args == 3 and stopwords[sub] then
-            write_json(ipc_path('agent_request.json'), {
-                action = 'clear_goals',
-                seq = seq,
-            })
-            msg('Goal cleared.')
-        else
-            local text = table.concat(args, ' ', 3)
-            -- Strip Ashita autotranslate markers (\xEF...) the way other
-            -- name-parsing commands do.
-            text = text:gsub('\xEF.', '')
-            write_json(ipc_path('agent_request.json'), {
-                action = 'set_goal',
-                goal   = text,
-                seq    = seq,
-            })
-            msg(string.format('Goal sent to planner: %q', text))
-        end
 
     elseif cmd == 'preview' then
         -- Same syntax as `goto` but loads waypoints for visualization only

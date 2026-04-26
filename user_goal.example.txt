@@ -1,0 +1,36 @@
+# user_goal.txt — free-text instructions for the agent.
+#
+# Copy this file to `user_goal.txt` (in this same directory) and edit.
+# `user_goal.txt` is gitignored so each character/installation keeps
+# its own. Save the file to apply changes — agent_core watches the
+# mtime and re-plans on every save. An empty file clears all goals
+# (gambits stay armed; only the agent itself can clear those).
+#
+# The entire file is handed to the LLM planner verbatim, comments
+# included — anything you write here informs planning.
+#
+# ----------------------------------------------------------------
+# Goals (top = highest priority)
+# ----------------------------------------------------------------
+# List goals in priority order. The agent works on #1 first, and
+# only moves on once it completes. The planner decomposes each line
+# into a goal subtree (travel / goto / farm / wait / composite).
+
+1. Travel to South Gustaberg, engage one Huge Hornet, kill it, then stop.
+
+# Other examples you can swap in:
+# 1. Travel to South Gustaberg and farm 5 Huge Hornets there.
+# 2. Unlock Sub Job
+# 3. Unlock Dragoon
+# 4. Get to Selbina via Valkurm Dunes
+
+# ----------------------------------------------------------------
+# Context (optional)
+# ----------------------------------------------------------------
+# The planner already sees current zone, position, job, level, HP,
+# inventory, and known zone IDs. Use this section for anything
+# that *isn't* observable — preferences, constraints, hints.
+#
+# - Prefer cheap travel; no teleports or airships above 200g.
+# - Avoid Tu'Lia entirely.
+# - Skip combat above my level until Sub Job is unlocked.

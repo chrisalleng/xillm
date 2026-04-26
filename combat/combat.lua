@@ -19,7 +19,7 @@
 
 addon.name    = 'combat'
 addon.author  = 'xillm'
-addon.version = '0.6'
+addon.version = '0.8'
 addon.desc    = 'Combat state publisher + gambit engine (Tier 1 for agent_core)'
 
 require('common')
@@ -126,15 +126,47 @@ local function read_self()
     local mm = AshitaCore:GetMemoryManager()
     local p = mm:GetPlayer()
     local party = mm:GetParty()
-    local hp     = pcget(function() return party:GetMemberHP(0) end) or 0
-    local hp_max = pcget(function() return party:GetMemberHPMax(0) end) or 0
-    local mp     = pcget(function() return party:GetMemberMP(0) end) or 0
-    local mp_max = pcget(function() return party:GetMemberMPMax(0) end) or 0
-    local tp     = pcget(function() return party:GetMemberTP(0) end) or 0
+    -- Current HP/MP/TP: IParty slot 0 is reliable for the local player.
+    local hp = pcget(function() return party:GetMemberHP(0) end) or 0
+    local mp = pcget(function() return party:GetMemberMP(0) end) or 0
+    local tp = pcget(function() return party:GetMemberTP(0) end) or 0
+    -- Max HP/MP: IParty.GetMemberHPMax(0) returns 0 when the player is
+    -- solo (the party struct only populates slot-0 max values in an
+    -- actual party — known Ashita quirk; xiui works around it via
+    -- IPlayer.GetHPMax). Try IPlayer first, fall back to IParty, last
+    -- resort back-compute from HPP. Always gives us a real number when
+    -- the player is alive.
+    local function read_max(getplayer, getparty, getpct, current)
+        local v = pcget(getplayer) or 0
+        if v > 0 then return v end
+        v = pcget(getparty) or 0
+        if v > 0 then return v end
+        local pct = pcget(getpct) or 0
+        if current > 0 and pct > 0 then
+            return math.floor(current / (pct / 100.0) + 0.5)
+        end
+        return 0
+    end
+    local hp_max = read_max(
+        function() return p:GetHPMax() end,
+        function() return party:GetMemberHPMax(0) end,
+        function() return p:GetHPPercent() end,
+        hp)
+    local mp_max = read_max(
+        function() return p:GetMPMax() end,
+        function() return party:GetMemberMPMax(0) end,
+        function() return p:GetMPPercent() end,
+        mp)
     local main_job     = pcget(function() return p:GetMainJob() end) or 0
     local main_job_lvl = pcget(function() return p:GetMainJobLevel() end) or 0
     local sub_job      = pcget(function() return p:GetSubJob() end) or 0
     local sub_job_lvl  = pcget(function() return p:GetSubJobLevel() end) or 0
+    -- Status drives death detection downstream. Standard FFXI codes:
+    --   0 = idle, 1 = engaged, 2 = dead-pending-menu, 3 = dead/zoning,
+    --   33 = healing, 38 = chocobo, 44 = riding (varies by game version).
+    -- Without this field, the FarmingDirector can't tell "alive at 0 HP
+    -- mid-frame" from "actually dead", and keeps issuing /attack on.
+    local status       = pcget(function() return p:GetStatus() end) or 0
     local buffs = {}
     local raw_buffs = pcget(function() return p:GetBuffs() end)
     if type(raw_buffs) == 'table' then
@@ -153,6 +185,7 @@ local function read_self()
         mp_max = mp_max,
         mp_pct = (mp_max > 0) and (100.0 * mp / mp_max) or 0,
         tp     = tp,
+        status       = status,
         main_job     = main_job,
         main_job_lvl = main_job_lvl,
         sub_job      = sub_job,

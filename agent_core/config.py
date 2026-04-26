@@ -68,8 +68,19 @@ class Paths:
     def persistent_dir(self, character: str) -> Path:
         return self.ipc_base / 'persistent' / character
 
+    def relationships_dir(self, character: str) -> Path:
+        # Per-player JSON files (interaction history, favors, tone) so
+        # we don't serialise the whole social graph on every update.
+        return self.persistent_dir(character) / 'relationships'
+
     def events_file(self) -> Path:
         return self.ipc_base / 'events.jsonl'
+
+    def user_goal_file(self) -> Path:
+        # The user's free-text goal lives in the repo root so it's easy
+        # to find and edit. Empty file = "stop everything"; any non-empty
+        # text gets handed to the LLM planner.
+        return REPO_ROOT / 'user_goal.txt'
 
 
 @dataclass
