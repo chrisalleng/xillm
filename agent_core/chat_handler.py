@@ -522,7 +522,7 @@ class ChatHandler:
                 user_prompt=user_prompt,
                 tools=_CHAT_TOOLS,
                 tool_handlers=self._make_handlers(parsed, outcome),
-                max_iters=4,
+                max_iters=6,
                 max_tokens=1024,
                 source='chat_handler',
             )

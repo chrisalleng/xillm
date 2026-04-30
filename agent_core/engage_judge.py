@@ -107,19 +107,22 @@ SYSTEM_PROMPT = (
     '- DO NOT reference past fights or "still recovering" / "still '
     '  healing" - state the CURRENT decision only.\n'
     '- DO mention HP%%, level, or con label - they are the deciding '
-    '  factors. The HP/MP values in the prompt are bucketed to 10%% '
-    '  and prefixed with "around" (e.g. "around 90%%"). Use that exact '
-    '  phrasing - do NOT invent a more precise number, and do NOT drop '
-    '  the "around" qualifier. So "my HP is around 90%%" is correct; '
-    '  "my HP is at 95%%" or "my HP is 90%%" is wrong.\n'
+    '  factors. Use the EXACT integer percent shown in the prompt '
+    '  (e.g. if "Player HP" says 63%%, say "my HP is at 63%%", not '
+    '  "around 60%%" or "above 50%%"). Do not round, do not invent.\n'
+    '- Compare current HP vs. avg/max damage taken from history when '
+    '  weighing risk. If max damage taken on this mob exceeds your '
+    '  current HP, the fight is potentially fatal - skip or rest. If '
+    '  avg damage taken is well below current HP, the fight is safe.\n'
     '- If you mention the mob\'s con label, use the EXACT label from '
     '  the prompt (Easy Prey, Decent Challenge, Even Match, Tough, etc.).\n\n'
     'GOOD examples (mention agent, mob name, mob con, decision):\n'
-    '  "My HP is around 100%%, the Wild Rabbit is Easy Prey, going in."\n'
-    '  "I\'m around 30%% HP and the Goblin Smithy is a Decent Challenge '
-    '  - too risky, skipping."\n'
-    '  "The Tunnel Worm is Tough at this level, I\'ll skip it."\n'
-    '  "MP\'s around 0 and a Wild Rabbit linker is next to me, sitting."\n'
+    '  "My HP is at 100%%, the Wild Rabbit is Easy Prey, going in."\n'
+    '  "I\'m at 30%% HP and Ding Bats average 40%% damage - too risky, '
+    '  skipping."\n'
+    '  "Max damage from Tunnel Worm was 95%% last time, I\'m at 60%%, '
+    '  not safe."\n'
+    '  "MP at 0 and a Wild Rabbit linker is next to me, sitting."\n'
     'BAD examples:\n'
     '  "I\'m still recovering from the last fight" (flavor; not '
     '  literally resting right now).\n'
@@ -150,20 +153,12 @@ def _build_prompt(mob: dict[str, Any], player: dict[str, Any],
     hp    = player.get('hp_pct')
     mp    = player.get('mp_pct')
     plvl_s = f'{plvl}' if plvl is not None else '?'
-    # Bucket HP/MP to the same 10% granularity the cache key uses. The
-    # cache is (name, level, hp_bucket); echoing a cached reason that
-    # cites an exact percent is misleading once HP shifts within the
-    # same bucket. Round to nearest 10% (clipped to 100) and tell the
-    # LLM to phrase it with "around X%" so it stays accurate for any
-    # HP in the bucket.
-    def _bucket_pct(p: Any) -> int | None:
-        if not isinstance(p, (int, float)):
-            return None
-        return min(int(p) // HP_BUCKET_PCT * HP_BUCKET_PCT, 100)
-    hp_b = _bucket_pct(hp)
-    mp_b = _bucket_pct(mp)
-    hp_s = f'around {hp_b}%' if hp_b is not None else '?'
-    mp_s = f'around {mp_b}%' if mp_b is not None else '?'
+    # Send exact HP/MP - the LLM needs the real number to weigh against
+    # avg/max damage taken. Cache key remains bucketed (10% granularity)
+    # so we don't re-query on every 1%% change, but the prompt itself
+    # carries the precise current state.
+    hp_s = f'{hp:.0f}%' if isinstance(hp, (int, float)) else '?'
+    mp_s = f'{mp:.0f}%' if isinstance(mp, (int, float)) else '?'
     sub_s = f'{sub_job}{sub_lvl}' if isinstance(sub_lvl, int) and sub_lvl > 0 else sub_job
     job_s = f'{main_job}{plvl_s}/{sub_s}'
 
@@ -173,6 +168,8 @@ def _build_prompt(mob: dict[str, Any], player: dict[str, Any],
     avg_hp_s = f'{avg_hp:.0f}%' if isinstance(avg_hp, (int, float)) else 'n/a'
     avg_dmg = history.get('avg_damage_taken_pct')
     avg_dmg_s = f'{avg_dmg:.0f}%' if isinstance(avg_dmg, (int, float)) else 'n/a'
+    max_dmg = history.get('max_damage_taken_pct')
+    max_dmg_s = f'{max_dmg:.0f}%' if isinstance(max_dmg, (int, float)) else 'n/a'
     last_killed = history.get('last_killed_at')
     last_died   = history.get('last_died_at')
     now = time.time()
@@ -198,11 +195,12 @@ def _build_prompt(mob: dict[str, Any], player: dict[str, Any],
         f'\n'
         f'Goal: {goal or "(no explicit user goal)"}\n'
         f'\n'
-        f'Fight history (this character vs. "{name}" in this zone):\n'
+        f'Fight history (this character vs. "{name}" at this level):\n'
         f'  kills:               {kc}\n'
         f'  deaths:              {dc}\n'
         f'  avg HP remaining:    {avg_hp_s}\n'
         f'  avg damage taken:    {avg_dmg_s}    <- typical fight cost\n'
+        f'  max damage taken:    {max_dmg_s}    <- worst single fight\n'
         f'  last killed:         {_ago(last_killed)}\n'
         f'  last died:           {_ago(last_died)}\n'
     )
@@ -233,65 +231,63 @@ def _parse_decision(text: str) -> dict[str, Any] | None:
 
 
 class EngageJudge:
-    """Owns the (name, lvl) -> judgment cache and worker dispatch. One
-    instance per orchestrator; passed into FarmingDirector by main.py."""
+    """Per-call judgment dispatcher. No cache - every request fires a
+    fresh LLM call. Caller holds an rid (request id) to poll for the
+    verdict, then discards. Pattern matches RestJudge."""
 
     def __init__(self, cfg: _config.Config, llm: _llm.LLMGateway | None):
         self.cfg = cfg
         self.llm = llm
-        # Cache key is (name, level, hp_bucket). Crossing a bucket
-        # boundary (default every 25% HP) forces a fresh LLM call so
-        # the reason text reflects current HP, not whatever HP was
-        # captured on the original judgment.
-        self._cache: dict[tuple[str, int, int], dict[str, Any]] = {}
-        self._pending: set[tuple[str, int, int]] = set()
+        # rid -> verdict dict once the worker finishes. Caller polls
+        # via status(rid) and consumes via discard(rid). No cross-call
+        # caching - every judgment is fresh against current state.
+        self._results: dict[int, dict[str, Any]] = {}
+        self._pending: set[int] = set()
+        self._next_rid: int = 1
         self._lock = threading.Lock()
 
+    def available(self) -> bool:
+        return self.llm is not None and self.llm.available
+
     def invalidate(self) -> None:
-        with self._lock:
-            self._cache.clear()
+        """No-op kept for backward compatibility - the level-up path
+        in farming.py calls this. Without a cache there's nothing
+        to clear, but we leave the entry point so callers don't
+        need to know about the refactor."""
+        pass
 
-    def lookup(self, name: str, player_lvl: int,
-               hp_pct: float | int | None) -> dict[str, Any] | None:
-        """Synchronous cache read. Returns the cached judgment or None.
-        Error entries auto-expire after ERROR_CACHE_TTL_S so we re-try
-        the LLM once it's recovered."""
-        key = (name, player_lvl, _hp_bucket(hp_pct))
+    def status(self, rid: int) -> dict[str, Any] | None:
+        """Returns the verdict dict ('decision': 'engage'|'skip'|'rest'
+        |'error', 'reason': ...) once the worker has resolved, or None
+        while still pending. Caller should `discard(rid)` after acting
+        on the verdict."""
         with self._lock:
-            entry = self._cache.get(key)
-            if entry is None:
+            if rid in self._pending:
                 return None
-            if entry.get('decision') == 'error':
-                if time.time() - float(entry.get('ts') or 0.0) > ERROR_CACHE_TTL_S:
-                    self._cache.pop(key, None)
-                    return None
-            return entry
+            return self._results.get(rid)
 
-    def is_pending(self, name: str, player_lvl: int,
-                   hp_pct: float | int | None) -> bool:
+    def discard(self, rid: int) -> None:
         with self._lock:
-            return (name, player_lvl, _hp_bucket(hp_pct)) in self._pending
+            self._results.pop(rid, None)
 
     def request(self, mob: dict[str, Any], player: dict[str, Any],
-                goal: str, history: dict[str, Any]) -> None:
-        """Fire-and-forget judgment. Dedup'd by (name, level, hp_bucket)
-        so repeated calls while a worker is in flight don't pile up."""
-        name = mob.get('name')
-        plvl = player.get('level')
-        if not name or plvl is None or self.llm is None or not self.llm.available:
-            return
-        key = (name, int(plvl), _hp_bucket(player.get('hp_pct')))
+                goal: str, history: dict[str, Any]) -> int | None:
+        """Fire a fresh judgment. Returns the rid for polling, or None
+        if the LLM is unavailable (caller should fall back immediately)."""
+        if not self.available():
+            return None
         with self._lock:
-            if key in self._cache or key in self._pending:
-                return
-            self._pending.add(key)
+            rid = self._next_rid
+            self._next_rid += 1
+            self._pending.add(rid)
         t = threading.Thread(
-            target=self._worker, args=(key, mob, player, goal, history),
-            name=f'engage-judge-{name}', daemon=True,
+            target=self._worker, args=(rid, mob, player, goal, history),
+            name=f'engage-judge-{rid}', daemon=True,
         )
         t.start()
+        return rid
 
-    def _worker(self, key: tuple[str, int], mob: dict[str, Any],
+    def _worker(self, rid: int, mob: dict[str, Any],
                 player: dict[str, Any], goal: str,
                 history: dict[str, Any]) -> None:
         prompt = _build_prompt(mob, player, goal, history)
@@ -329,7 +325,7 @@ class EngageJudge:
                 tools=[_web_research.WEB_SEARCH_TOOL,
                        _web_research.WEB_FETCH_TOOL],
                 tool_handlers=_web_research.make_handlers(self.cfg),
-                max_iters=4,
+                max_iters=6,
                 max_tokens=256,
                 source='engage_judge',
             )
@@ -342,26 +338,13 @@ class EngageJudge:
         latency = time.time() - t0
 
         with self._lock:
-            self._pending.discard(key)
+            self._pending.discard(rid)
             if decision is not None:
-                # 'rest' is a response to transient state (current HP/MP)
-                # and isn't a property of the mob at this level - caching
-                # it would loop forever (rest -> cache hit -> rest -> ...).
-                # 'engage' and 'skip' are stable per (name, lvl) so they
-                # cache cleanly.
-                if decision.get('decision') == 'rest':
-                    pass  # don't cache; re-fire next time
-                else:
-                    decision['ts'] = time.time()
-                    self._cache[key] = decision
+                self._results[rid] = decision
             else:
-                # Cache the error so callers fall back to hardcoded
-                # buckets without re-firing the request every tick.
-                # The TTL in lookup() will evict it after 30s.
-                self._cache[key] = {
+                self._results[rid] = {
                     'decision': 'error',
                     'reason':   err or 'unknown',
-                    'ts':       time.time(),
                 }
 
         # Echo the LLM's raw text response verbatim so a watcher can
@@ -374,17 +357,13 @@ class EngageJudge:
             pass
         verdict = (decision or {}).get('decision') or 'error'
         reason  = (decision or {}).get('reason') or err
-        # Log the verbatim prompt and raw response on every judgment.
-        # Lets us verify the HP%% / level / con label we sent the LLM
-        # before assuming it hallucinated. Truncated to keep
-        # events.jsonl bounded but generous enough to see the full
-        # player + history blocks.
         event_kwargs: dict[str, Any] = {
             'character':   self.cfg.character,
             'source':      'engage_judge',
             'type_':       'judgment',
-            'mob_name':    key[0],
-            'player_lvl':  key[1],
+            'rid':         rid,
+            'mob_name':    mob.get('name'),
+            'player_lvl':  player.get('level'),
             'decision':    verdict,
             'reason':      reason,
             'latency_s':   round(latency, 3),

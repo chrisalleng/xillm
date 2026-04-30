@@ -321,23 +321,60 @@ class NavServer:
         print(f'  gambits: ctx={ctx["main_job"]}/{ctx["sub_job"]}/{ctx["in_party"]}'
               f'  active={len(merged)}')
 
+    # Zones that are NOT present on this LandSandBoat server. The
+    # bundled zone_transitions.json was generated from retail FFXI data
+    # (~200 zones) but our server runs RoZ + CoP era only. Loading the
+    # missing zones means the planner sometimes picks them ("East
+    # Ronfaure S") and the agent paths off across non-existent geometry.
+    # Filter at load time so the rest of the system never sees them.
+    _ERA_EXCLUDED_NAME_SUFFIXES = (' S',)              # WotG past-Vana
+    _ERA_EXCLUDED_NAME_KEYWORDS = (                    # ToAU
+        'Aht Urhgan', 'Wajaom', 'Bhaflau', 'Arrapago',
+        'Talacca', 'Mount Zhayolm', 'Halvung', 'Mamook',
+        'Aydeewa', 'Alzadaal', 'Caedarva',
+    )
+
+    def _is_era_excluded(self, name: str) -> bool:
+        """True if the zone name is from a post-CoP expansion that the
+        LSB server does not implement."""
+        if not name:
+            return False
+        for suf in self._ERA_EXCLUDED_NAME_SUFFIXES:
+            if name.endswith(suf):
+                return True
+        nl = name.lower()
+        for kw in self._ERA_EXCLUDED_NAME_KEYWORDS:
+            if kw.lower() in nl:
+                return True
+        return False
+
     def _load_transitions(self):
         if not TRANSITIONS_FILE.exists():
             print(f'Warning: {TRANSITIONS_FILE} not found')
             return
         with open(TRANSITIONS_FILE) as f:
             data = json.load(f)
+        excluded_zids: set[int] = set()
         for zid_str, name in data.get('names', {}).items():
             zid = int(zid_str)
+            if self._is_era_excluded(name):
+                excluded_zids.add(zid)
+                continue
             self.zone_names[zid] = name
             self.name_to_zone[name.lower()] = zid
         for zid_str, trans_list in data.get('transitions', {}).items():
-            for t in trans_list:
+            zid = int(zid_str)
+            if zid in excluded_zids:
+                continue
+            # Also drop transitions whose destination is an excluded zone.
+            filtered = [t for t in trans_list if t.get('zone') not in excluded_zids]
+            for t in filtered:
                 if 'z' not in t:
                     t['z'] = 0.0
-            self.transitions[int(zid_str)] = trans_list
+            self.transitions[zid] = filtered
         print(f'Loaded {len(self.zone_names)} zone names, '
-              f'{sum(len(v) for v in self.transitions.values())} transitions')
+              f'{sum(len(v) for v in self.transitions.values())} transitions '
+              f'(excluded {len(excluded_zids)} post-CoP zones)')
 
     def resolve_zone_name(self, name: str):
         name_lower = name.lower()

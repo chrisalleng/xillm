@@ -215,7 +215,7 @@ class RestJudge:
                 tools=[_web_research.WEB_SEARCH_TOOL,
                        _web_research.WEB_FETCH_TOOL],
                 tool_handlers=_web_research.make_handlers(self.cfg),
-                max_iters=4,
+                max_iters=6,
                 max_tokens=256,
                 source='rest_judge',
             )

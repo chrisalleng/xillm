@@ -265,6 +265,13 @@ class FarmingDirector:
         # Wall-clock of the last /heal we issued. Used by _start_resting
         # to drop redundant toggle attempts within HEAL_TOGGLE_GAP_S.
         self._last_heal_at: float = 0.0
+        # Active engage_judge request id (None when no call is in
+        # flight). Cleared in _enter('acquire') so each acquire cycle
+        # fires a fresh judgment, and on verdict consume so a 'skip'
+        # bouncing back to acquire fires a fresh call for the next
+        # candidate. No cross-tick caching - "calls are free" per the
+        # local LLM tier.
+        self._engage_judge_rid: int | None = None
         # Optional injectables - without them, locate/approach degrade
         # gracefully into the old "assume we're near the spawn" behaviour.
         # Keeps tests + tools that drive the director directly viable.
@@ -463,6 +470,12 @@ class FarmingDirector:
         if new_state == 'acquire':
             self._acquired_name = None
             self._last_acquire_sid = None
+            # Drop any in-flight engage-judge rid - the next acquire's
+            # locked target deserves a fresh judgment.
+            if (self._engage_judge_rid is not None
+                    and self._engage_judge is not None):
+                self._engage_judge.discard(self._engage_judge_rid)
+            self._engage_judge_rid = None
         # killed bookkeeping is one-shot per kill - clear the latch on
         # entry so re-entering 'killed' (e.g. after an aborted rest)
         # would record again. In practice we only enter killed once per
@@ -558,6 +571,7 @@ class FarmingDirector:
                     dmg = self._engage_start_hp_pct
                     _fight_history.record_death(
                         self.cfg, snap.zone_id, died_to,
+                        player_level=snap.self_lvl,
                         damage_taken_pct=dmg,
                     )
                 _events.append(
@@ -748,68 +762,75 @@ class FarmingDirector:
                 check_type=ct, hp_pct=snap.self_hp_pct,
             )
             return v
-        cached = ej.lookup(name, int(plvl), snap.self_hp_pct)
-        if cached is not None:
-            decision = cached.get('decision')
-            reason = cached.get('reason') or ''
-            if decision in ('engage', 'skip', 'rest'):
-                self._echo_engage_decision(
-                    decision, name, reason,
-                    check_type=ct, hp_pct=snap.self_hp_pct,
+
+        # Per-call rid lifecycle (no cache). On the first tick we fire
+        # a fresh request and store the rid; subsequent ticks poll
+        # status. Once a verdict lands we consume + clear the rid;
+        # the next acquire cycle for a different sid fires fresh.
+        rid = self._engage_judge_rid
+        if rid is None:
+            history = {}
+            if snap.zone_id is not None:
+                history = _fight_history.summary(
+                    self.cfg, snap.zone_id, name, plvl,
                 )
-                return decision
-            # 'error' (LLM failed) -> fall back to hardcoded sets so the
-            # agent keeps moving while the LLM endpoint is down. The
-            # cached error expires after ERROR_CACHE_TTL_S, so a recovery
-            # is picked up without manual intervention.
-            if decision == 'error':
+            mob = {
+                'name':       name,
+                'level':      locked.get('level'),
+                'check_type': locked.get('check_type'),
+                'conditions': locked.get('conditions'),
+                'distance':   locked.get('distance'),
+            }
+            from . import gambits as _gambits
+            main_job_s = _gambits.JOB_NAMES.get(int(snap.self_main_job)) \
+                if isinstance(snap.self_main_job, int) else None
+            sub_job_s = _gambits.JOB_NAMES.get(int(snap.self_sub_job)) \
+                if isinstance(snap.self_sub_job, int) else None
+            player = {
+                'level':    plvl,
+                'hp_pct':   snap.self_hp_pct,
+                'mp_pct':   snap.self_mp_pct,
+                'main_job': main_job_s,
+                'sub_job':  sub_job_s,
+                'sub_lvl':  snap.self_sub_lvl,
+            }
+            new_rid = ej.request(
+                mob, player, self._read_user_goal_text(), history,
+            )
+            if new_rid is None:
                 v = self._fallback_verdict(ct)
                 self._echo_engage_decision(
-                    v, name, '(fallback - LLM error, applying hardcoded rules)',
+                    v, name,
+                    '(fallback - LLM unavailable, applying hardcoded rules)',
                     check_type=ct, hp_pct=snap.self_hp_pct,
                 )
                 return v
-        if ej.is_pending(name, int(plvl), snap.self_hp_pct):
+            self._engage_judge_rid = new_rid
             return 'pending'
-        # Fire a new judgment request. Pull fight history for this mob
-        # name in this zone - the judge's main prior on whether THIS
-        # character has fought this mob before, won, or died trying.
-        history = {}
-        if snap.zone_id is not None:
-            history = _fight_history.summary(self.cfg, snap.zone_id, name)
-        mob = {
-            'name':       name,
-            'level':      locked.get('level'),
-            'check_type': locked.get('check_type'),
-            'conditions': locked.get('conditions'),
-            'distance':   locked.get('distance'),
-        }
-        # Resolve job IDs to 3-letter codes the LLM understands. JOB_NAMES
-        # is the same map planner.py uses; keeping a single source of
-        # truth means /check'ing this list whenever Square adds a job.
-        from . import gambits as _gambits
-        main_job_s = _gambits.JOB_NAMES.get(int(snap.self_main_job)) \
-            if isinstance(snap.self_main_job, int) else None
-        sub_job_s = _gambits.JOB_NAMES.get(int(snap.self_sub_job)) \
-            if isinstance(snap.self_sub_job, int) else None
-        player = {
-            'level':    plvl,
-            'hp_pct':   snap.self_hp_pct,
-            'mp_pct':   snap.self_mp_pct,
-            'main_job': main_job_s,
-            'sub_job':  sub_job_s,
-            'sub_lvl':  snap.self_sub_lvl,
-        }
-        ej.request(mob, player, self._read_user_goal_text(), history)
-        # If the judge declined to fire (LLM unavailable), fall back.
-        if not ej.is_pending(name, int(plvl), snap.self_hp_pct) and ej.lookup(name, int(plvl), snap.self_hp_pct) is None:
-            v = self._fallback_verdict(ct)
+
+        verdict = ej.status(rid)
+        if verdict is None:
+            return 'pending'
+        # Verdict landed - consume and clear the rid before acting,
+        # so a 'skip' that bounces back to acquire fires a fresh call
+        # for the next candidate.
+        ej.discard(rid)
+        self._engage_judge_rid = None
+        decision = verdict.get('decision')
+        reason = verdict.get('reason') or ''
+        if decision in ('engage', 'skip', 'rest'):
             self._echo_engage_decision(
-                v, name, '(fallback - LLM unavailable, applying hardcoded rules)',
+                decision, name, reason,
                 check_type=ct, hp_pct=snap.self_hp_pct,
             )
-            return v
-        return 'pending'
+            return decision
+        # 'error' or unknown - fallback.
+        v = self._fallback_verdict(ct)
+        self._echo_engage_decision(
+            v, name, '(fallback - LLM error, applying hardcoded rules)',
+            check_type=ct, hp_pct=snap.self_hp_pct,
+        )
+        return v
 
     def _echo_engage_decision(self, verdict: str, mob_name: str | None,
                               reason: str,
@@ -843,17 +864,6 @@ class FarmingDirector:
             return
         self._issue('/heal')
         self._last_heal_at = now
-
-    def _judge_says_skip(self, name: str | None, plvl: int | None,
-                         hp_pct: float | int | None) -> bool:
-        """Picker-side fast path: if the judge cache already has a 'skip'
-        verdict for this (name, lvl, hp_bucket) we skip the candidate
-        without going through the lock + /check round trip again."""
-        ej = self._engage_judge
-        if ej is None or not name or plvl is None:
-            return False
-        cached = ej.lookup(name, int(plvl), hp_pct)
-        return bool(cached and cached.get('decision') == 'skip')
 
     def _fallback_verdict(self, ct: Any) -> str:
         """Hardcoded check_type bucketing - used only when the LLM judge
@@ -956,8 +966,6 @@ class FarmingDirector:
             for cand in nearby:
                 sid = cand.get('server_id')
                 if sid is not None and self._spawn_blacklist.get(sid, 0.0) > cutoff:
-                    continue
-                if self._judge_says_skip(cand.get('name'), snap.self_lvl, snap.self_hp_pct):
                     continue
                 if cand.get('check_type') == 0x40:
                     continue
@@ -1225,6 +1233,7 @@ class FarmingDirector:
                     dmg = max(0.0, self._engage_start_hp_pct - float(snap.self_hp_pct))
                 _fight_history.record_kill(
                     self.cfg, snap.zone_id, killed_name,
+                    player_level=snap.self_lvl,
                     hp_remaining_pct=snap.self_hp_pct,
                     damage_taken_pct=dmg,
                 )

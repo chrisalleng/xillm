@@ -44,14 +44,24 @@ from . import web_research as _web_research
 SYSTEM_PROMPT = _web_research.ERA_CONSTRAINT + '\n\n' + """You are the inner monologue of an autonomous Final Fantasy XI agent.
 When you call `update_goals`, ALWAYS populate the `rationale` field
 with ONE first-person sentence (<=100 chars) - what the agent is
-thinking, why this plan. Echoed in-game. The rationale MUST use the
-actual current job, level, zone, and HP from the world state shown
-above - DO NOT make up numbers or copy any specific values from this
-prompt's examples.
-GOOD shape (substitute REAL current values): "<job><lvl> in <zone>,
-<short reason for the plan>."
-BAD: third-person, multi-sentence, citing field names, made-up
-levels or zones, copying example wording verbatim.
+thinking, why this plan. Echoed in-game.
+
+ZONE NAME RULE - read carefully:
+- The world state has a line "Current location: <NAME> (zone id <N>)".
+- If the rationale mentions the agent's current zone, you MUST copy
+  the EXACT zone name from that line. NOT a similar-sounding zone
+  (West Ronfaure != East Ronfaure), NOT a zone from research notes,
+  NOT a famous zone you remember - the literal current location.
+- If you're emitting a travel goal, mention the destination zone by
+  name (also exact - take it from the neighbors block).
+
+Other rationale rules:
+- The job and level MUST match the "Self:" line of the world state.
+- DO NOT make up numbers, copy example wording verbatim, or use
+  third-person.
+
+GOOD shape (substitute REAL current values from world state):
+  "<job><lvl> in <current zone name>, <short reason for the plan>."
 
 DO NOT recommend Valkurm Dunes below level ~17. It is a party-only
 camp, not a solo zone - sending a low-level player there gets them
@@ -775,8 +785,8 @@ class Planner:
             f'  {zid:>3}  {name}' for zid, name in sorted(zone_names.items())
         )
         return (
-            f'Current zone: {snap.zone_id} ({cur_zone_name})\n'
-            f'Position:     ({snap.x}, {snap.y}, {snap.z})\n'
+            f'Current location: {cur_zone_name} (zone id {snap.zone_id})\n'
+            f'Position:         ({snap.x}, {snap.y}, {snap.z})\n'
             f'Moving:       {snap.moving}\n'
             f'\n{self._self_text()}'
             f'\n{self._inventory_text()}'
@@ -843,18 +853,51 @@ class Planner:
         18: 'PUP', 19: 'DNC', 20: 'SCH', 21: 'GEO', 22: 'RUN',
     }
 
-    def _self_text(self) -> str:
-        """Render job/level/HP from combat.json. Best-effort - empty
-        string if the channel hasn't published yet."""
+    def _read_self_state(self) -> dict[str, Any] | None:
+        """Read combat.json's `self` block, with last-known-good caching
+        for transient "not loaded yet" windows (zoning, fresh login).
+        During those windows the addon publishes main_job=0 (NON) and
+        main_job_lvl=0; planning against that produces nonsense like
+        "NON0 in <zone>". We cache the most recent valid read on
+        self._cached_self and fall back to it when the live read
+        looks stale.
+
+        Returns None if we have neither a fresh read nor a cache."""
         path = self.cfg.paths.state_dir(self.cfg.character) / 'combat.json'
-        if not path.exists():
-            return 'Self: <combat.json missing>\n'
-        try:
-            with open(path) as f:
-                d = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return 'Self: <combat.json unreadable>\n'
-        s = d.get('self') or {}
+        s: dict[str, Any] | None = None
+        if path.exists():
+            try:
+                with open(path) as f:
+                    d = json.load(f)
+                s = d.get('self') or {}
+            except (OSError, json.JSONDecodeError):
+                s = None
+        # "Loaded" heuristic: a real character has a non-zero main_job
+        # AND non-zero main_job_lvl. Either being 0 means we caught a
+        # transient window (zoning, login, character select).
+        loaded = (
+            isinstance(s, dict)
+            and (s.get('main_job') or 0) > 0
+            and (s.get('main_job_lvl') or 0) > 0
+        )
+        if loaded:
+            self._cached_self = s
+            return s
+        return getattr(self, '_cached_self', None)
+
+    def has_valid_self(self) -> bool:
+        """True when we can plan with confidence. Used to gate planner
+        firings - returning False means the caller should skip this
+        cycle and retry after the addon has published valid state."""
+        return self._read_self_state() is not None
+
+    def _self_text(self) -> str:
+        """Render job/level/HP for the planner prompt. Falls back to
+        the cached last-known-good state if combat.json's current self
+        block is stale (NON0 etc.)."""
+        s = self._read_self_state()
+        if not s:
+            return 'Self: <combat.json not yet published>\n'
         mj = self._JOB_CODES.get(s.get('main_job') or 0, '?')
         sj = self._JOB_CODES.get(s.get('sub_job')  or 0, '?')
         return (
@@ -1291,6 +1334,16 @@ class Planner:
             return ''
 
     def plan(self, user_text: str, zone_names: dict[int, str]) -> bool:
+        # Refuse to plan against a stale "not loaded yet" snapshot.
+        # During zone change / fresh login / character select the
+        # addon publishes main_job=0 + main_job_lvl=0, which would
+        # have the LLM produce rationales like "NON0 in <zone>...".
+        # The caller (poll_user_goal_file / poll_idle_replan / etc.)
+        # will retry on the next tick once valid state lands.
+        if not self.has_valid_self():
+            print('  planner: self-state not yet loaded; deferring plan.')
+            return False
+
         """Send the user instruction + world state to the LLM. Apply
         whichever tool calls come back (goals, gambits, or both).
         Returns True if at least one tool was applied successfully."""

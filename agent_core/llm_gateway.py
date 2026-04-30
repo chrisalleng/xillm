@@ -254,16 +254,15 @@ class LLMGateway:
         }
         if tools:
             body['tools'] = tools
-            # Qwen3 (and likely future thinking models) defaults to a
-            # `<think>...</think>` chain-of-thought before any output.
-            # When we're asking for tool calls, that thinking adds 5-30s
-            # of latency AND tends to crowd out the tool call entirely
-            # (the model "decides" in prose instead of via tool). Ollama
-            # exposes a `think` parameter on /api/chat to gate this. We
-            # set it to false whenever tools are in play. Models that
-            # don't support thinking ignore the field, so it's safe to
-            # set unconditionally on tool-bearing requests.
-            body['think'] = False
+        # Qwen3.x defaults to "auto" thinking which routes the actual
+        # answer into a `thinking` block and leaves `content` empty.
+        # Set think=false unconditionally so the answer always lands in
+        # `content` - applies to JSON-output judges (tools=None) AND
+        # tool-call requests. Models that don't support `think` ignore
+        # the field, so this is safe regardless of which model the tier
+        # is currently routed to. (Was previously gated on `tools`,
+        # which left engage_judge / rest_judge getting empty content.)
+        body['think'] = False
         req = urllib.request.Request(
             url,
             data=json.dumps(body).encode('utf-8'),
