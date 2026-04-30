@@ -76,8 +76,18 @@ function entities.scan(zone_id)
                     tod_hours = {},
                     weather_ids = {},
                     sightings = 0,
+                    -- Provenance: distinguishes things this character
+                    -- saw firsthand from records imported via chat /
+                    -- party-share (future). Direct observations are
+                    -- always trustworthy; imports inherit the source's
+                    -- credibility, which the agent may weight lower.
+                    source = 'observed',
+                    first_seen_unix = os.time(),
+                    last_seen_unix  = os.time(),
                 }
                 records[sid] = rec
+            else
+                rec.last_seen_unix = os.time()
             end
 
             if x < rec.min_x then rec.min_x = x end

@@ -61,7 +61,7 @@ def load_collision(zone_id: int):
 
 def load_collision_with_walls(zone_id: int):
     """Like load_collision but additionally returns (wall_verts_rc, wall_tris)
-    — the instance-wall-triangle subset, in Recast space, already winding-
+    - the instance-wall-triangle subset, in Recast space, already winding-
     corrected. Used by the occlusion check to detect hitwalls past a cliff
     edge. Terrain triangles come first in the raw JSON; instance walls are
     the suffix after terrain_triangle_count."""
@@ -100,7 +100,7 @@ def load_collision_with_walls(zone_id: int):
     tris_fixed = tris
 
     # Partition into terrain (first N) and instance-wall (the suffix).
-    # Use `emitted_terrain_count` (the post-walkability-filter count) — the
+    # Use `emitted_terrain_count` (the post-walkability-filter count) - the
     # older `terrain_triangle_count` field is the pre-filter input count and
     # overshoots the boundary. Fall back for older JSON files without the
     # new field (conservatively treat all triangles as terrain).
@@ -116,7 +116,7 @@ def load_collision_with_walls(zone_id: int):
 def make_settings(zone_id=None):
     """Navmesh settings matching NavServer.get_mesh(). Applies the same
     per-zone override (ZONE_NAV_OVERRIDES) so the detector's navmesh is
-    consistent with the server's — otherwise drop-off connections could
+    consistent with the server's - otherwise drop-off connections could
     reference polys that don't exist in the production navmesh."""
     s = navmesh.NavSettings()
     s.cell_size = 0.20
@@ -138,20 +138,20 @@ def make_settings(zone_id=None):
 
 
 def recast_to_game(rx, ry, rz):
-    # Recast (Y-up) → runtime Ashita (x=EW, y=NS, z=elev).
+    # Recast (Y-up) -> runtime Ashita (x=EW, y=NS, z=elev).
     return (rx, rz, -ry)
 
 
 def load_hitwall_bboxes_rc(zone_id, ffxi_path):
     """Parse MZB + MMB for the given zone, return a list of axis-aligned
-    bboxes (in Recast space) for every `hitwall_*` instance — the explicit
+    bboxes (in Recast space) for every `hitwall_*` instance - the explicit
     invisible collision walls FFXI uses to seal non-droppable cliffs.
 
     Why this is separate from the navmesh's instance-wall triangles:
     * Recast's navmesh is eroded by hitwall geometry identically to any other
       solid instance, but when identifying DROP-OFF edges we need to
       distinguish between "invisible wall that's stopping the player"
-      (hitwall — not droppable) and "visible stone/wall object that happens
+      (hitwall - not droppable) and "visible stone/wall object that happens
       to terminate at a cliff" (player CAN fall off the side). The
       `hitwall_*` name prefix is the precise signal; regular solid models
       like `pl_sta_coi1_m` must not block a drop-off candidate."""
@@ -200,7 +200,7 @@ def load_hitwall_bboxes_rc(zone_id, ffxi_path):
         verts_local = model["models"][0]["vertices"]
         m = ec.instance_matrix(inst)
         world_ashita = ec.apply_instance_transform(verts_local, m)
-        # Ashita → Recast: swap Y↔Z and negate Z (same transform as
+        # Ashita -> Recast: swap Y↔Z and negate Z (same transform as
         # load_collision uses on terrain/instance vertices).
         xs = [v[0] for v in world_ashita]          # Recast.x = Ashita.X
         ys = [-v[2] for v in world_ashita]         # Recast.y = -Ashita.Z
@@ -248,7 +248,7 @@ def has_overhead_rock(grid_tuple, verts_rc, tris, x, z, y_floor,
     """Return True if there is a near-horizontal collision triangle whose
     plane at (x, z) sits between `y_floor + margin` and `y_floor +
     max_overhead`. Used to reject drop-off candidates whose START poly
-    is sitting under solid rock — Recast voxelizes the rock's underside
+    is sitting under solid rock - Recast voxelizes the rock's underside
     or sides as a walkable poly at slightly the wrong height, creating
     a phantom drop that arrows through the rock to whatever's below.
 
@@ -293,13 +293,13 @@ def has_overhead_rock(grid_tuple, verts_rc, tris, x, z, y_floor,
 
 
 def segment_blocked(grid_tuple, verts_rc, tris, s, e, margin=0.5):
-    """Return True if the 3D line segment `s`→`e` (Recast space) is
+    """Return True if the 3D line segment `s`->`e` (Recast space) is
     intersected by any collision triangle strictly between the endpoints
     (a margin of `margin` yalms is excluded at each end to avoid self-
     intersection with the top-cliff and landing polys). Catches drop-off
-    candidates whose straight fall line passes through solid geometry —
+    candidates whose straight fall line passes through solid geometry -
     cave ceilings, overhanging rock, or floors between two stacked
-    levels — which means the "drop" can't actually happen.
+    levels - which means the "drop" can't actually happen.
 
     Implementation: walk XZ grid cells along the segment; for each
     collected triangle run Möller-Trumbore ray-triangle intersection."""
@@ -383,7 +383,7 @@ def build_hitwall_grid(hitwall_bboxes, cell_size=5.0):
 
 def build_wall_grid(verts_rc, wall_tris, cell_size=5.0):
     """Bucket every instance-wall triangle into every XZ cell its bbox
-    overlaps. A single huge wall (like hitwall_005 at Beaucedine, 29y × 32y)
+    overlaps. A single huge wall (like hitwall_005 at Beaucedine, 29y x 32y)
     would be missed by centroid-bucketing but is caught by bbox-bucketing.
     Returns (grid_dict, cell_size, tri_bboxes) where tri_bboxes[i] =
     (xmin, xmax, ymin, ymax, zmin, zmax) in Recast space for wall triangle i."""
@@ -474,7 +474,7 @@ def detect_dropoffs(
         mesh = navmesh.build_navmesh(verts, tris, settings)
     except RuntimeError as e:
         # Indoor city zones, BCNM arenas, and similar have no walkable
-        # ground terrain — Recast refuses to build with "No tiles built".
+        # ground terrain - Recast refuses to build with "No tiles built".
         # Such zones can't have drop-offs by definition; emit an empty
         # connections list and exit gracefully so a sweep over all 255
         # zones doesn't bail at the first interior.
@@ -520,7 +520,7 @@ def detect_dropoffs(
         sx = mx + nx * outward
         sz = mz + nz * outward
 
-        # Occlusion check — does an invisible `hitwall_*` instance sit
+        # Occlusion check - does an invisible `hitwall_*` instance sit
         # anywhere in the candidate's drop-off zone? A hitwall positioned
         # between the navmesh border edge and the cliff's actual physical
         # edge means the game's collision stops the player before they can
@@ -528,7 +528,7 @@ def detect_dropoffs(
         # the step-off point (same radius used for the landing search below);
         # if a hitwall exists within that disk at a compatible elevation the
         # fall is occluded. Regular visible geometry (pl_sta_*, _rol_*, etc.)
-        # intentionally does NOT count here — those are droppable surfaces
+        # intentionally does NOT count here - those are droppable surfaces
         # that terminate at cliff edges, not invisible walls.
         if wall_blocks_step_off(wall_grid, sx, my, sz,
                                  horizontal_radius=horizontal_match_tol,
@@ -570,7 +570,7 @@ def detect_dropoffs(
         # Redundancy filter: if the existing navmesh routes between the
         # SPECIFIC top-cliff poly and SPECIFIC landing poly at reasonable cost,
         # a connection adds nothing. Use explicit-ref query to avoid the
-        # findNearestPoly snap — otherwise both endpoints can snap to a
+        # findNearestPoly snap - otherwise both endpoints can snap to a
         # common connecting slope and the path comes back bogus-short.
         straight = math.hypot(end_rc[0] - start_rc[0], end_rc[2] - start_rc[2])
         if straight <= max_check_path:
@@ -582,7 +582,7 @@ def detect_dropoffs(
                 continue
 
         # Terrain-intersection filter: does the straight 3D drop path
-        # (start→landing, diagonal through air) pass through solid
+        # (start->landing, diagonal through air) pass through solid
         # geometry? Covers cave ceilings, overhangs, and inter-level
         # floors that stand between the top poly and the landing poly.
         if segment_blocked(terrain_grid, verts, tris,
@@ -593,7 +593,7 @@ def detect_dropoffs(
         # Overhead-rock filter: a real cliff has clear sky above the
         # step-off point. If there's a ceiling triangle (downward-facing
         # surface) within max_overhead yalms above the start, the start
-        # poly is sitting under solid rock — a navmesh artifact, not a
+        # poly is sitting under solid rock - a navmesh artifact, not a
         # genuine cliff edge. Drops emitted here would arrow through
         # the cave/overhang ceiling into the room below.
         if has_overhead_rock(terrain_grid, verts, tris,

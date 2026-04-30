@@ -16,7 +16,7 @@
 
 addon.name    = 'nav'
 addon.author  = 'xillm'
-addon.version = '.40'
+addon.version = '.45'
 addon.desc    = 'Navigation client for FFXI (Python agent_core backend)'
 addon.link    = ''
 
@@ -27,6 +27,7 @@ local struct   = require('struct')
 local d3d8     = require('d3d8')
 local imgui    = require('imgui')
 local entities = require('entities')
+local coverage = require('coverage')
 
 -------------------------------------------------------------------------------
 -- Config
@@ -95,7 +96,7 @@ local state = {
     --   3. Reaching the destination resets phase + walks to 0.
     retry = {
         phase   = 'normal',  -- 'normal' | 'wide' | 'walking' | 'failed'
-        target  = nil,       -- { x, y, zone_id } — current retry goal (becomes detour resume point during wide-detour)
+        target  = nil,       -- { x, y, zone_id } - current retry goal (becomes detour resume point during wide-detour)
         walks   = 0,         -- number of random-walk attempts (0..3)
         is_walk = false,     -- true while the active path is a random walk, not the real goal
     },
@@ -130,6 +131,29 @@ end
 
 local function ipc_path(filename)
     return state.data_path .. filename
+end
+
+-- Per-character persistent path under <ipc_base>/persistent/<character>/.
+-- Matches the agent_core layout (cfg.paths.persistent_dir). Mob memory,
+-- coverage maps, and other character-specific knowledge live here so
+-- multiple agents on the same install don't share data - each one
+-- learns the world independently.
+local function get_character_name()
+    local ok, p = pcall(function()
+        return AshitaCore:GetMemoryManager():GetParty():GetMemberName(0)
+    end)
+    if ok and p ~= nil and p ~= '' then return p end
+    return nil
+end
+
+local function persistent_path(subpath)
+    local char = get_character_name()
+    if char == nil or char == '' then return nil end
+    return state.data_path .. 'persistent/' .. char .. '/' .. subpath
+end
+
+local function ensure_dir(path)
+    pcall(function() ashita.fs.create_directory(path) end)
 end
 
 local function get_player_pos()
@@ -194,7 +218,7 @@ local function dist2d(ax, ay, bx, by)
     return math.sqrt(dx * dx + dy * dy)
 end
 
--- Autotranslate (groupId, messageId) → zone_id. Extracted from LSB
+-- Autotranslate (groupId, messageId) -> zone_id. Extracted from LSB
 -- scripts/commands/zone.lua. Key = (groupId<<8) | messageId.
 -- When the user types {East Ronfaure} the Ashita command arg contains a
 -- 0xFD-delimited byte sequence with groupId at +3 and messageId at +4 from
@@ -272,7 +296,7 @@ end
 
 local function resolve_zone_name(name)
     -- 1) Autotranslate: if the arg contains a 0xFD byte, decode via the
-    --    (groupId, messageId) → zone_id map.
+    --    (groupId, messageId) -> zone_id map.
     local at_zid = decode_autotrans_zone(name)
     if at_zid then
         local rm = AshitaCore:GetResourceManager()
@@ -335,18 +359,47 @@ end
 local function save_entities(zone_id)
     if not zone_id or zone_id == 0 then return end
     local data = entities.serialize(zone_id)
-    if data then
-        write_json(ipc_path('entities_' .. zone_id .. '.json'), data)
-    end
+    if data == nil then return end
+    -- Per-character path: persistent/<character>/entities/<zone>.json.
+    -- Without a character (e.g. logged out / zoning) we skip - better
+    -- than writing to a "no-character" path that pollutes the dir.
+    local path = persistent_path('entities/' .. zone_id .. '.json')
+    if path == nil then return end
+    ensure_dir(state.data_path .. 'persistent/' .. (get_character_name() or '') .. '/entities')
+    write_json(path, data)
 end
 
 local function load_entities(zone_id)
     if not zone_id or zone_id == 0 then return end
-    local data = read_json(ipc_path('entities_' .. zone_id .. '.json'))
+    local path = persistent_path('entities/' .. zone_id .. '.json')
+    if path == nil then return end
+    local data = read_json(path)
     entities.load(data, zone_id)
     local n = entities.count(zone_id)
     if n > 0 then
         msg(string.format('Loaded %d entity records for zone %d.', n, zone_id))
+    end
+end
+
+local function save_coverage(zone_id)
+    if not zone_id or zone_id == 0 then return end
+    local data = coverage.serialize(zone_id)
+    if data == nil then return end
+    local path = persistent_path('coverage/' .. zone_id .. '.json')
+    if path == nil then return end
+    ensure_dir(state.data_path .. 'persistent/' .. (get_character_name() or '') .. '/coverage')
+    write_json(path, data)
+end
+
+local function load_coverage(zone_id)
+    if not zone_id or zone_id == 0 then return end
+    local path = persistent_path('coverage/' .. zone_id .. '.json')
+    if path == nil then return end
+    local data = read_json(path)
+    coverage.load(zone_id, data)
+    local n = coverage.count(zone_id)
+    if n > 0 then
+        msg(string.format('Loaded %d coverage cells for zone %d.', n, zone_id))
     end
 end
 
@@ -519,7 +572,7 @@ local function retry_or_fail(px, py, pz)
     local wy = py + math.sin(angle) * dist
     msg(string.format('Retry %d/3: short walk to (%.1f, %.1f) then resume goal.',
         state.retry.walks, wx, wy))
-    -- This sub-goto MUST NOT recursively trigger retries — request_path
+    -- This sub-goto MUST NOT recursively trigger retries - request_path
     -- alone re-arms `state.goal`, but `state.retry.target` keeps the real
     -- destination so on completion we know where to go next.
     request_path(px, py, pz, wx, wy, nil, false)
@@ -531,18 +584,34 @@ local function check_path_response()
     local seq = data.seq
     if seq == nil then return end
 
-    -- Two acceptance modes:
-    --   1. We have a pending request and this response matches it.
-    --   2. We have NO pending request and this is a fresh seq we haven't
-    --      seen before — the orchestrator (goal manager / LLM planner)
-    --      pushed a path for us to follow.
-    -- consumed_seq tracks the last response we've already processed so
-    -- we don't re-handle stale responses on every poll.
-    if state.pending_seq ~= nil then
+    -- Skip if we've already processed this exact response. Critical
+    -- for reset_state paths too - without this, the addon re-reads
+    -- the same nav_path.json on every 10Hz check_path_response tick
+    -- and re-runs cancel_all + adopt the waypoints from scratch,
+    -- preventing any forward progress (the agent walks one frame,
+    -- the next tick resets it back to wp 1, repeat). The seq is the
+    -- same regardless of how often we read the file; once consumed,
+    -- we're done with it.
+    if seq <= state.consumed_seq and state.pending_seq == nil then
+        return
+    end
+
+    -- Orchestrator-pushed paths carry reset_state=true. They override
+    -- whatever the addon thought it was doing - no in-flight retry,
+    -- no stale route, no leftover waypoints. Checked BEFORE the
+    -- pending_seq match because an outstanding addon-issued request
+    -- (pending_seq set to some small int) would otherwise reject the
+    -- new path's huge timestamp seq and we'd never see the reset.
+    if data.reset_state then
+        cancel_all()
+        clear_retry()
+        state.pending_seq = nil  -- drop any in-flight addon request
+    elseif state.pending_seq ~= nil then
+        -- Non-reset response: only accept if it matches our pending
+        -- request. (Orchestrator-pushed gotos with reset=true skip
+        -- this match check above.)
         if seq ~= state.pending_seq then return end
         state.pending_seq = nil
-    else
-        if seq <= state.consumed_seq then return end
     end
     state.consumed_seq = seq
 
@@ -675,7 +744,7 @@ end
 -- target (clear retry state, let search/route progress, or announce).
 local function on_destination_reached(px, py, pz)
     state.goal = nil
-    -- A random-walk sub-goal *always* takes priority — the agent
+    -- A random-walk sub-goal *always* takes priority - the agent
     -- reached the random helper waypoint, not the real target.
     -- Reissue the active goal (may be the detour resume point or the
     -- original target) so the route eventually completes.
@@ -690,7 +759,7 @@ local function on_destination_reached(px, py, pz)
     -- Detour complete: we just arrived at the 5-ahead resume point on
     -- the saved default-radius path. Splice the remainder back in and
     -- restore the original retry target. No new server round-trip
-    -- needed — the original waypoints are already valid for this
+    -- needed - the original waypoints are already valid for this
     -- stretch onward.
     if state.detour then
         local d = state.detour
@@ -745,7 +814,7 @@ local function movement_tick(px, py, pz)
         state.check_y = py
         state.check_frame = state.frame
         -- Forward progress on the active path means whatever escalation
-        -- got us here worked — reset the retry chain so a *new* stuck
+        -- got us here worked - reset the retry chain so a *new* stuck
         -- later in the path starts fresh from 'normal' (wider radius
         -- first, walks 0/3) instead of immediately giving up.
         if state.retry.phase ~= 'normal' and not state.retry.is_walk then
@@ -886,7 +955,7 @@ local function draw_object_boxes(px, py, pz)
         -- validation pass and subsequent reads (observed when stepping
         -- through many instances on /nav objects on). Copying to locals
         -- up front ensures the projection math always sees numbers. If any
-        -- field is nil at snapshot time, skip this frame — next frame will
+        -- field is nil at snapshot time, skip this frame - next frame will
         -- try again.
         local v11, v12, v13, v14 = view._11, view._12, view._13, view._14
         local v21, v22, v23, v24 = view._21, view._22, view._23, view._24
@@ -1143,6 +1212,7 @@ ashita.events.register('load', 'nav_load', function()
     if zone_id and zone_id ~= 0 then
         state.zone_id = zone_id
         load_entities(zone_id)
+        load_coverage(zone_id)
         load_instances(zone_id)
         load_dropoffs(zone_id)
     end
@@ -1151,6 +1221,7 @@ end)
 
 ashita.events.register('unload', 'nav_unload', function()
     save_entities(state.zone_id)
+    save_coverage(state.zone_id)
     cancel_all()
 end)
 
@@ -1184,6 +1255,7 @@ ashita.events.register('d3d_present', 'nav_render', function()
         local zone_id = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0)
         if zone_id ~= nil and zone_id ~= 0 and zone_id ~= state.zone_id then
             save_entities(state.zone_id)
+            save_coverage(state.zone_id)
 
             if state.route then
                 -- Cross-zone route active: advance to next segment
@@ -1246,6 +1318,7 @@ ashita.events.register('d3d_present', 'nav_render', function()
 
             state.zone_id = zone_id
             load_entities(zone_id)
+            load_coverage(zone_id)
             load_instances(zone_id)
             load_dropoffs(zone_id)
         end
@@ -1256,6 +1329,18 @@ ashita.events.register('d3d_present', 'nav_render', function()
     -- Entity scanning
     if state.frame % ENTITY_SCAN_INTERVAL == 0 then
         entities.scan(state.zone_id)
+    end
+
+    -- Coverage observation: log a position sample into the per-zone
+    -- grid every entity-scan tick. Same cadence as entity.scan keeps
+    -- the two views aligned ("if I scanned for entities here, I also
+    -- claimed to have visited the cell"). 25 Vana sec per real sec
+    -- means ~3.5 minutes of real time per Vana hour - plenty fast for
+    -- ToD-aware coverage to fill in.
+    if state.frame % ENTITY_SCAN_INTERVAL == 0 then
+        local vana_secs = (os.time() - 1009810800) * 25
+        local vana_hour = math.floor(vana_secs / 3600) % 24
+        coverage.observe(state.zone_id, px, py, vana_hour)
     end
 
     -- Check for path responses from server
@@ -1313,9 +1398,12 @@ ashita.events.register('d3d_present', 'nav_render', function()
         movement_tick(px, py, pz)
     end
 
-    -- Periodic entity save
+    -- Periodic entity + coverage save (same cadence - both are "what
+    -- the agent has learned about this zone" and there's no point in
+    -- letting them drift apart on disk).
     if state.frame % ENTITY_SAVE_INTERVAL == 0 then
         save_entities(state.zone_id)
+        save_coverage(state.zone_id)
     end
 
     -- Write status for monitoring
@@ -1628,7 +1716,7 @@ ashita.events.register('command', 'nav_cmd', function(e)
                 })
             end
             table.sort(ranked, function(a, b) return a.d < b.d end)
-            msg(string.format('Player (%.1f,%.1f,%.1f) — 5 nearest:', px, py, pz))
+            msg(string.format('Player (%.1f,%.1f,%.1f) - 5 nearest:', px, py, pz))
             for k = 1, math.min(5, #ranked) do
                 local r = ranked[k]
                 msg(string.format('  %.1fy  %s  col=%d  center=(%.1f,%.1f,%.1f)  bbox=(%.0f..%.0f, %.0f..%.0f, %.0f..%.0f)',
@@ -1672,7 +1760,7 @@ ashita.events.register('command', 'nav_cmd', function(e)
                 })
             end
             table.sort(ranked, function(a, b) return a.d < b.d end)
-            msg(string.format('Player (%.1f,%.1f,%.1f) — 5 nearest drop-offs:', px, py, pz))
+            msg(string.format('Player (%.1f,%.1f,%.1f) - 5 nearest drop-offs:', px, py, pz))
             for k = 1, math.min(5, #ranked) do
                 local r = ranked[k]
                 local c = r.c

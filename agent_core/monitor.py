@@ -44,7 +44,7 @@ while True:
             if 0 < wp_idx <= len(wps):
                 wp = wps[wp_idx - 1]
                 d_wp = dist2d(x, y, wp[0], wp[1])
-                wp_info = f" → wp[{wp_idx}/{wp_total}]=({wp[0]:.0f},{wp[1]:.0f}) dist={d_wp:.1f}"
+                wp_info = f" -> wp[{wp_idx}/{wp_total}]=({wp[0]:.0f},{wp[1]:.0f}) dist={d_wp:.1f}"
 
         state = "MOVING" if moving else "idle"
         print(f"[{state}] pos=({x:.1f}, {y:.1f}, {z:.1f}){moved}{wp_info}")

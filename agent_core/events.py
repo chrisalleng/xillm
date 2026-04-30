@@ -36,7 +36,7 @@ def append(path: Path, character: str, source: str, type_: str, **fields: Any) -
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, separators=(',', ':')) + '\n'
-    # Single write() call into the OS — kernel-level atomic for short lines.
+    # Single write() call into the OS - kernel-level atomic for short lines.
     # We don't bother with rename-tmp because partial reads aren't a concern
     # for line-oriented JSONL: a reader that sees a half-written line on a
     # crash just discards it.

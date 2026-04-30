@@ -11,8 +11,8 @@
 * dispatch the LLM on /tells, party-chat mentions, etc.
 *
 * Phase 5 scope: state publishing + event emission only. Outbound
-* chat (LLM-issued replies) goes through cmd_inbox.txt → cmdrelay,
-* same path as every other agent → addon command.
+* chat (LLM-issued replies) goes through cmd_inbox.txt -> cmdrelay,
+* same path as every other agent -> addon command.
 --]]
 
 addon.name    = 'chat'
@@ -164,7 +164,7 @@ end
 -------------------------------------------------------------------------------
 
 ashita.events.register('load', 'chat_load', function()
-    msg('Loaded v' .. addon.version .. ' — chat → state/<char>/chat.json + events.jsonl')
+    msg('Loaded v' .. addon.version .. ' - chat -> state/<char>/chat.json + events.jsonl')
 end)
 
 ashita.events.register('text_in', 'chat_text_in', function(e)

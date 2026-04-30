@@ -29,7 +29,7 @@ Schema (all fields optional except `name`):
 The store is read-mostly: chat-handling LLM calls accrete interactions
 and tweak tone; the goal-planner edits favors/notes when the user
 mentions them. Compact summaries (`summary_for_prompt`) are what gets
-pasted into LLM context windows — the raw record can grow without
+pasted into LLM context windows - the raw record can grow without
 bound, but the prompt slice stays bounded.
 
 Interaction list is kept rolling at MAX_INTERACTIONS to prevent any
@@ -51,20 +51,20 @@ from . import persistence as _persistence
 MAX_INTERACTIONS = 200
 
 # Tone score is clipped to [-1, +1]. Anything past saturation is just
-# "very friendly" / "very hostile" — finer gradation is meaningless
+# "very friendly" / "very hostile" - finer gradation is meaningless
 # noise once you're past ±0.7.
 TONE_MIN = -1.0
 TONE_MAX = 1.0
 
 
 # Reject anything that could escape the relationships dir. FFXI names
-# are alphanumeric with the occasional apostrophe — tighten to that.
+# are alphanumeric with the occasional apostrophe - tighten to that.
 _VALID_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9'_-]{1,29}$")
 
 
 class InvalidPlayerName(ValueError):
     """Raised when a player name fails the safety check. We keep the
-    rule strict — anything that isn't an FFXI-style name is suspicious
+    rule strict - anything that isn't an FFXI-style name is suspicious
     enough that we'd rather error than persist."""
 
 
@@ -110,7 +110,7 @@ def load(cfg: _config.Config, name: str) -> dict[str, Any]:
     data = _persistence._read_json(path, _empty(safe))
     if not isinstance(data, dict) or 'name' not in data:
         return _empty(safe)
-    # Defensive backfill — older records may be missing newer fields.
+    # Defensive backfill - older records may be missing newer fields.
     template = _empty(safe)
     for k, v in template.items():
         data.setdefault(k, v)
@@ -140,7 +140,7 @@ def list_known(cfg: _config.Config) -> list[str]:
 
 
 # -----------------------------------------------------------------------
-# Mutators (single function with patch dict — gives the LLM one tool
+# Mutators (single function with patch dict - gives the LLM one tool
 # call instead of ten, and atomically applies a batch of changes per
 # event)
 # -----------------------------------------------------------------------
@@ -200,13 +200,13 @@ def update(cfg: _config.Config, name: str, patch: dict[str, Any]) -> dict[str, A
         append_interaction      {channel, direction, text, summary?}
         append_note             string appended to notes (newline-separated)
         set_notes               string replacing notes wholesale
-        add_favor_owed_by_us    string ("we promised X") — new open favor
+        add_favor_owed_by_us    string ("we promised X") - new open favor
         add_favor_owed_to_us    string ("they did X for us")
         mark_favor_done_by_us   string substring matching an open favor
                                 we owed; moves it to favors_completed
         mark_favor_done_to_us   same but for favors they owed us
 
-    Unknown fields raise — we'd rather fail than silently swallow LLM
+    Unknown fields raise - we'd rather fail than silently swallow LLM
     typos that would make a "tone update" no-op."""
     if not isinstance(patch, dict):
         raise InvalidRelationshipPatch('patch must be an object')
@@ -239,7 +239,7 @@ def update(cfg: _config.Config, name: str, patch: dict[str, Any]) -> dict[str, A
         if 'summary' in ev:
             entry['summary'] = ev['summary']
         record.setdefault('interactions', []).append(entry)
-        # Keep the list bounded — older entries get shed; the LLM is
+        # Keep the list bounded - older entries get shed; the LLM is
         # responsible for distilling anything load-bearing into `notes`.
         if len(record['interactions']) > MAX_INTERACTIONS:
             record['interactions'] = record['interactions'][-MAX_INTERACTIONS:]
@@ -299,7 +299,7 @@ def record_interaction(cfg: _config.Config, name: str, *,
                        channel: str, direction: str,
                        text: str, summary: str | None = None,
                        tone_delta: float = 0.0) -> dict[str, Any]:
-    """Convenience wrapper for the chat-side recorder — accretes a
+    """Convenience wrapper for the chat-side recorder - accretes a
     single interaction with optional tone update. Future chat addon
     hooks call this on every inbound/outbound line involving a named
     player; the LLM uses `update` directly for richer changes."""
@@ -323,7 +323,7 @@ def record_interaction(cfg: _config.Config, name: str, *,
 def summary_for_prompt(record: dict[str, Any], *,
                        recent_interactions: int = 5) -> str:
     """Compact one-paragraph summary suitable for an LLM prompt. Keeps
-    counts + last few interactions + open favors + notes — drops the
+    counts + last few interactions + open favors + notes - drops the
     long interaction history."""
     name = record.get('name', '?')
     tone = record.get('tone_score', 0.0)
@@ -355,7 +355,7 @@ def summary_for_prompt(record: dict[str, Any], *,
             dr = ev.get('direction', '?')
             txt = ev.get('summary') or ev.get('text') or ''
             if len(txt) > 80:
-                txt = txt[:77] + '…'
+                txt = txt[:77] + '...'
             lines.append(f'    [{ch}/{dr}] {txt}')
     if notes:
         lines.append(f'  Notes: {notes}')

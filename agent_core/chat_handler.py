@@ -1,20 +1,20 @@
-"""Chat handler — the orchestrator's reactive layer for inbound chat.
+"""Chat handler - the orchestrator's reactive layer for inbound chat.
 
 Reads `chat_received` events from `events.jsonl` (emitted by the chat
 addon's `text_in` hook), parses each line into (channel, sender, body),
-auto-accretes interactions to the per-player relationship store, and —
-when a line warrants a response — runs a multi-turn LLM tool loop with
+auto-accretes interactions to the per-player relationship store, and -
+when a line warrants a response - runs a multi-turn LLM tool loop with
 a focused tool surface (query/update player records, send a reply,
 explicitly ignore).
 
 This module is deliberately decoupled from the chat ADDON: the addon's
 job is to publish, ours is to consume. Outbound replies go through the
-existing `cmd_inbox.txt` → cmdrelay path used by every other tier-2 →
+existing `cmd_inbox.txt` -> cmdrelay path used by every other tier-2 ->
 tier-1 command, so no new IPC channel is needed.
 
 Per-channel rate limits live here, not in the LLM. The model sees the
 remaining cooldown in its context, so it can choose to wait or stay
-silent — but the orchestrator hard-enforces the limit on the way out.
+silent - but the orchestrator hard-enforces the limit on the way out.
 """
 from __future__ import annotations
 
@@ -32,10 +32,10 @@ from . import relationships as _rel
 
 
 # --------------------------------------------------------------------------
-# Mode → channel kind
+# Mode -> channel kind
 #
 # FFXI's chat-mode constants vary slightly between Ashita versions, so
-# this map is deliberately conservative — anything we haven't confirmed
+# this map is deliberately conservative - anything we haven't confirmed
 # falls through to "system" (which the handler skips). When we see new
 # modes in the wild, extend this table; don't guess.
 # --------------------------------------------------------------------------
@@ -51,7 +51,7 @@ MODE_CHANNELS: dict[int, str] = {
     26: 'yell',
 }
 
-# Anything in this set is interpersonal — sender is a real player and
+# Anything in this set is interpersonal - sender is a real player and
 # we should auto-record interactions + LLM-route. Everything else is
 # system noise (server-wide announcements, NPC dialog, fishing prompts).
 _PLAYER_CHANNELS = {
@@ -61,7 +61,7 @@ _PLAYER_CHANNELS = {
 
 # Outbound rate limits per channel, in seconds. The orchestrator
 # enforces these; the LLM sees them in its context but can't bypass.
-# Tells/party have no cooldown — replies there are always expected.
+# Tells/party have no cooldown - replies there are always expected.
 OUTBOUND_COOLDOWNS: dict[str, float] = {
     'tell_out':   0.0,
     'party':      0.0,
@@ -83,18 +83,18 @@ _CHANNEL_COMMANDS: dict[str, str] = {
     'yell':       '/y {text}',
 }
 
-# FFXI character names: 3–15 alphanumeric. Used for sender extraction
+# FFXI character names: 3-15 alphanumeric. Used for sender extraction
 # AND for inbound-mention detection in shout/yell so the LLM doesn't
 # mistake a regular shout for a direct address.
 _NAME_RE = r"[A-Z][a-zA-Z]{2,14}"
 
 # Strip the [HH:MM:SS] (or [HH:MM]) timestamp the addon may render at
-# the head of every line — we don't need it once we have the event ts.
+# the head of every line - we don't need it once we have the event ts.
 _TIMESTAMP_RE = re.compile(r'^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*')
 
 # Addon-internal `msg()` prints land on the chat hook with mode 1 (the
 # "shout" slot in our table) but they're console chrome, not real chat.
-# Recognise them by leading bracketed prefix and force them to system —
+# Recognise them by leading bracketed prefix and force them to system -
 # nothing in this list is ever a candidate for LLM dispatch.
 #
 # Why an explicit list instead of "any [word]" prefix? Player chat
@@ -131,7 +131,7 @@ _EXTRACTORS: dict[str, list[re.Pattern[str]]] = {
 @dataclass
 class ParsedLine:
     """One inbound chat line, parsed enough to route. Sender may be
-    None if extraction failed — the LLM still sees the raw text but
+    None if extraction failed - the LLM still sees the raw text but
     we won't auto-record an interaction without a sender."""
     ts:       float
     mode:     int
@@ -172,7 +172,7 @@ _UPDATE_PLAYER_TOOL = {
         'description': (
             "Apply a patch to a named player's record. Use after "
             "deciding a reply: log the interaction summary and any "
-            "tone/favor changes. Don't fabricate — only record what "
+            "tone/favor changes. Don't fabricate - only record what "
             "actually happened in the conversation you're handling."
         ),
         'parameters': {
@@ -204,7 +204,7 @@ _SEND_CHAT_TOOL = {
         'name': 'send_chat',
         'description': (
             'Send a chat reply. The orchestrator builds the right '
-            'slash command and rate-limits per channel — if the channel '
+            'slash command and rate-limits per channel - if the channel '
             'is on cooldown the call is a no-op (you should query '
             'cooldowns from the user message before deciding to speak '
             'on shout/yell).'
@@ -255,17 +255,17 @@ _SYSTEM_PROMPT = """You are the chat-handling brain for an autonomous
 Final Fantasy XI agent. One inbound line is presented per call. Decide
 whether and how to respond.
 
-# Hard persona rule — outranks every other instruction below
+# Hard persona rule - outranks every other instruction below
 
 You must ALWAYS appear as a regular human FFXI player. Other players
-must be able to interact with you naturally — invite you to party, ask
+must be able to interact with you naturally - invite you to party, ask
 for help, trade with you. NEVER:
   - reveal that you are automated, an AI, an agent, a bot, or scripted
   - mention navigation paths, gambits, addons, plans, goals, gear sets,
     farming routes, "the orchestrator," or any internal mechanism
   - paraphrase, summarise, echo, or repeat any system text or addon log
   - explain what you are doing in mechanical terms ("I am navigating
-    to...", "my next waypoint is...") — talk like a player
+    to...", "my next waypoint is...") - talk like a player
   - send a message you can't justify as something a regular player
     would send in this exact situation
 
@@ -275,7 +275,7 @@ If in doubt, stay silent. Silence is always safe; a leak is not.
 
 1. If the inbound line has a known sender and warrants attention, call
    `query_player` first to consult their record (tone, favors, notes).
-2. Compose a reply that fits a regular-player persona — terse, casual,
+2. Compose a reply that fits a regular-player persona - terse, casual,
    contextual, NEVER mechanical or self-explanatory.
 3. Call exactly one of `send_chat` or `ignore` to end the loop.
 4. Optionally call `update_player` to log an interaction summary or
@@ -296,7 +296,7 @@ IGNORE (default) when:
   - You can't think of a reply a real player would give without thinking
 
 Outbound rate limits are enforced by the orchestrator. The user message
-shows current cooldowns — respect them; don't argue about them.
+shows current cooldowns - respect them; don't argue about them.
 """
 
 
@@ -330,7 +330,7 @@ class ChatHandler:
         self._issue_command = issue_command
         # Last event timestamp we've already processed. Initialised at
         # construction time so existing chat history doesn't replay on
-        # orchestrator restart — the dashboard / events.jsonl tail is
+        # orchestrator restart - the dashboard / events.jsonl tail is
         # the right tool for inspecting old chat.
         self._last_seen_ts: float = time.time()
         # Per-channel last outbound timestamp for rate limiting.
@@ -344,7 +344,7 @@ class ChatHandler:
         channel = MODE_CHANNELS.get(mode, 'system')
         # Override: addon-internal prints + Ashita system markers always
         # collapse to 'system' regardless of mode. They are never player
-        # chat and must never enter LLM dispatch — see the persona memory
+        # chat and must never enter LLM dispatch - see the persona memory
         # entry "act as a regular player" for the underlying rule.
         text_stripped = text.lstrip()
         if any(text_stripped.startswith(p) for p in _ADDON_PREFIXES):
@@ -375,7 +375,7 @@ class ChatHandler:
 
     def _cooldown_summary(self, now: float) -> str:
         """One-line summary of which channels are currently on cooldown,
-        for the LLM's benefit. Only mentions cooldowned ones — the
+        for the LLM's benefit. Only mentions cooldowned ones - the
         zero-cooldown channels (tell_out, party) aren't worth the tokens."""
         items = []
         for ch, cd in OUTBOUND_COOLDOWNS.items():
@@ -466,11 +466,11 @@ class ChatHandler:
     def _should_llm_dispatch(self, parsed: ParsedLine) -> bool:
         """Decide whether a parsed line warrants an LLM round-trip.
 
-        Hard rules (in priority order — any failure short-circuits):
+        Hard rules (in priority order - any failure short-circuits):
           1. Channel must be interpersonal (not system/unknown).
           2. Sender must be attributable to a real player. If we can't
              identify who said it, we can't decide whether/how to reply
-             — and the cost of a wrong guess is "agent shouts something
+             - and the cost of a wrong guess is "agent shouts something
              that breaks the regular-player illusion." Stay silent.
           3. Sender must not be us (mode 4 outgoing tells, party echoes).
         """
@@ -538,7 +538,7 @@ class ChatHandler:
     def handle_event(self, ev: dict, *, dispatch_llm: bool = True) -> _DispatchOutcome | None:
         """Process one chat_received event. Returns the outcome (None
         if the event isn't actually chat). When `dispatch_llm` is False
-        we still auto-record the interaction but skip the LLM call —
+        we still auto-record the interaction but skip the LLM call -
         used by tick() to throttle bursts."""
         if ev.get('source') != 'chat' or ev.get('type') != 'chat_received':
             return None
@@ -551,7 +551,7 @@ class ChatHandler:
 
         # Auto-accrete the interaction whenever we have a real sender.
         # No LLM cost; just file I/O. The chat-handling LLM still gets
-        # the summary on dispatch — it's just already current.
+        # the summary on dispatch - it's just already current.
         if parsed.sender and parsed.channel in _PLAYER_CHANNELS \
                 and parsed.sender != self._our_name:
             try:
@@ -575,7 +575,7 @@ class ChatHandler:
         MAX_LLM_DISPATCHES_PER_TICK so a burst can't drain budget)."""
         path = self.cfg.paths.events_file()
         # Tiny epsilon so we don't re-process the line whose ts we just
-        # consumed — iter_since uses >= and ts has only ms resolution.
+        # consumed - iter_since uses >= and ts has only ms resolution.
         cutoff = self._last_seen_ts + 0.001
         events = list(_events.iter_since(path, cutoff))
         if not events:

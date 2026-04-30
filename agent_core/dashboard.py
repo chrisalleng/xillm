@@ -4,11 +4,11 @@ A localhost HTTP server (default port 7777) running in a background
 daemon thread alongside the main poll loop. Serves:
 
     GET  /            HTML dashboard page (single file, no CDNs)
-    GET  /api/state   JSON snapshot — world state, goals, gambits,
+    GET  /api/state   JSON snapshot - world state, goals, gambits,
                       recent events, LLM cost summary
 
 The page polls /api/state once a second and re-renders. No
-WebSockets / SSE / framework — keeps the dependency footprint at
+WebSockets / SSE / framework - keeps the dependency footprint at
 "Python stdlib + browser."
 
 Phase 7 scope: read-only visibility. Manual controls (pause the
@@ -32,7 +32,7 @@ from . import state as _state
 
 
 # Embedded HTML/CSS/JS. One self-contained page; the JS polls
-# /api/state every second and re-renders. Kept terse on purpose —
+# /api/state every second and re-renders. Kept terse on purpose -
 # this is a debug surface, not a product UI.
 _HTML = """<!doctype html>
 <html lang="en">
@@ -116,7 +116,7 @@ async function tick() {
   try {
     const r = await fetch('/api/state');
     const d = await r.json();
-    document.getElementById('char').textContent = '· ' + (d.character || '?');
+    document.getElementById('char').textContent = '. ' + (d.character || '?');
     renderKV('world', d.world || {});
     document.getElementById('goals').textContent = JSON.stringify(d.goals || {}, null, 2);
     document.getElementById('gambits').textContent = JSON.stringify(d.gambits || [], null, 2);
@@ -173,7 +173,7 @@ def _build_snapshot(cfg: _config.Config) -> dict[str, Any]:
     state_dir = paths.state_dir(cfg.character)
     persistent_dir = paths.persistent_dir(cfg.character)
 
-    # World state — flatten the most actionable bits of the channels
+    # World state - flatten the most actionable bits of the channels
     # into a small kv table for the top-of-page view.
     ws = _state.aggregate(state_dir, cfg.character)
     nav = ws.get('nav') or {}
@@ -204,11 +204,11 @@ def _build_snapshot(cfg: _config.Config) -> dict[str, Any]:
         'self_tp':    self_.get('tp', 0),
         'job':        f"{self_.get('main_job', '?')}/{self_.get('sub_job', '?')} "
                        f"lvl {self_.get('main_job_lvl', '?')}",
-        'target':     target.get('name', '—') if target else '—',
-        'target_hp':  f"{target.get('hp_pct', '?')}%" if target else '—',
+        'target':     target.get('name', '-') if target else '-',
+        'target_hp':  f"{target.get('hp_pct', '?')}%" if target else '-',
         'chat_lines': len(chat.get('lines', [])) if chat else 0,
         'inv_used':   f"{inv_main.get('used', 0)}/{inv_main.get('capacity', 0)}"
-                       if inv_main else '—',
+                       if inv_main else '-',
     }
 
     # Persistent files
@@ -239,7 +239,7 @@ def _build_snapshot(cfg: _config.Config) -> dict[str, Any]:
         'session_calls': len(llm_calls),
         'input_tokens':  in_tok,
         'output_tokens': out_tok,
-        'by_tier':       ', '.join(f'{t}={n}' for t, n in by_tier.items()) or '—',
+        'by_tier':       ', '.join(f'{t}={n}' for t, n in by_tier.items()) or '-',
     }
 
     return {

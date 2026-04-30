@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent_core entrypoint — currently the navmesh / pathfinding service.
+agent_core entrypoint - currently the navmesh / pathfinding service.
 
 Phase 1 of the agent architecture (docs/agent-architecture.md): the
 existing navserver code lives here unchanged in behaviour; the package
@@ -46,7 +46,7 @@ import heapq
 class NavServer:
     # Fallback agent radius used when a request sets `wider_radius=true`.
     # The default mesh is built with agent_radius=0.75 (the global default
-    # in get_mesh) — when the addon's first attempt at a goto fails
+    # in get_mesh) - when the addon's first attempt at a goto fails
     # because the path threads a too-narrow gap, it retries with this
     # much larger value to force a clearly-conservative route.
     FALLBACK_AGENT_RADIUS = 1.5
@@ -75,7 +75,9 @@ class NavServer:
         from . import chat_handler as _chat_handler
         from . import config as _config
         from . import dashboard as _dashboard
+        from . import engage_judge as _engage_judge
         from . import farming as _farming
+        from . import rest_judge as _rest_judge
         from . import gambits as _gambits
         from . import goal_manager as _gm
         from . import llm_gateway as _llm
@@ -83,7 +85,7 @@ class NavServer:
         from . import planner as _planner
         self.cfg = _config.load()
         self.llm = _llm.LLMGateway(self.cfg)
-        # Persistent gambit library — keyed by (job/subjob/party) context.
+        # Persistent gambit library - keyed by (job/subjob/party) context.
         # Loaded once at startup; the planner mutates it via tool calls,
         # the context watcher resolves the right set for the current
         # job/party state and redeploys when context changes.
@@ -97,31 +99,46 @@ class NavServer:
             _dashboard.start(self.cfg)
         except OSError as e:
             print(f'  dashboard: not started: {e}')
+        self.engage_judge = _engage_judge.EngageJudge(self.cfg, self.llm)
+        self.rest_judge = _rest_judge.RestJudge(self.cfg, self.llm)
         self.farming = _farming.FarmingDirector(
             cfg=self.cfg,
             snapshot_provider=self._read_combat_snapshot,
             issue_command=self._issue_command,
             # Nav snapshot drives the locate/approach states. The goal
             # manager's snapshot has the same fields (zone_id/x/y/z/moving)
-            # so we reuse it — duck-typed inside FarmingDirector via getattr.
+            # so we reuse it - duck-typed inside FarmingDirector via getattr.
             nav_snapshot_provider=self._read_player_snapshot,
             # Same dispatch_goto callable the goal manager uses, so the
             # approach state's request goes through handle_request and
             # rides the existing nav addon's path-following retry chain.
             dispatch_goto=self.handle_request,
+            # Navmesh reachability check used by engage_nearby's wander
+            # to validate exploration targets before dispatching the
+            # goto. Stops the agent from dispatching partial-path
+            # requests to cells that fall in walls / water / off-mesh.
+            nearest_reachable=self.nearest_reachable,
+            # LLM judge that decides engage/skip per-candidate from mob
+            # info, player state, goal, and per-mob fight history.
+            engage_judge=self.engage_judge,
+            # LLM judge for post-kill rest/continue decisions. Same
+            # context shape; consulted once per kill before moving on.
+            rest_judge=self.rest_judge,
         )
         self.goal_manager = _gm.GoalManager(
             cfg=self.cfg,
             dispatch_goto=self.handle_request,
             snapshot_provider=self._read_player_snapshot,
             farming_director=self.farming,
+            issue_command=self._issue_command,
         )
         self.planner = _planner.Planner(
             self.cfg, self.llm, self.goal_manager,
             gambits_store=self.gambits_store,
             current_ctx_provider=self._current_gambit_ctx,
+            neighbors_provider=self._zone_neighbors,
         )
-        # Reactive chat layer — polls events.jsonl for chat_received,
+        # Reactive chat layer - polls events.jsonl for chat_received,
         # auto-accretes interactions to the relationship store, and
         # LLM-dispatches lines worth a reply. Outbound replies ride
         # the same cmd_inbox.txt path as nav commands. Initialised
@@ -134,7 +151,7 @@ class NavServer:
         # into <repo>/user_goal.txt and saves. We watch its mtime; on
         # change we hand the contents to the planner (or clear, if empty).
         # The current mtime at startup is treated as "already applied"
-        # so an existing file doesn't replay on every restart — the
+        # so an existing file doesn't replay on every restart - the
         # persistent goal tree on disk is the source of truth for what
         # the agent is currently doing.
         self._user_goal_mtime = 0.0
@@ -145,59 +162,124 @@ class NavServer:
             except OSError:
                 pass
 
+    # Maximum age (seconds) before a state file is treated as ghost
+    # data. Addons publish at 5-10 Hz when the client is running; if
+    # nothing has been written for several seconds, the client is
+    # closed (or the addon crashed). Ticking the goal/farm state
+    # machines against frozen snapshots churns through false moves
+    # against the orchestrator's view of a world that doesn't exist.
+    SNAPSHOT_STALE_S = 5.0
+
+    def _is_state_fresh(self, path: Path) -> bool:
+        """True iff `path` exists and was written within SNAPSHOT_STALE_S.
+        Stale or missing -> False; callers should treat as 'addon not
+        publishing, idle the state machines.'"""
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return False
+        return (time.time() - mtime) <= self.SNAPSHOT_STALE_S
+
     def _read_player_snapshot(self):
         """Build the goal-manager snapshot from the addon's nav_status.json.
 
-        Phase 1b will move this to state/<char>/nav.json; for now we read
-        the legacy file so nav doesn't have to change."""
+        Returns an all-None snapshot if the file is missing OR stale -
+        the goal manager treats absent zone_id as 'don't dispatch.'"""
         from . import goal_manager as _gm
         status_file = IPC_DIR / 'nav_status.json'
-        if not status_file.exists():
-            return _gm._Snapshot(zone_id=None, x=None, y=None, z=None, moving=False)
+        if not self._is_state_fresh(status_file):
+            return _gm._Snapshot(zone_id=None, x=None, y=None, z=None,
+                                 moving=False, equipped=self._read_equipped_map())
         try:
             with open(status_file) as f:
                 s = json.load(f)
         except (json.JSONDecodeError, OSError):
-            return _gm._Snapshot(zone_id=None, x=None, y=None, z=None, moving=False)
+            return _gm._Snapshot(zone_id=None, x=None, y=None, z=None,
+                                 moving=False, equipped=self._read_equipped_map())
         return _gm._Snapshot(
             zone_id=s.get('zone_id'),
             x=s.get('x'),
             y=s.get('y'),
             z=s.get('z'),
             moving=bool(s.get('moving', False)),
+            equipped=self._read_equipped_map(),
         )
+
+    def _zone_neighbors(self, zone_id: int) -> list[int]:
+        """Direct one-zoneline neighbors of `zone_id`. De-duped and sorted
+        so the planner's prompt is stable across calls. Returns [] for
+        unknown zones (e.g. instances we have no transitions for)."""
+        trans = self.transitions.get(zone_id, [])
+        seen: set[int] = set()
+        for t in trans:
+            tz = t.get('to')
+            if isinstance(tz, int) and tz != zone_id:
+                seen.add(tz)
+        return sorted(seen)
+
+    def _read_equipped_map(self) -> dict[str, str | None] | None:
+        """Read inventory.json and return slot_name -> equipped item name.
+        None if the channel hasn't published yet; equip-goal completion
+        treats None as 'wait for next snapshot'."""
+        path = self.cfg.paths.state_dir(self.cfg.character) / 'inventory.json'
+        if not path.exists():
+            return None
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        equipped = d.get('equipped') or {}
+        return {
+            slot: (item.get('name') if item else None)
+            for slot, item in equipped.items()
+        }
 
     def _read_combat_snapshot(self):
         """Build the farming director's snapshot from combat.json.
-        Returns a _Snapshot with all fields possibly None — the director
-        treats nil as "no info yet, retry"."""
+        Returns a _Snapshot with all fields possibly None - the director
+        treats nil as "no info yet, retry". Same staleness gate as the
+        nav snapshot: if combat.json hasn't been touched in
+        SNAPSHOT_STALE_S, treat it as missing rather than authoritative."""
         from . import farming as _farming
         path = self.cfg.paths.state_dir(self.cfg.character) / 'combat.json'
-        if not path.exists():
-            return _farming._Snapshot(
-                self_hp_pct=None, self_hp=None, self_status=None,
-                target_name=None, target_alive=None, target_hp_pct=None,
-                engaged=False,
-            )
+        empty = _farming._Snapshot(
+            self_hp_pct=None, self_hp=None, self_mp_pct=None,
+            self_status=None, self_lvl=None,
+            self_main_job=None, self_sub_job=None, self_sub_lvl=None,
+            target_name=None, target_alive=None, target_hp_pct=None,
+            engaged=False,
+        )
+        if not self._is_state_fresh(path):
+            return empty
         try:
             with open(path) as f:
                 d = json.load(f)
         except (json.JSONDecodeError, OSError):
-            return _farming._Snapshot(
-                self_hp_pct=None, self_hp=None, self_status=None,
-                target_name=None, target_alive=None, target_hp_pct=None,
-                engaged=False,
-            )
+            return empty
         s = d.get('self') or {}
         t = d.get('target') or {}
         return _farming._Snapshot(
             self_hp_pct=s.get('hp_pct'),
             self_hp=s.get('hp'),
+            self_mp_pct=s.get('mp_pct'),
             self_status=s.get('status'),
+            self_lvl=s.get('main_job_lvl'),
+            self_main_job=s.get('main_job'),
+            self_sub_job=s.get('sub_job'),
+            self_sub_lvl=s.get('sub_job_lvl'),
             target_name=t.get('name') if t else None,
             target_alive=t.get('alive') if t else None,
             target_hp_pct=t.get('hp_pct') if t else None,
+            target_distance=t.get('distance') if t else None,
+            target_x=t.get('x') if t else None,
+            target_y=t.get('y') if t else None,
+            target_z=t.get('z') if t else None,
+            target_server_id=t.get('server_id') if t else None,
+            target_claimed_by_us=bool(t.get('claimed_by_us', False)) if t else False,
             engaged=bool(d.get('engaged', False)),
+            nearby_enemies=d.get('nearby_enemies') or [],
+            menu_open=bool(s.get('menu_open', False)),
         )
 
     def _read_combat_state(self) -> dict | None:
@@ -215,14 +297,14 @@ class NavServer:
     def _current_gambit_ctx(self) -> dict[str, str]:
         """Build the live (main_job, sub_job, in_party) context from
         combat.json. Falls back to all-wildcard if combat.json is
-        missing — that selects the universal `*/*/*` set, if any."""
+        missing - that selects the universal `*/*/*` set, if any."""
         state = self._read_combat_state()
         return self._gambits_mod.context_from_combat(state)
 
     def poll_gambit_context(self):
         """Recompute the current context from combat.json; if it
         changed since last tick, redeploy the resolved gambit list.
-        Always cheap — usually a single dict-eq check after one JSON
+        Always cheap - usually a single dict-eq check after one JSON
         read; the actual resolve+write only fires on real changes
         (zoning, /sj <job>, party invite/leave)."""
         ctx = self._current_gambit_ctx()
@@ -553,15 +635,15 @@ class NavServer:
         # Z down-positive). Recast wants its Y axis to be "physical up" for
         # walkability filtering, so we swap Y↔Z and negate Z: the sole
         # coordinate transformation in the entire pipeline.
-        # See ashita_to_recast() below — this is the vectorised form.
+        # See ashita_to_recast() below - this is the vectorised form.
         verts = np.column_stack([
             verts_raw[:, 0],       # Recast.x = Ashita.X
             -verts_raw[:, 2],      # Recast.y = -Ashita.Z  (physical up)
             verts_raw[:, 1],       # Recast.z = Ashita.Y
         ]).astype(np.float32)
 
-        # The (x, y, z) → (x, -z, y) transform has positive determinant, so
-        # triangle winding is preserved — no index swap needed.
+        # The (x, y, z) -> (x, -z, y) transform has positive determinant, so
+        # triangle winding is preserved - no index swap needed.
         return verts, tris
 
 
@@ -573,7 +655,7 @@ class NavServer:
 
     def get_mesh(self, zone_id: int, wider_radius: bool = False):
         # Defaults derived from end-to-end tuning in Attohwa Chasm
-        # (zone 7 — narrowest trails + densest instance collision):
+        # (zone 7 - narrowest trails + densest instance collision):
         #   - agent_radius=0.25 opens 1y-wide ledges and cliff trails;
         #     larger values fragment the navmesh.
         #   - agent_max_slope=45° matches FFXI's actual walkable angle.
@@ -710,14 +792,14 @@ class NavServer:
             print(f'  Blocked {total} polys for {len(obstacles)} obstacles in zone {zone_id}')
 
     def game_to_recast(self, x, y, z):
-        """Ashita LocalPosition (X=EW, Y=NS, Z=elev down-positive) → Recast
+        """Ashita LocalPosition (X=EW, Y=NS, Z=elev down-positive) -> Recast
         (Y-up with floor normals pointing +Y). Swap Y↔Z and negate Z. This
-        is the ONLY coordinate transformation in the server — everything
+        is the ONLY coordinate transformation in the server - everything
         else uses Ashita directly."""
         return (x, -z, y)
 
     def recast_to_game(self, rx, ry, rz):
-        """Inverse of game_to_recast. Recast (x, y, z) → Ashita (x, z, -y)."""
+        """Inverse of game_to_recast. Recast (x, y, z) -> Ashita (x, z, -y)."""
         return (rx, rz, -ry)
 
     def _path_to_waypoints(self, path_rc, max_segment=1.0):
@@ -778,6 +860,40 @@ class NavServer:
 
         return waypoints
 
+    def nearest_reachable(self, zone_id: int, target_xy: tuple[float, float],
+                          *, max_snap_y: float = 8.0) -> tuple[float, float] | None:
+        """Return the navmesh point closest to `target_xy` in this zone,
+        or None if no walkable poly exists within `max_snap_y` yalms.
+
+        Used by the farming director's wander state to validate that an
+        exploration target sits on (or very near) walkable terrain
+        before dispatching the goto. Without this we keep dispatching
+        partial-path requests to cells that fall in water / walls /
+        off-mesh nooks, then waiting WANDER_TIMEOUT_S to give up.
+
+        Cheap: navmesh poly centers are cached per-zone, lookup is a
+        sweep through them. No path-finding involved."""
+        try:
+            mesh = self.get_mesh(zone_id)
+        except Exception:
+            return None
+        try:
+            import numpy as _np
+            centers = _np.array(navmesh.get_poly_centers(mesh))
+        except Exception:
+            return None
+        if len(centers) == 0:
+            return None
+        tx, ty = target_xy
+        # Recast x/z = game x/y; recast y is elevation (we ignore it
+        # for snap-distance - the target's z is unknown anyway).
+        d2 = (centers[:, 0] - tx) ** 2 + (centers[:, 2] - ty) ** 2
+        idx = int(d2.argmin())
+        dist = float(d2[idx]) ** 0.5
+        if dist > max_snap_y:
+            return None
+        return (float(centers[idx, 0]), float(centers[idx, 2]))
+
     def find_path(self, zone_id, start_game, end_game, avoid_zone_exits=True,
                   wider_radius: bool = False):
         mesh = self.get_mesh(zone_id, wider_radius=wider_radius)
@@ -796,7 +912,7 @@ class NavServer:
             for c in centers:
                 gx, gy = c[0], c[2]  # recast x,z -> game x,y
                 if (gx - tx)**2 + (gy - ty)**2 < 10**2:
-                    candidate_elevs.add(round(-c[1], 1))  # recast y → game z = -recast_y
+                    candidate_elevs.add(round(-c[1], 1))  # recast y -> game z = -recast_y
 
             for game_z in sorted(candidate_elevs):
                 end_try = self.game_to_recast(tx, ty, game_z)
@@ -968,6 +1084,13 @@ class NavServer:
                     'waypoints': waypoints,
                     'end_dist': round(end_dist, 1),
                     'seq': seq,
+                    # Pass through the orchestrator's intent: when set,
+                    # the addon will drop any in-flight retry / route /
+                    # search state before accepting this new path.
+                    # Stops stale leftovers (old segment targets, retry
+                    # walks toward an old destination) from firing
+                    # request_path's that wander the agent off-course.
+                    'reset_state': bool(req.get('reset_state')),
                 })
             except Exception as e:
                 print(f'  Error: {e}')
@@ -1028,7 +1151,7 @@ class NavServer:
                     print(f'  No route found')
                     return
 
-                zone_path = ' → '.join(
+                zone_path = ' -> '.join(
                     self.zone_names.get(s['zone_id'], str(s['zone_id']))
                     for s in route)
                 print(f'  Route: {zone_path} ({len(route)} segments)')
@@ -1039,6 +1162,14 @@ class NavServer:
                     'route': route,
                     'zone_id': zone_id,
                     'seq': seq,
+                    # Same reset semantics as the goto branch - when
+                    # set, the addon drops any leftover retry state /
+                    # stale waypoints before adopting this route.
+                    # Without this, an addon-side wider-radius retry
+                    # from a previous wander can fire its own goto
+                    # mid-cross-zone and wedge the agent on stale
+                    # waypoints from the wrong zone.
+                    'reset_state': bool(req.get('reset_state')),
                 })
             except Exception as e:
                 print(f'  Error: {e}')
@@ -1084,7 +1215,7 @@ class NavServer:
 
     def _issue_command(self, command: str) -> None:
         """Append a single Ashita /command to cmd_inbox.txt for cmdrelay
-        to relay. Multi-line — cmdrelay v1.1+ consumes every line per
+        to relay. Multi-line - cmdrelay v1.1+ consumes every line per
         poll, so we can queue several without losing any. Best-effort:
         a missing cmdrelay just means the line sits unread, no error."""
         inbox = IPC_DIR / 'cmd_inbox.txt'
@@ -1142,7 +1273,7 @@ class NavServer:
         finally:
             # nav_request.json is a one-shot trigger, NOT a state file.
             # Without this delete, an addon-issued goto persists on disk
-            # forever — and after an agent_core restart (which resets
+            # forever - and after an agent_core restart (which resets
             # last_request_mtime to 0) the same stale request gets
             # treated as fresh and replayed.
             try:
@@ -1150,10 +1281,133 @@ class NavServer:
             except OSError:
                 pass
 
+    # Minimum gap between failure-triggered replans, to avoid storms
+    # if a freshly-planned goal also fails immediately. The next
+    # failure inside this window is silently dropped.
+    FAILURE_REPLAN_COOLDOWN_S = 30.0
+
+    # Same cooldown but for idle-replans - fired when the goal tree's
+    # roots have all completed (success) but the user goal is still
+    # active. Fills the gap when the LLM plans only the first leg
+    # (e.g. travel) and didn't include the follow-up (engage_nearby).
+    IDLE_REPLAN_COOLDOWN_S = 60.0
+
+    def poll_idle_replan(self):
+        """If every root in the goal tree is in a terminal state but
+        the user goal is non-empty, fire a fresh plan call. The current
+        world state (now including completed prior leaves) gives the
+        LLM the context to add the next stage.
+
+        Distinct from failure-replan: that one fires on a single failed
+        leaf even with other leaves still active. This one only fires
+        when there's nothing left to do AND the user still wants more."""
+        gm = self.goal_manager
+        if gm._active_leaf_id is not None:
+            return  # something is still running
+        if not gm.goals.roots:
+            return  # tree was explicitly cleared (empty user_goal); no replan
+        # Every root must be in a terminal state for this to count as
+        # "all done." Pending or active anywhere -> not idle.
+        terminal = ('completed', 'failed', 'abandoned')
+        for rid in gm.goals.roots:
+            node = gm._node(rid)
+            if node is None or node.get('state', 'pending') not in terminal:
+                return
+        now = time.time()
+        if now - getattr(self, '_last_idle_replan_ts', 0.0) < self.IDLE_REPLAN_COOLDOWN_S:
+            return
+        ugf = self.cfg.paths.user_goal_file()
+        if not ugf.exists():
+            return
+        try:
+            text = ugf.read_text(encoding='utf-8', errors='replace').strip()
+        except OSError:
+            return
+        if not text:
+            return
+        print(f'[idle_replan] all roots done; replanning against current state')
+        self._last_idle_replan_ts = now
+        try:
+            self.planner.plan(text, self.zone_names)
+        except Exception as e:
+            print(f'  idle_replan failed: {e}')
+
+    def poll_replan_request(self):
+        """Watch <ipc_base>/replan_request.txt - written by `/goals refresh`
+        in the goals addon. Presence of the file means "throw away the
+        current plan and replan from current state." Also clears any
+        idle/failure replan cooldowns so a manual refresh always lands."""
+        path = self.cfg.paths.ipc_base / 'replan_request.txt'
+        if not path.exists():
+            return
+        try:
+            path.unlink()
+        except OSError as e:
+            print(f'  replan_request: could not consume {path}: {e}')
+            return
+        ugf = self.cfg.paths.user_goal_file()
+        if not ugf.exists():
+            return
+        try:
+            text = ugf.read_text(encoding='utf-8', errors='replace').strip()
+        except OSError:
+            return
+        if not text:
+            print('[replan_request] user_goal empty; nothing to plan')
+            return
+        # Bypass cooldowns - this came from a deliberate user action.
+        self._last_failure_replan_ts = 0.0
+        self._last_idle_replan_ts = 0.0
+        # Clear the existing tree so the planner produces a fresh plan
+        # rather than reasoning around stale active/completed leaves.
+        from . import persistence as _persistence
+        empty = _persistence.Goals()
+        empty.save(self.goal_manager._goals_path)
+        self.goal_manager.goals = empty
+        self.goal_manager._last_dispatch.clear()
+        self.goal_manager._active_leaf_id = None
+        # Stop any in-flight farming director so it doesn't keep firing
+        # combat commands against the cleared goal.
+        if self.farming.is_active():
+            self.farming.stop()
+        print(f'[replan_request] /goals refresh - replanning')
+        try:
+            self.planner.plan(text, self.zone_names)
+        except Exception as e:
+            print(f'  replan_request failed: {e}')
+
+    def poll_failure_replan(self):
+        """If the goal manager latched a goal-failed signal since the
+        last poll, fire ONE replan with the current user_goal text.
+        Triggered by a real "plan stopped working" event - not by mid-
+        plan zone changes (which were causing thrash and got removed)."""
+        sig = self.goal_manager.consume_failure_signal()
+        if sig is None:
+            return
+        now = time.time()
+        if now - getattr(self, '_last_failure_replan_ts', 0.0) < self.FAILURE_REPLAN_COOLDOWN_S:
+            print(f'[failure_replan] cooldown active; skipping replan for {sig!r}')
+            return
+        ugf = self.cfg.paths.user_goal_file()
+        if not ugf.exists():
+            return
+        try:
+            text = ugf.read_text(encoding='utf-8', errors='replace').strip()
+        except OSError:
+            return
+        if not text:
+            return
+        print(f'[failure_replan] leaf {sig!r} failed; replanning')
+        self._last_failure_replan_ts = now
+        try:
+            self.planner.plan(text, self.zone_names)
+        except Exception as e:
+            print(f'  failure_replan failed: {e}')
+
     def poll_user_goal_file(self):
         """Watch <repo>/user_goal.txt for changes. Whenever the user saves
         a new instruction we re-plan; if the file is empty (or whitespace
-        only) we treat that as "stop everything" — clear the goal tree,
+        only) we treat that as "stop everything" - clear the goal tree,
         wipe gambits, and tell the nav addon to stop.
 
         Mtime tracking is in-memory only. The persistent goal tree on
@@ -1179,14 +1433,14 @@ class NavServer:
             print(f'[user_goal] {text!r}')
             self.planner.plan(text, self.zone_names)
         else:
-            print('[user_goal] empty — clearing goals (gambits untouched)')
+            print('[user_goal] empty - clearing goals (gambits untouched)')
             from . import persistence as _persistence
             empty = _persistence.Goals()
             empty.save(self.goal_manager._goals_path)
             self.goal_manager.goals = empty
             self.goal_manager._last_dispatch.clear()
             self.goal_manager._active_leaf_id = None
-            # Gambits intentionally NOT wiped — they are context-bound
+            # Gambits intentionally NOT wiped - they are context-bound
             # combat reactions (per job/subjob/party state) that should
             # outlive any single user goal. The agent itself has to ask
             # for a clear if it wants one.
@@ -1205,6 +1459,10 @@ class NavServer:
         # doc's Tier-2 budget.
         ticks_per_goal_run = 5
         tick_counter = 0
+        # Liveness latch - log once on transitions so the operator can
+        # see "client closed" / "client back" without scrolling through
+        # silent gaps.
+        _addons_were_live: bool | None = None
         try:
             while True:
                 self.poll()
@@ -1212,6 +1470,31 @@ class NavServer:
                 tick_counter += 1
                 if tick_counter >= ticks_per_goal_run:
                     tick_counter = 0
+                    # Liveness gate. If the addons aren't publishing
+                    # state (combat.json mtime > SNAPSHOT_STALE_S),
+                    # skip every tick that consumes/acts on snapshots.
+                    # Without this gate, goal manager + farming director
+                    # spin forever against frozen snapshots, dispatching
+                    # gotos that no addon reads. user_goal poll runs
+                    # regardless - text edits are safe, and any plan it
+                    # produces just sits on disk until the client comes
+                    # back. nav_request.json poll (in self.poll above)
+                    # also runs regardless, since that's the addon-side
+                    # arrival channel.
+                    combat_path = self.cfg.paths.state_dir(self.cfg.character) / 'combat.json'
+                    addons_live = self._is_state_fresh(combat_path)
+                    if _addons_were_live is None:
+                        _addons_were_live = addons_live
+                    elif addons_live != _addons_were_live:
+                        if addons_live:
+                            print('[liveness] addons publishing again; resuming ticks')
+                        else:
+                            print('[liveness] addon snapshots stale; idling state machines '
+                                  '(client likely closed)')
+                        _addons_were_live = addons_live
+                    if not addons_live:
+                        time.sleep(POLL_INTERVAL)
+                        continue
                     try:
                         self.goal_manager.tick()
                     except Exception as e:
@@ -1220,6 +1503,18 @@ class NavServer:
                         self.poll_gambit_context()
                     except Exception as e:
                         print(f'gambit_context error: {e}')
+                    try:
+                        self.poll_replan_request()
+                    except Exception as e:
+                        print(f'replan_request error: {e}')
+                    try:
+                        self.poll_failure_replan()
+                    except Exception as e:
+                        print(f'failure_replan error: {e}')
+                    try:
+                        self.poll_idle_replan()
+                    except Exception as e:
+                        print(f'idle_replan error: {e}')
                     try:
                         self.chat.tick()
                     except Exception as e:

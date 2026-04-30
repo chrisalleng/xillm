@@ -3,11 +3,11 @@
 Sources, in priority order:
     1. environment variables (`AGENT_CHARACTER`, `AGENT_LLM_API_KEY`,
        `AGENT_LLM_BASE_URL`, `AGENT_LLM_REACTIVE_MODEL`, ...)
-    2. `agent_core/config.toml` (gitignored — write API keys here)
+    2. `agent_core/config.toml` (gitignored - write API keys here)
     3. compiled-in defaults below
 
 The character name is the namespace key for every per-character state /
-command / persistent file. MVP runs single-character — we read it from
+command / persistent file. MVP runs single-character - we read it from
 `AGENT_CHARACTER` or the config file once at startup.
 """
 from __future__ import annotations
@@ -33,11 +33,27 @@ DEFAULT_ASHITA_BASE = Path(
 class LLMConfig:
     # The orchestrator talks to any OpenAI-compatible API: Groq (default
     # for free-tier dev), OpenAI, Together, llama.cpp's own server, etc.
-    # Anthropic also exposes an OpenAI-compat shim — point base_url at it
+    # Anthropic also exposes an OpenAI-compat shim - point base_url at it
     # to use Claude. base_url is provider-specific; api_key is always
     # required.
+    #
+    # base_url / api_key / provider here are the DEFAULT used by any
+    # tier that doesn't have its own override below. The per-tier
+    # `<tier>_base_url` / `<tier>_api_key` / `<tier>_provider` fields
+    # let you split tiers across providers - typical setup is local
+    # Ollama for fast tiers + cloud (Groq) for the heavy deliberative
+    # tier where the cloud's larger models clearly outclass anything
+    # that fits on our consumer GPU.
     base_url: str = 'https://api.groq.com/openai/v1'
     api_key: str = ''  # set via env var or config.toml; never commit
+
+    # Provider routing. 'openai' goes through the OpenAI SDK (works for
+    # OpenAI proper, Groq, Anthropic's compat shim, Together, etc).
+    # 'ollama' bypasses the SDK and posts to Ollama's native /api/chat -
+    # required for models whose tool-call format isn't parsed by Ollama's
+    # OpenAI-compat shim (Qwen 2.5, GLM-4, etc). Auto-detected from
+    # base_url if left empty: ":11434" -> ollama, anything else -> openai.
+    provider: str = ''
 
     # Per-tier model defaults. Tiers are described in
     # docs/agent-architecture.md ("LLM integration"). Groq's free tier
@@ -46,6 +62,19 @@ class LLMConfig:
     reactive: str = 'llama-3.1-8b-instant'
     periodic: str = 'llama-3.3-70b-versatile'
     deliberative: str = 'llama-3.3-70b-versatile'
+
+    # Per-tier provider overrides. Empty string = inherit from the
+    # default base_url/api_key/provider above. Setting `_provider` to
+    # 'ollama' or 'openai' explicitly bypasses the auto-detect.
+    reactive_base_url: str = ''
+    reactive_api_key: str = ''
+    reactive_provider: str = ''
+    periodic_base_url: str = ''
+    periodic_api_key: str = ''
+    periodic_provider: str = ''
+    deliberative_base_url: str = ''
+    deliberative_api_key: str = ''
+    deliberative_provider: str = ''
 
 
 @dataclass
@@ -104,18 +133,44 @@ def load() -> Config:
             cfg.paths.ipc_base = Path(data['ipc_base'])
         if 'llm' in data:
             llm = data['llm']
-            for key in ('base_url', 'api_key', 'reactive', 'periodic', 'deliberative'):
+            simple_keys = (
+                'base_url', 'api_key', 'provider',
+                'reactive', 'periodic', 'deliberative',
+                'reactive_base_url', 'reactive_api_key', 'reactive_provider',
+                'periodic_base_url', 'periodic_api_key', 'periodic_provider',
+                'deliberative_base_url', 'deliberative_api_key', 'deliberative_provider',
+            )
+            for key in simple_keys:
                 if key in llm:
                     setattr(cfg.llm, key, llm[key])
 
     cfg.character = os.environ.get('AGENT_CHARACTER', cfg.character)
     cfg.llm.api_key = os.environ.get('AGENT_LLM_API_KEY', cfg.llm.api_key)
     cfg.llm.base_url = os.environ.get('AGENT_LLM_BASE_URL', cfg.llm.base_url)
+    cfg.llm.provider = os.environ.get('AGENT_LLM_PROVIDER', cfg.llm.provider)
     for tier in ('reactive', 'periodic', 'deliberative'):
         env_key = f'AGENT_LLM_{tier.upper()}_MODEL'
         if env_key in os.environ:
             setattr(cfg.llm, tier, os.environ[env_key])
+        # Per-tier endpoint overrides. e.g. AGENT_LLM_DELIBERATIVE_BASE_URL.
+        for suffix in ('BASE_URL', 'API_KEY', 'PROVIDER'):
+            env_key = f'AGENT_LLM_{tier.upper()}_{suffix}'
+            if env_key in os.environ:
+                setattr(cfg.llm, f'{tier}_{suffix.lower()}', os.environ[env_key])
     if 'AGENT_IPC_BASE' in os.environ:
         cfg.paths.ipc_base = Path(os.environ['AGENT_IPC_BASE'])
+
+    # Auto-detect provider from base_url if not explicitly set. Same
+    # rule applied to the default and to any per-tier override that
+    # specified a base_url but no provider.
+    def _autodetect(url: str) -> str:
+        return 'ollama' if ':11434' in url else 'openai'
+    if not cfg.llm.provider:
+        cfg.llm.provider = _autodetect(cfg.llm.base_url)
+    for tier in ('reactive', 'periodic', 'deliberative'):
+        bu = getattr(cfg.llm, f'{tier}_base_url', '')
+        prov = getattr(cfg.llm, f'{tier}_provider', '')
+        if bu and not prov:
+            setattr(cfg.llm, f'{tier}_provider', _autodetect(bu))
 
     return cfg

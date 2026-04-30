@@ -22,6 +22,12 @@ cp /home/chris/workspace/xillm/chat/chat.lua $ASHITA/addons/chat/
 mkdir -p $ASHITA/addons/inventory
 cp /home/chris/workspace/xillm/inventory/inventory.lua $ASHITA/addons/inventory/
 
+# goals addon: in-game UI overlay showing the agent's goal tree, the
+# active leaf, and recent decision events. Read-only status panel,
+# shift+drag to reposition.
+mkdir -p $ASHITA/addons/goals
+cp /home/chris/workspace/xillm/goals/goals.lua $ASHITA/addons/goals/
+
 # cmdrelay (relays cmd_inbox.txt lines as /commands inside Ashita).
 # Kept under our deployment so we can fix bugs in it without manual
 # copies. Reloaded BEFORE issuing any other commands below so the
@@ -46,5 +52,7 @@ sleep 2
     echo '/addon reload chat'
     echo '/addon load inventory'
     echo '/addon reload inventory'
+    echo '/addon load goals'
+    echo '/addon reload goals'
 } > $ASHITA/config/addons/nav/cmd_inbox.txt
 echo "Deployed and reloaded."

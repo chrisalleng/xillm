@@ -1,9 +1,9 @@
 /*
- * navmesh.cpp — pybind11 wrapper around Recast + Detour.
+ * navmesh.cpp - pybind11 wrapper around Recast + Detour.
  *
  * Provides:
- *   build_navmesh(verts, tris, settings) → opaque handle
- *   find_path(handle, start, end) → list of (x,y,z) waypoints
+ *   build_navmesh(verts, tris, settings) -> opaque handle
+ *   find_path(handle, start, end) -> list of (x,y,z) waypoints
  *
  * Supports solo (monolithic) and tiled navmesh builds.
  * Tiled mode processes geometry in spatial tiles with bounded memory per tile,
@@ -54,7 +54,7 @@ struct NavMeshData {
 };
 
 // One-way (or bidirectional) jump/drop-off link between two navmesh points.
-// Coords are in Recast space (Y-up) — same space as verts/tris passed to
+// Coords are in Recast space (Y-up) - same space as verts/tris passed to
 // build_navmesh. Caller converts from game coords via game_to_recast() before
 // passing the list in. radius is the tolerance used by Detour to snap each
 // endpoint to the nearest walkable polygon; 0.75y is a reasonable default.
@@ -62,7 +62,7 @@ struct OffMeshConnection {
     float start[3];
     float end[3];
     float radius;
-    bool bidir;              // false = start → end only (drop-off); true = both ways
+    bool bidir;              // false = start -> end only (drop-off); true = both ways
     unsigned char area;      // area type id (RC_WALKABLE_AREA default is 63; use 2 for drop-offs)
     unsigned short flags;    // polyFlags OR'd onto the link poly (1 = walkable)
     unsigned int userId;     // optional caller tag
@@ -682,7 +682,7 @@ static std::tuple<int,int> count_polys(std::shared_ptr<NavMeshData> mesh) {
 }
 
 // Path query using explicit poly refs for both endpoints, skipping the
-// findNearestPoly snap. Used by the drop-off detector — when the redundancy
+// findNearestPoly snap. Used by the drop-off detector - when the redundancy
 // check must decide whether TWO SPECIFIC polys (the top-of-cliff and the
 // landing) are already connected, findNearestPoly's 100y snap can silently
 // move both endpoints onto a connecting slope poly and return a bogus short

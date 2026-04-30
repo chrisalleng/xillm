@@ -7,7 +7,7 @@ startup.
 
 Atomic writes (temp file + rename) so a crash mid-write doesn't leave
 us with a truncated JSON file we can't load. We don't bother with file
-locking — only the orchestrator writes, and it's single-process.
+locking - only the orchestrator writes, and it's single-process.
 
 Phase 1 scope: load/save primitives + an empty `Goals` / `Gambits` /
 `Knowledge` shape. Phase 2+ fills in the actual goal-tree and gambit-AST
@@ -33,7 +33,7 @@ def _atomic_write_json(path: Path, data: Any) -> None:
             f.write('\n')
         # mkstemp creates 0600; bump to 0644 so the Lua addon (running
         # under Wine but as the same Linux user) can still read it.
-        # In practice 0600 should also work — but we hit a case where
+        # In practice 0600 should also work - but we hit a case where
         # Wine's filesystem layer cared, so be permissive.
         os.chmod(tmp, 0o644)
         os.replace(tmp, path)
@@ -102,7 +102,7 @@ class Gambits:
 
 @dataclass
 class Knowledge:
-    """Free-form learned facts. Schema is open by design — the LLM and
+    """Free-form learned facts. Schema is open by design - the LLM and
     orchestrator both write to it. We just wrap it for typed access."""
     data: dict[str, Any] = field(default_factory=dict)
 

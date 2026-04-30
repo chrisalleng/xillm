@@ -14,13 +14,15 @@ Each call:
 Phase 1 scope: a working `call()` that takes a plain prompt and returns
 text, plus a `healthcheck()` that does one cheap reactive-tier call.
 The full tool surface (read_world_state, update_goals, etc.) lands in
-Phase 2 alongside the goal manager — tool calls go through the same
+Phase 2 alongside the goal manager - tool calls go through the same
 client, just with a `tools=[...]` param.
 """
 from __future__ import annotations
 
 import json
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -31,6 +33,39 @@ except ImportError:  # pragma: no cover
 
 from . import config as _config
 from . import events as _events
+
+
+# Default Ollama context window. Ollama defaults to 2048 which silently
+# truncates anything above it - way too small for our planner prompt.
+# 16384 covers our worst-case (system prompt + 200-zone catalog + tools)
+# with headroom; well within Llama 3.1 / Qwen 2.5 native limits.
+OLLAMA_NUM_CTX = 16384
+
+
+@dataclass
+class NormalizedToolCall:
+    """Provider-agnostic tool call. OpenAI gives us arguments as a JSON
+    string we have to parse; Ollama gives us a parsed dict directly. We
+    normalize to a parsed dict either way so callers don't have to care."""
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ChatResponse:
+    """Provider-agnostic chat-completion result."""
+    text: str
+    tool_calls: list[NormalizedToolCall] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    finish_reason: str = ''
+    latency_s: float = 0.0
+    model: str = ''
+    # Raw assistant message in the provider's native shape, ready to be
+    # appended back into a multi-turn conversation. Different providers
+    # need different field combinations to keep history well-formed.
+    raw_assistant_message: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -47,49 +82,265 @@ class LLMGateway:
 
     def __init__(self, cfg: _config.Config):
         self.cfg = cfg
-        if OpenAI is None or not cfg.llm.api_key:
-            self.client = None
+        # Lazy-built OpenAI clients keyed by (base_url, api_key). Tiers
+        # may target different providers (e.g. local Ollama for reactive,
+        # Groq for deliberative) so we cache one client per endpoint
+        # instead of a single self.client.
+        self._clients: dict[tuple[str, str], Any] = {}
+        # Eagerly build the default client so legacy `self.client`
+        # callers (and the healthcheck) keep working without per-tier
+        # routing knowledge. Falls back to None if SDK or key missing,
+        # preserving the existing `available` semantics.
+        if OpenAI is not None and cfg.llm.api_key:
+            self.client = self._client_for(cfg.llm.base_url, cfg.llm.api_key)
         else:
-            self.client = OpenAI(
-                api_key=cfg.llm.api_key,
-                base_url=cfg.llm.base_url,
-            )
+            self.client = None
+
+    def _client_for(self, base_url: str, api_key: str):
+        """Return (and lazily cache) an OpenAI SDK client for this
+        endpoint. Used for OpenAI-compat tiers; Ollama-native tiers
+        bypass this entirely and POST via urllib."""
+        if OpenAI is None:
+            return None
+        key = (base_url, api_key)
+        c = self._clients.get(key)
+        if c is None:
+            c = OpenAI(api_key=api_key, base_url=base_url)
+            self._clients[key] = c
+        return c
+
+    def _resolve_tier(self, tier: str) -> tuple[str, str, str, str]:
+        """Resolve (model, base_url, api_key, provider) for a tier.
+        Per-tier overrides win; otherwise fall back to the [llm]
+        defaults. Empty per-tier endpoint fields are treated as 'inherit'."""
+        model = getattr(self.cfg.llm, tier)
+        base_url = getattr(self.cfg.llm, f'{tier}_base_url', '') or self.cfg.llm.base_url
+        api_key = getattr(self.cfg.llm, f'{tier}_api_key', '') or self.cfg.llm.api_key
+        provider = getattr(self.cfg.llm, f'{tier}_provider', '') or self.cfg.llm.provider
+        return model, base_url, api_key, provider
 
     @property
     def available(self) -> bool:
-        """True iff we have both the SDK and an API key."""
+        """True iff we have an OpenAI client (Ollama path also requires
+        the SDK to be importable for the healthcheck-style call helper,
+        though the native /api/chat path uses urllib only)."""
         return self.client is not None
+
+    @property
+    def is_ollama(self) -> bool:
+        """True iff the DEFAULT provider is ollama. Per-tier routing
+        decisions should use _resolve_tier()'s provider value, not this."""
+        return self.cfg.llm.provider == 'ollama'
+
+    # -------------------------------------------------------------------
+    # Provider-agnostic chat completion with tool support.
+    #
+    # OpenAI's compat shim (Groq, OpenAI proper, etc) -> goes through
+    # the openai SDK. Ollama's native API -> urllib POST to /api/chat,
+    # which correctly parses tool calls for models whose format the
+    # OpenAI shim mangles (Qwen 2.5, GLM, etc). Both paths return a
+    # NormalizedToolCall list with arguments already parsed to dicts.
+    # -------------------------------------------------------------------
+
+    def tool_chat(
+        self,
+        tier: str,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = 'auto',
+        max_tokens: int = 2048,
+    ) -> ChatResponse:
+        """Single-turn chat completion with optional tool calling.
+        Routes per tier - `tier` is one of reactive/periodic/deliberative
+        and the gateway looks up the model + endpoint + provider from
+        config (with per-tier overrides honoured)."""
+        model, base_url, api_key, provider = self._resolve_tier(tier)
+        if provider == 'ollama':
+            return self._tool_chat_ollama(
+                model, base_url, messages, tools, tool_choice, max_tokens,
+            )
+        client = self._client_for(base_url, api_key)
+        return self._tool_chat_openai(
+            client, model, messages, tools, tool_choice, max_tokens,
+        )
+
+    def _tool_chat_openai(
+        self,
+        client,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str,
+        max_tokens: int,
+    ) -> ChatResponse:
+        if client is None:
+            raise RuntimeError('OpenAI client unavailable (no api_key?)')
+        kwargs: dict[str, Any] = {
+            'model':       model,
+            'max_tokens':  max_tokens,
+            'messages':    messages,
+        }
+        if tools:
+            kwargs['tools']       = tools
+            kwargs['tool_choice'] = tool_choice
+        t0 = time.time()
+        resp = client.chat.completions.create(**kwargs)
+        latency = time.time() - t0
+        choice = resp.choices[0] if resp.choices else None
+        if choice is None:
+            return ChatResponse(text='', latency_s=latency, model=model)
+        msg = choice.message
+        raw_calls = getattr(msg, 'tool_calls', None) or []
+        norm: list[NormalizedToolCall] = []
+        for c in raw_calls:
+            try:
+                args = json.loads(c.function.arguments or '{}')
+            except json.JSONDecodeError:
+                args = {}
+            norm.append(NormalizedToolCall(
+                id=c.id, name=c.function.name, arguments=args,
+            ))
+        # Echo shape for multi-turn: include tool_calls verbatim so
+        # OpenAI's shim sees a well-formed assistant turn on the
+        # follow-up request.
+        echo: dict[str, Any] = {'role': 'assistant', 'content': msg.content or ''}
+        if raw_calls:
+            echo['tool_calls'] = [
+                {
+                    'id':       c.id,
+                    'type':     'function',
+                    'function': {
+                        'name':      c.function.name,
+                        'arguments': c.function.arguments,
+                    },
+                }
+                for c in raw_calls
+            ]
+        usage = getattr(resp, 'usage', None)
+        return ChatResponse(
+            text=msg.content or '',
+            tool_calls=norm,
+            input_tokens=getattr(usage, 'prompt_tokens', 0) or 0 if usage else 0,
+            output_tokens=getattr(usage, 'completion_tokens', 0) or 0 if usage else 0,
+            finish_reason=getattr(choice, 'finish_reason', '') or '',
+            latency_s=latency,
+            model=model,
+            raw_assistant_message=echo,
+        )
+
+    def _tool_chat_ollama(
+        self,
+        model: str,
+        base_url: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str,  # ollama ignores this; tools-or-not is the only switch
+        max_tokens: int,
+    ) -> ChatResponse:
+        # Ollama wants base_url WITHOUT the /v1 suffix the OpenAI shim uses.
+        base = base_url.rstrip('/')
+        if base.endswith('/v1'):
+            base = base[:-3]
+        url = f'{base}/api/chat'
+        body: dict[str, Any] = {
+            'model':    model,
+            'messages': messages,
+            'stream':   False,
+            'options': {
+                'num_ctx':     OLLAMA_NUM_CTX,
+                'num_predict': max_tokens,
+            },
+        }
+        if tools:
+            body['tools'] = tools
+            # Qwen3 (and likely future thinking models) defaults to a
+            # `<think>...</think>` chain-of-thought before any output.
+            # When we're asking for tool calls, that thinking adds 5-30s
+            # of latency AND tends to crowd out the tool call entirely
+            # (the model "decides" in prose instead of via tool). Ollama
+            # exposes a `think` parameter on /api/chat to gate this. We
+            # set it to false whenever tools are in play. Models that
+            # don't support thinking ignore the field, so it's safe to
+            # set unconditionally on tool-bearing requests.
+            body['think'] = False
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            err_body = ''
+            try:
+                err_body = e.read().decode('utf-8', errors='replace')[:500]
+            except Exception:
+                pass
+            raise RuntimeError(f'Ollama HTTP {e.code}: {err_body}') from e
+        latency = time.time() - t0
+        data = json.loads(raw.decode('utf-8'))
+        msg = data.get('message') or {}
+        text = msg.get('content', '') or ''
+        raw_calls = msg.get('tool_calls') or []
+        norm: list[NormalizedToolCall] = []
+        for i, c in enumerate(raw_calls):
+            fn = c.get('function') or {}
+            args = fn.get('arguments')
+            if isinstance(args, str):
+                # Some Ollama-served models hand back arg-strings; parse.
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            elif not isinstance(args, dict):
+                args = {}
+            # Ollama doesn't issue tool-call ids; synthesize a stable one
+            # so multi-turn loops can pair tool results back to the call.
+            norm.append(NormalizedToolCall(
+                id=f'ollama_{int(time.time() * 1000)}_{i}',
+                name=fn.get('name', '') or '',
+                arguments=args,
+            ))
+        # Echo shape: Ollama's /api/chat echoes back whatever shape we
+        # send, including its own tool_calls form. Use the message dict
+        # nearly verbatim so a follow-up request stays well-formed.
+        echo: dict[str, Any] = {'role': 'assistant', 'content': text}
+        if raw_calls:
+            echo['tool_calls'] = raw_calls
+        return ChatResponse(
+            text=text,
+            tool_calls=norm,
+            input_tokens=int(data.get('prompt_eval_count') or 0),
+            output_tokens=int(data.get('eval_count') or 0),
+            finish_reason='tool_calls' if norm else 'stop',
+            latency_s=latency,
+            model=model,
+            raw_assistant_message=echo,
+        )
 
     def _model_for(self, tier: str) -> str:
         return getattr(self.cfg.llm, tier)
 
     def call(self, tier: str, prompt: str, *, max_tokens: int = 1024) -> CallResult:
-        """Dispatch a single text prompt at the named tier. Phase 1
-        helper — no tools, no streaming. Tools come in Phase 2."""
-        if self.client is None:
-            raise RuntimeError(
-                'LLM client unavailable. Install `openai` and set '
-                'AGENT_LLM_API_KEY (or put it in agent_core/config.toml) '
-                'to use the LLM gateway.'
-            )
-        model = self._model_for(tier)
-        t0 = time.time()
-        resp = self.client.chat.completions.create(
-            model=model,
+        """Dispatch a single text prompt at the named tier. Routes through
+        tool_chat() with no tools so the per-tier provider routing kicks
+        in (rather than always going through the default-endpoint client)."""
+        cr = self.tool_chat(
+            tier,
+            [{'role': 'user', 'content': prompt}],
+            tools=None,
             max_tokens=max_tokens,
-            messages=[{'role': 'user', 'content': prompt}],
         )
-        latency = time.time() - t0
-        text = (resp.choices[0].message.content or '') if resp.choices else ''
-        # Groq + OpenAI both populate `usage`; some providers omit it.
-        usage = getattr(resp, 'usage', None)
-        in_tok = getattr(usage, 'prompt_tokens', 0) if usage else 0
-        out_tok = getattr(usage, 'completion_tokens', 0) if usage else 0
+        model, _, _, _ = self._resolve_tier(tier)
         result = CallResult(
-            text=text,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            latency_s=latency,
+            text=cr.text,
+            input_tokens=cr.input_tokens,
+            output_tokens=cr.output_tokens,
+            latency_s=cr.latency_s,
             model=model,
         )
         _events.append(
@@ -101,7 +352,7 @@ class LLMGateway:
             model=model,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
-            latency_s=round(latency, 3),
+            latency_s=round(cr.latency_s, 3),
         )
         return result
 
@@ -124,12 +375,12 @@ class LLMGateway:
     #
     # The single-turn `Planner.plan()` pattern works for "decide and
     # commit" calls (set goals, deploy gambits) where the LLM doesn't
-    # need to read state mid-decision. Other surfaces — chat handling,
-    # combat-log review — need to query, decide, possibly act, possibly
+    # need to read state mid-decision. Other surfaces - chat handling,
+    # combat-log review - need to query, decide, possibly act, possibly
     # query more. That's what this helper is for.
     #
     # Contract: pass a tools list (OpenAI shape) and a parallel handler
-    # dict (name → callable). Each iteration the LLM either emits tool
+    # dict (name -> callable). Each iteration the LLM either emits tool
     # calls (we run them, append the results, continue) or returns a
     # plain message (we stop and hand the text back). max_iters caps the
     # loop so a misbehaving model can't run up unbounded tokens.
@@ -150,12 +401,7 @@ class LLMGateway:
         """Run a tool-use conversation. Returns a ToolLoopResult with
         the final assistant text, the list of (name, args, result) tool
         calls actually executed, and aggregated token counts."""
-        if self.client is None:
-            raise RuntimeError(
-                'LLM client unavailable. Install `openai` and set '
-                'AGENT_LLM_API_KEY (or put it in agent_core/config.toml).'
-            )
-        model = self._model_for(tier)
+        model, _, _, _ = self._resolve_tier(tier)
         messages: list[dict[str, Any]] = [
             {'role': 'system', 'content': system_prompt},
             {'role': 'user',   'content': user_prompt},
@@ -168,67 +414,25 @@ class LLMGateway:
         last_iter_had_calls = False
 
         for iter_idx in range(max_iters):
-            t0 = time.time()
-            resp = self.client.chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice='auto',  # let the model stop when it's done
-                messages=messages,
+            cr = self.tool_chat(
+                tier, messages,
+                tools=tools, tool_choice='auto', max_tokens=max_tokens,
             )
-            latency_total += time.time() - t0
-            usage = getattr(resp, 'usage', None)
-            if usage is not None:
-                in_total += getattr(usage, 'prompt_tokens', 0) or 0
-                out_total += getattr(usage, 'completion_tokens', 0) or 0
+            latency_total += cr.latency_s
+            in_total += cr.input_tokens
+            out_total += cr.output_tokens
 
-            choice = resp.choices[0] if resp.choices else None
-            if choice is None:
-                break
-            assistant_msg = choice.message
-            tool_calls = getattr(assistant_msg, 'tool_calls', None) or []
+            messages.append(cr.raw_assistant_message)
 
-            # Echo the assistant turn back into the conversation. Keep
-            # `tool_calls` so the next request stays well-formed; the
-            # OpenAI shape requires every tool result to reference its
-            # originating call id.
-            echoed: dict[str, Any] = {
-                'role':    'assistant',
-                'content': assistant_msg.content or '',
-            }
-            if tool_calls:
-                echoed['tool_calls'] = [
-                    {
-                        'id':       call.id,
-                        'type':     'function',
-                        'function': {
-                            'name':      call.function.name,
-                            'arguments': call.function.arguments,
-                        },
-                    }
-                    for call in tool_calls
-                ]
-            messages.append(echoed)
-
-            if not tool_calls:
-                final_text = assistant_msg.content or ''
+            if not cr.tool_calls:
+                final_text = cr.text
                 terminated = True
                 break
 
             last_iter_had_calls = True
-            for call in tool_calls:
-                name = call.function.name
-                try:
-                    args = json.loads(call.function.arguments or '{}')
-                except json.JSONDecodeError as e:
-                    result: Any = {'error': f'malformed args: {e}'}
-                    applied.append((name, {}, result))
-                    messages.append({
-                        'role':         'tool',
-                        'tool_call_id': call.id,
-                        'content':      json.dumps(result),
-                    })
-                    continue
+            for call in cr.tool_calls:
+                name = call.name
+                args = call.arguments
                 handler = tool_handlers.get(name)
                 if handler is None:
                     result = {'error': f'unknown tool {name!r}'}
@@ -238,9 +442,6 @@ class LLMGateway:
                     except Exception as e:
                         result = {'error': f'{type(e).__name__}: {e}'}
                 applied.append((name, args, result))
-                # Tool messages must be JSON strings per the OpenAI spec.
-                # Wrap any non-string result in JSON; strings pass through
-                # so a handler can return preformatted text if it wants.
                 payload = result if isinstance(result, str) else json.dumps(result, default=str)
                 messages.append({
                     'role':         'tool',

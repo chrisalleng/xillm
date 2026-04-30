@@ -8,7 +8,7 @@ The orchestrator polls these files at ~5 Hz, builds a unified
 change events into the event bus.
 
 Phase 1 scope: the load / aggregate interfaces. We DON'T yet wire it
-into nav.lua's existing `nav_status.json` etc. — that migration is
+into nav.lua's existing `nav_status.json` etc. - that migration is
 Phase 1b.
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import Any
 
 
 # Known channels we expect to see state files for. Unknown channels
-# are silently ignored — it's fine for an addon to not publish yet.
+# are silently ignored - it's fine for an addon to not publish yet.
 KNOWN_CHANNELS: tuple[str, ...] = (
     'nav',         # zone, position, autofollow status
     'combat',      # target, hp/mp, status effects, casting state

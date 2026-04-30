@@ -35,8 +35,8 @@ end
 local function poll()
     -- Consume every command in the inbox per poll, not just the first.
     -- Producers (e.g. agent_core/deploy.sh) often need to issue several
-    -- commands together — `/addon reload nav` + `/addon load combat`
-    -- + `/addon reload combat` for instance — and the previous one-line
+    -- commands together - `/addon reload nav` + `/addon load combat`
+    -- + `/addon reload combat` for instance - and the previous one-line
     -- behaviour silently dropped all but the first.
     local path = inbox_path()
     local f = io.open(path, 'r')

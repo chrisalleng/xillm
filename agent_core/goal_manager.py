@@ -1,4 +1,4 @@
-"""Goal manager — picks the active leaf goal and dispatches it.
+"""Goal manager - picks the active leaf goal and dispatches it.
 
 The persistent goal tree lives in `persistent/<char>/goals.json` (loaded
 via `persistence.Goals`). Each tick the manager:
@@ -7,7 +7,7 @@ via `persistence.Goals`). Each tick the manager:
        satisfied, dispatches the next directive (or marks it complete),
     3. updates the on-disk file when state changes.
 
-Phase 2a scope: deterministic execution — no LLM in this loop. The
+Phase 2a scope: deterministic execution - no LLM in this loop. The
 LLM planner (Phase 2b) writes / mutates the goal tree; the manager
 just walks it. Goals supported in 2a:
 
@@ -18,8 +18,8 @@ just walks it. Goals supported in 2a:
 
 Each goal also carries an optional `completion` block that defines how
 to detect completion (`type=in_zone, zone_id`, `type=near_pos, ...`).
-If `completion` is omitted we infer it from `type` (travel→arrival in
-target_zone, goto→within 5y of target_pos, etc.).
+If `completion` is omitted we infer it from `type` (travel->arrival in
+target_zone, goto->within 5y of target_pos, etc.).
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ ARRIVAL_RADIUS_Y = 8.0
 class _Snapshot:
     """The bits of world state the goal manager actually needs each tick.
 
-    Pulled from the existing nav_status.json the addon publishes — when
+    Pulled from the existing nav_status.json the addon publishes - when
     the IPC migration lands (Phase 1b) this will read state/<char>/nav.json
     instead, but the shape of the data we care about is the same.
     """
@@ -51,12 +51,16 @@ class _Snapshot:
     y: float | None
     z: float | None
     moving: bool
+    # slot_name -> equipped item name; None when inventory.json hasn't
+    # published yet. Slots without an equipped item map to None.
+    # Used by `equip` goal completion detection.
+    equipped: dict[str, str | None] | None = None
 
 
 class GoalManager:
     """Walks the persistent goal tree and dispatches directives via a
     caller-provided dispatch function (so the manager doesn't depend on
-    NavServer directly — easier to test, easier to swap the dispatch
+    NavServer directly - easier to test, easier to swap the dispatch
     target if/when we move off nav_request.json)."""
 
     # Hard cap between two redispatches of the same leaf, even when
@@ -70,15 +74,20 @@ class GoalManager:
         dispatch_goto: Callable[[dict[str, Any]], None],
         snapshot_provider: Callable[[], _Snapshot],
         farming_director: Any | None = None,
+        issue_command: Callable[[str], None] | None = None,
     ):
         self.cfg = cfg
         self._dispatch = dispatch_goto
         self._snapshot = snapshot_provider
+        # `equip` leaves issue raw FFXI /commands via cmdrelay rather
+        # than going through nav_request.json. None disables `equip`
+        # (those leaves immediately complete as no-ops).
+        self._issue_command = issue_command
         self._goals_path = cfg.paths.persistent_dir(cfg.character) / 'goals.json'
         self.goals = _persistence.Goals.load(self._goals_path)
         # Per-leaf bookkeeping for redispatch decisions:
-        #   _last_dispatch[gid]      → wall-clock of last dispatch
-        #   _dispatched_zone[gid]    → zone_id we dispatched FROM
+        #   _last_dispatch[gid]      -> wall-clock of last dispatch
+        #   _dispatched_zone[gid]    -> zone_id we dispatched FROM
         # We only redispatch a leaf if the player has crossed a zone
         # boundary since the previous dispatch (route-segment changed)
         # or if the cooldown has elapsed and we still have no path
@@ -88,9 +97,23 @@ class GoalManager:
         # Cache of the active leaf id so external callers can ask without
         # re-walking the tree.
         self._active_leaf_id: str | None = None
+        # One-shot signal: set to the goal id of any leaf that just
+        # transitioned to `failed`. Consumed by main's failure-replan
+        # poll, which calls `consume_failure_signal()` to read+clear.
+        # Distinct from completion - failure is the trigger because the
+        # agent's plan visibly stopped working and needs LLM re-evaluation.
+        self._failed_leaf_signal: str | None = None
         # Farming director (Phase 3c). Optional; if absent, `farm` leaves
         # complete immediately as a no-op so older configs don't wedge.
         self.farming = farming_director
+
+    def consume_failure_signal(self) -> str | None:
+        """Return the id of the most recently failed leaf, clearing the
+        latch in the process. None if no failure pending. Caller (main)
+        decides what to do - typically a failure-triggered replan."""
+        sig = self._failed_leaf_signal
+        self._failed_leaf_signal = None
+        return sig
 
     # ---- tree helpers --------------------------------------------------
 
@@ -126,7 +149,7 @@ class GoalManager:
                     continue
                 unresolved_children.append(cid)
             if not unresolved_children:
-                # All children terminal — propagate failure if any child
+                # All children terminal - propagate failure if any child
                 # failed (a composite isn't "completed" if its subgoal
                 # died). Otherwise the parent is completed.
                 child_states = [
@@ -193,10 +216,29 @@ class GoalManager:
                 if started is None:
                     return False
                 return time.time() - started >= leaf.get('seconds', 0)
-            if t == 'farm':
+            if t in ('farm', 'engage_nearby'):
                 # The farming director marks itself completed when the
                 # `stop_when` directive fires (e.g. kill_count reached).
                 return self.farming is not None and self.farming.is_done()
+            if t == 'equip':
+                # Done when the next inventory snapshot reflects the
+                # /equip we issued. equipped[slot] either (a) hasn't
+                # published yet -> wait, or (b) doesn't match -> wait,
+                # (c) matches -> done. We also bail with success after
+                # the dispatch timeout to avoid wedging on items that
+                # silently failed to equip (lvl_req mismatch, etc.) -
+                # the LLM can re-plan after observing the unchanged state.
+                eq = (snap.equipped or {}).get(leaf.get('slot'))
+                if eq == leaf.get('item'):
+                    return True
+                started = leaf.get('_started_at')
+                if started is not None and time.time() - started >= 5.0:
+                    # Timeout: mark complete-with-warning. The leaf
+                    # records the effective outcome on disk so a
+                    # re-plan can see what didn't take.
+                    leaf['_equip_outcome'] = 'timeout'
+                    return True
+                return False
             return False
         # Explicit completion clauses.
         ctype = completion.get('type')
@@ -222,7 +264,7 @@ class GoalManager:
         segment progression, stuck-detection, wider-radius retry, even
         random walks on persistent failure (see nav.lua's retry chain).
         Once we hand it a cross_zone_goto with a route, our job is to
-        watch for completion and advance to the next leaf — not to
+        watch for completion and advance to the next leaf - not to
         keep poking the addon."""
         return self._last_dispatch.get(gid) is None
 
@@ -236,11 +278,28 @@ class GoalManager:
             return
         if t == 'composite':
             return  # nothing to dispatch directly
-        if t == 'farm':
-            # Farm leaves are stateful — handed once to the director,
-            # which then drives /ta + /attack + /heal cycles tick-by-tick.
-            # `_should_dispatch` still gates the *first* hand-off so we
-            # don't restart the director on every tick.
+        if t == 'equip':
+            # One-shot: fire `/equip <slot> "<item>"` once, stamp _started_at
+            # for completion's timeout fallback, and let the inventory
+            # snapshot drive completion.
+            if not self._should_dispatch(gid, snap, now):
+                return
+            slot = leaf.get('slot')
+            item = leaf.get('item')
+            if slot and item and self._issue_command is not None:
+                # Quote the name - FFXI item names can contain spaces and
+                # apostrophes; the client's parser handles "..." fine.
+                self._issue_command(f'/equip {slot} "{item}"')
+                leaf['_started_at'] = now
+                self._last_dispatch[gid] = now
+                self._dispatched_zone[gid] = snap.zone_id
+                self._save()
+            return
+        if t in ('farm', 'engage_nearby'):
+            # Farm + engage_nearby both run through the farming director
+            # - same start/tick contract, just different acquire behavior
+            # (named target vs /ta <enemy>). Single hand-off; director
+            # drives the kill loop tick-by-tick from there.
             if not self._should_dispatch(gid, snap, now):
                 return
             if self.farming is not None:
@@ -260,6 +319,10 @@ class GoalManager:
                 'target_zone': target_zone,
                 'player': [snap.x, snap.y, snap.z],
                 'seq': int(now * 1000),
+                # Orchestrator-pushed travel - addon must drop any
+                # in-flight retry/route state from prior goals before
+                # following this one.
+                'reset_state': True,
             }
             if leaf.get('target_pos') is not None:
                 req['target'] = leaf['target_pos']
@@ -274,6 +337,7 @@ class GoalManager:
                 'player': [snap.x, snap.y, snap.z],
                 'target': target_pos,
                 'seq': int(now * 1000),
+                'reset_state': True,
             }
             self._dispatch(req)
         self._last_dispatch[gid] = now
@@ -318,21 +382,28 @@ class GoalManager:
         # The farming director is a long-running state machine. Tick it
         # before the completion check so a kill that just happened gets
         # counted before we evaluate stop_when.
-        if leaf.get('type') == 'farm' and self.farming is not None and self.farming.is_active():
+        if leaf.get('type') in ('farm', 'engage_nearby') \
+                and self.farming is not None and self.farming.is_active():
             self.farming.tick()
         if self._is_complete(leaf, snap):
             # Distinguish completed vs failed for farm leaves so death
-            # (FarmingDirector → 'failed') doesn't masquerade as success.
+            # (FarmingDirector -> 'failed') doesn't masquerade as success.
             # `is_done()` covers both terminal states; `state == 'failed'`
             # is the disambiguator.
             terminal = 'completed'
-            if leaf.get('type') == 'farm' and self.farming is not None \
+            if leaf.get('type') in ('farm', 'engage_nearby') and self.farming is not None \
                     and getattr(self.farming, 'state', None) == 'failed':
                 terminal = 'failed'
             leaf['state'] = terminal
             self._last_dispatch.pop(leaf_id, None)
             self._dispatched_zone.pop(leaf_id, None)
             self._save()
+            if terminal == 'failed':
+                # Latch the failure id so main's failure-replan poll
+                # can pick it up. Overwriting an unconsumed signal is
+                # fine - what matters is "something failed since you
+                # last replanned," not which specific leaf.
+                self._failed_leaf_signal = leaf_id
             _events.append(
                 self.cfg.paths.events_file(),
                 character=self.cfg.character,

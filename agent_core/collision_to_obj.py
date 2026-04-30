@@ -3,10 +3,10 @@
 Convert collision JSON files to Wavefront OBJ for Recast navmesh building.
 
 Collision JSON format (from tools/extract_collision):
-  vertices: [[x, y, z], ...]  — raw MZB coordinates
-  triangles: [[i0, i1, i2], ...] — 0-based indices
+  vertices: [[x, y, z], ...]  - raw MZB coordinates
+  triangles: [[i0, i1, i2], ...] - 0-based indices
 
-Coordinate transform (MZB → Recast Y-up):
+Coordinate transform (MZB -> Recast Y-up):
   FFXI game: X=east/west, Y=south/north (horizontal), Z=elevation (up)
   MZB raw:   game.x=MZB.x, game.y=-MZB.y, game.z=MZB.z
   Recast:    X=horizontal, Y=up, Z=horizontal

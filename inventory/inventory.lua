@@ -10,14 +10,14 @@
 *
 * Phase 6 scope: state publishing only. The action surface
 * (equip_set, move_item, discard_item) goes through cmd_inbox.txt
-* into luashitacast and packer — both of which are already deployed
+* into luashitacast and packer - both of which are already deployed
 * and configured via their own files. We don't need an action
 * channel because those addons already accept /commands.
 --]]
 
 addon.name    = 'inventory'
 addon.author  = 'xillm'
-addon.version = '0.2'
+addon.version = '0.4'
 addon.desc    = 'Inventory state publisher (Tier 1 addon for agent_core)'
 
 require('common')
@@ -45,6 +45,39 @@ local CONTAINERS = {
     {id = 9,  name = 'wardrobe2'},
     {id = 10, name = 'wardrobe3'},
     {id = 11, name = 'wardrobe4'},
+}
+
+-- Equipment slot indices per the FFXI client (matches equipmon.lua).
+-- Order matters: SLOT_ORDER[i] is the slot id for the i-th /equip arg.
+local EQUIP_SLOTS = {
+    [0]  = 'main',  [1]  = 'sub',   [2]  = 'range', [3]  = 'ammo',
+    [4]  = 'head',  [5]  = 'body',  [6]  = 'hands', [7]  = 'legs',
+    [8]  = 'feet',  [9]  = 'neck',  [10] = 'waist', [11] = 'ear1',
+    [12] = 'ear2',  [13] = 'ring1', [14] = 'ring2', [15] = 'back',
+}
+
+-- FFXI item slot bitmask -> slot-name list. The bitmask uses one bit
+-- per character-slot (16 total, ear1/ear2/ring1/ring2 are separate),
+-- so a symmetric item like a ring sets two bits. We collapse the
+-- ear1/ear2 and ring1/ring2 pairs to a single 'ear'/'ring' entry so
+-- the LLM doesn't have to reason about left-vs-right.
+local SINGLE_BITS = {
+    {bit = 0x0001, name = 'main'},
+    {bit = 0x0002, name = 'sub'},
+    {bit = 0x0004, name = 'range'},
+    {bit = 0x0008, name = 'ammo'},
+    {bit = 0x0010, name = 'head'},
+    {bit = 0x0020, name = 'body'},
+    {bit = 0x0040, name = 'hands'},
+    {bit = 0x0080, name = 'legs'},
+    {bit = 0x0100, name = 'feet'},
+    {bit = 0x0200, name = 'neck'},
+    {bit = 0x0400, name = 'waist'},
+    {bit = 0x0800, name = 'ear'},   -- ear1
+    {bit = 0x1000, name = 'ear'},   -- ear2 (collapsed)
+    {bit = 0x2000, name = 'ring'},  -- ring1
+    {bit = 0x4000, name = 'ring'},  -- ring2 (collapsed)
+    {bit = 0x8000, name = 'back'},
 }
 
 local function get_data_path()
@@ -100,6 +133,38 @@ end
 -- Inventory readers
 -------------------------------------------------------------------------------
 
+-- Resolve item metadata via Ashita's bundled resource manager.
+-- Returns name + flattened slot list + level requirement, or nil on
+-- unknown id. Cached because a 9-item inventory triggers 9 lookups
+-- per publish and the resource hash is small enough to memoize fully.
+local _resource_cache = {}
+local function resolve_item(id)
+    if id == nil or id == 0 or id == 65535 then return nil end
+    local cached = _resource_cache[id]
+    if cached ~= nil then return cached end
+    local res = pcget(function()
+        return AshitaCore:GetResourceManager():GetItemById(id)
+    end)
+    if res == nil then
+        _resource_cache[id] = false  -- negative cache; don't re-query
+        return nil
+    end
+    local name = pcget(function() return res.Name[1] end) or '?'
+    local slot_mask = pcget(function() return res.Slots end) or 0
+    local lvl_req = pcget(function() return res.Level end) or 0
+    local slots = {}
+    local seen = {}
+    for _, sb in ipairs(SINGLE_BITS) do
+        if (slot_mask % (sb.bit * 2)) >= sb.bit and not seen[sb.name] then
+            slots[#slots + 1] = sb.name
+            seen[sb.name] = true
+        end
+    end
+    local meta = {name = name, slots = slots, lvl_req = lvl_req}
+    _resource_cache[id] = meta
+    return meta
+end
+
 local function read_container(inv, container)
     local cap = pcget(function() return inv:GetContainerCountMax(container.id) end) or 0
     if cap == 0 then return nil end
@@ -113,11 +178,18 @@ local function read_container(inv, container)
             local id = pcget(function() return item.Id end) or 0
             local count = pcget(function() return item.Count end) or 0
             if id ~= 0 and id ~= 65535 and count > 0 then
-                items[#items + 1] = {
+                local entry = {
                     slot  = i,
                     id    = id,
                     count = count,
                 }
+                local meta = resolve_item(id)
+                if meta ~= nil then
+                    entry.name           = meta.name
+                    entry.equip_slots    = meta.slots
+                    entry.lvl_req        = meta.lvl_req
+                end
+                items[#items + 1] = entry
             end
         end
     end
@@ -128,14 +200,43 @@ local function read_container(inv, container)
     }
 end
 
--- Phase 6-min: equipped-gear introspection deferred. The Ashita
--- IMemoryManager doesn't expose GetEquipment(); equipmon.lua reads
--- equipped slots via a path through IInventory + raw struct offsets
--- I haven't worked out yet. Container snapshots cover what the
--- agent actually needs for now (drop detection, vendor purchases),
--- and luashitacast handles the equipping side.
-local function read_equipped()
-    return {}
+-- Read currently-equipped items via the equipmon pattern: GetEquippedItem
+-- returns a small struct whose Index field packs (container << 8 | slot).
+-- We fetch the underlying item from that container/slot to get the real
+-- Id/Count, then enrich with resource-manager metadata.
+local function read_equipped(inv)
+    local equipped = {}
+    for slot_id = 0, 15 do
+        local slot_name = EQUIP_SLOTS[slot_id]
+        local eq = pcget(function() return inv:GetEquippedItem(slot_id) end)
+        local entry = nil
+        if eq ~= nil then
+            local idx = pcget(function() return eq.Index end) or 0
+            if idx ~= 0 then
+                local container = math.floor(idx / 256)
+                local cslot = idx % 256
+                local item = pcget(function()
+                    return inv:GetContainerItem(container, cslot)
+                end)
+                if item ~= nil then
+                    local id = pcget(function() return item.Id end) or 0
+                    if id ~= 0 and id ~= 65535 then
+                        entry = {
+                            container = container,
+                            slot      = cslot,
+                            id        = id,
+                        }
+                        local meta = resolve_item(id)
+                        if meta ~= nil then
+                            entry.name = meta.name
+                        end
+                    end
+                end
+            end
+        end
+        equipped[slot_name] = entry  -- nil on empty slot; json.encode -> null
+    end
+    return equipped
 end
 
 -------------------------------------------------------------------------------
@@ -150,7 +251,7 @@ local function publish()
         ts         = os.time(),
         character  = char,
         containers = {},
-        equipped   = read_equipped(),
+        equipped   = read_equipped(inv),
     }
     for _, c in ipairs(CONTAINERS) do
         local data = read_container(inv, c)
@@ -167,7 +268,7 @@ end
 -------------------------------------------------------------------------------
 
 ashita.events.register('load', 'inventory_load', function()
-    msg('Loaded v' .. addon.version .. ' — inventory → state/<char>/inventory.json')
+    msg('Loaded v' .. addon.version .. ' - inventory -> state/<char>/inventory.json')
 end)
 
 ashita.events.register('d3d_present', 'inventory_render', function()

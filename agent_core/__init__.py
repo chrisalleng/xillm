@@ -1,4 +1,4 @@
-"""agent_core — orchestrator for the FFXI autonomous agent.
+"""agent_core - orchestrator for the FFXI autonomous agent.
 
 Modules:
     main             entrypoint; run-loop wiring nav + future subsystems together

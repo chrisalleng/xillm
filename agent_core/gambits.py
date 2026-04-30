@@ -46,7 +46,7 @@ Action nodes:
     {"kind": "disengage"}                              # /attack off
     {"kind": "raw",         "command": "/echo hello"}  # literal command line
 
-Targets follow Ashita's <…> placeholder convention; we pass them
+Targets follow Ashita's <...> placeholder convention; we pass them
 through verbatim so any standard target token (<me>, <t>, <p0>..<p5>,
 <bt>, <ft>, <stnpc>, <stpc>) is supported.
 """
@@ -287,7 +287,7 @@ def _key_matches(set_key: str, ctx: dict[str, str]) -> bool:
 
 
 def _specificity(set_key: str) -> int:
-    """0..3 — count of concrete (non-wildcard) segments. Used to order
+    """0..3 - count of concrete (non-wildcard) segments. Used to order
     matching sets so most-specific wins on id collisions."""
     return sum(1 for p in set_key.split('/') if p != WILDCARD)
 
@@ -334,7 +334,7 @@ def update_set(cfg: _config.Config, store: _persistence.Gambits,
                ctx: dict[str, Any] | None,
                gambits: list[dict[str, Any]]) -> str:
     """Validate + replace one set keyed by `ctx`. Persists the store.
-    Does NOT redeploy — caller does that with the *current* live ctx.
+    Does NOT redeploy - caller does that with the *current* live ctx.
     Returns the canonical key written."""
     validate(gambits)
     key = context_key_from_dict(ctx)
@@ -390,7 +390,7 @@ def modify_gambit(cfg: _config.Config, store: _persistence.Gambits,
     """Merge top-level fields from `patch` into the gambit identified by
     `gambit_id` within the set keyed by `ctx`. Patch may contain any of
     {priority, cooldown, trigger, action}; each replaces its top-level
-    field wholesale (no deep merge — partial trigger/action ASTs are
+    field wholesale (no deep merge - partial trigger/action ASTs are
     not validatable). Persists. Returns the canonical key."""
     if not isinstance(gambit_id, str) or not gambit_id:
         raise GambitValidationError('gambit_id must be a non-empty string')
