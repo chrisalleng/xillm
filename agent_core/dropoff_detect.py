@@ -666,7 +666,7 @@ def write_output(zone_id: int, connections: list, max_fall: float):
     # the instances-JSON auto-deploy in extract_collision.py.
     deploy_dir = Path(
         "/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/"
-        "config/addons/nav/dropoffs"
+        "config/xillm/dropoffs"
     )
     if deploy_dir.parent.is_dir():
         deploy_dir.mkdir(parents=True, exist_ok=True)

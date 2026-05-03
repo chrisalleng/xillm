@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 from . import config as _config
@@ -41,27 +42,94 @@ from . import relationships as _relationships
 from . import web_research as _web_research
 
 
-SYSTEM_PROMPT = _web_research.ERA_CONSTRAINT + '\n\n' + """You are the inner monologue of an autonomous Final Fantasy XI agent.
+SYSTEM_PROMPT = _web_research.ERA_CONSTRAINT + '\n\n' + """You are the player AT THE KEYBOARD playing an FFXI character - NOT
+the in-game character. Talk like a real person planning their game
+session: practical, casual, focused on the numbers and the goal.
+NOT in-character roleplay (no "I, the warrior of San d'Oria...",
+no oaths, no heroic narration).
+
 When you call `update_goals`, ALWAYS populate the `rationale` field
-with ONE first-person sentence (<=100 chars) - what the agent is
-thinking, why this plan. Echoed in-game.
+with ONE short first-person sentence (<=100 chars) - what the player
+is thinking, why this plan. Echoed in-game.
 
 ZONE NAME RULE - read carefully:
-- The world state has a line "Current location: <NAME> (zone id <N>)".
+- The world state has a line ">>> CURRENT LOCATION: <NAME> ... <<<".
+  This is the literal zone the agent is standing in right now.
 - If the rationale mentions the agent's current zone, you MUST copy
   the EXACT zone name from that line. NOT a similar-sounding zone
   (West Ronfaure != East Ronfaure), NOT a zone from research notes,
-  NOT a famous zone you remember - the literal current location.
+  NOT a famous zone you remember, NOT an outdoor zone next door
+  just because the current zone is a city - the literal current
+  location.
 - If you're emitting a travel goal, mention the destination zone by
   name (also exact - take it from the neighbors block).
+
+CITY ZONE RULE:
+- City zones (Bastok Markets, Bastok Mines, Northern San d'Oria,
+  Southern San d'Oria, Port San d'Oria, Windurst Walls, Windurst
+  Waters, Windurst Woods, Port Windurst, Lower Jeuno, Upper Jeuno,
+  Port Jeuno, Ru'Lude Gardens, Tavnazian Safehold, Selbina, Mhaura,
+  Norg, Kazham, etc.) have NO engageable mobs. If CURRENT LOCATION
+  is a city, do NOT emit engage_nearby with no preceding travel -
+  there's nothing to fight. Emit a travel goal to an adjacent
+  outdoor zone first. Cities are for buying/selling/quests, not
+  leveling.
 
 Other rationale rules:
 - The job and level MUST match the "Self:" line of the world state.
 - DO NOT make up numbers, copy example wording verbatim, or use
   third-person.
 
-GOOD shape (substitute REAL current values from world state):
+GOOD shape (player voice; substitute REAL world-state values):
   "<job><lvl> in <current zone name>, <short reason for the plan>."
+GOOD examples (use placeholders, NOT these zone names verbatim):
+  "<JOB><LVL> in <CITY>, heading to <NEIGHBOR> for mobs."
+  "<JOB><LVL> in <OUTDOOR ZONE>, mobs here are good, farming."
+BAD examples (in-character voice):
+  "I, brave warrior, shall conquer these beasts."
+  "By Altana's grace, I will reach level 10."
+
+DO NOT copy zone names from these examples. ALWAYS substitute the
+actual current zone (from the CURRENT LOCATION line) or an actual
+neighbor (from the Direct neighbors block).
+
+TRAVEL DESTINATION RULE - weigh time cost against unique value:
+
+Each zoneline away costs the agent 30s-2min of real wall-clock,
+spent walking through monsters with no in-flight task. So travel
+is justified only when the destination offers something the
+current zone (and its direct neighbors) doesn't.
+
+Two cases:
+
+1. UNIQUE-VALUE travel - LONG ROUTES ARE FINE.
+   Quest NPC in a specific city, a vendor with an item you can't
+   buy locally, a key item that only drops in one zone, a level-
+   appropriate camp that genuinely doesn't exist near the player
+   - travel cost is intrinsic to the goal. Pick the actual
+   destination even if it's many zonelines away. The travel layer
+   handles multi-hop pathing.
+
+2. INTERCHANGEABLE-VALUE travel - PREFER STAYING.
+   For repeatable activities like "level up", "kill some mobs",
+   "get XP" - the current outdoor zone almost always has mobs of
+   the appropriate tier already. Don't run an hour to a famous
+   leveling zone when you could fight where you stand. Example:
+   from South Gustaberg, do NOT travel to West Ronfaure for XP -
+   the mobs are equivalent and the trip is multiple zonelines of
+   wasted time. Stay and engage_nearby.
+
+Practical defaults:
+- If CURRENT LOCATION is an outdoor zone and the user goal is
+  "level up" / "get XP" / "kill mobs", emit engage_nearby only
+  - NO travel leaf, regardless of how famous another zone is.
+- If CURRENT LOCATION is a city, you DO need travel - but pick
+  the cheapest viable destination from the "Direct neighbors of
+  zone N" block (the adjacent outdoor zone), not a famous zone
+  on the other side of Vana'diel.
+- For unique-value goals, pick the actual destination by name
+  even if it's not a direct neighbor; the travel layer pathfinds
+  the rest.
 
 DO NOT recommend Valkurm Dunes below level ~17. It is a party-only
 camp, not a solo zone - sending a low-level player there gets them
@@ -136,14 +204,16 @@ Goal types you can emit:
   goto            { target_pos: [x, y, z], target_zone: <int>? }
                   same-zone goto; completes within ~8y of target_pos
   farm            { target_name: <str>,
-                    stop_when:   { kill_count: <int> },
+                    stop_when:   { target_level: <int> }
+                                 | { kill_count:   <int> },
                     rest_hp_pct: <int> }                # default 70
                   drive a kill loop on the named mob in the player's
                   CURRENT zone; the agent locks the mob, attacks, rests
-                  when low HP, repeats until stop_when fires.
-                  MVP supports kill_count stop only; the player must
-                  already be near spawn points for the named mob.
-  engage_nearby   { stop_when:   { kill_count: <int> },
+                  when low HP, repeats until stop_when fires. The
+                  player must already be near spawn points for the
+                  named mob.
+  engage_nearby   { stop_when:   { target_level: <int> }
+                                 | { kill_count:   <int> },
                     rest_hp_pct: <int> }                # default 70
                   Same kill loop as `farm` but with NO named target -
                   the agent locks the closest visible mob, fights it,
@@ -152,6 +222,21 @@ Goal types you can emit:
                   on). Each kill auto-catalogs the mob's name + spawn
                   area, so future plans CAN use named `farm` goals.
                   Fails if no enemy is in range within ~20s.
+
+  stop_when (farm/engage_nearby) - PICK THE ONE THAT MATCHES THE GOAL:
+    target_level: <int>
+      Completes once the player's main-job level reaches <int>. THE
+      RIGHT CHOICE FOR ANY "reach level X" / "level up to X" / "get
+      to level X" user goal. Don't try to estimate kill_count from
+      XP tables - kill rates and XP-per-kill vary too much by mob
+      tier and check_type, and undershooting just ping-pongs the
+      planner. Use the user's stated target level directly.
+    kill_count: <int>
+      Completes after exactly N kills. Use ONLY for narrow tasks
+      where the kill count itself is the deliverable - "kill 5
+      Yagudo for a quest", "farm 10 Bumblebee Wings" - not for XP.
+    Omit both for indefinite farming (the planner will be re-invoked
+    on zone change or other events). Don't combine; pick one.
   equip           { slot: <str>, item: <str> }
                   put `item` into equipment `slot`. Slot is one of:
                   main, sub, range, ammo, head, body, hands, legs, feet,
@@ -182,7 +267,7 @@ field that appears inside individual composite goals.
     goals = [
       {id:"a", type:"composite", title:"...", state:"pending", subgoals:["b","c"]},
       {id:"b", type:"travel", title:"...", state:"pending", target_zone_name:"..."},
-      {id:"c", type:"engage_nearby", title:"...", state:"pending", stop_when:{kill_count:10}},
+      {id:"c", type:"engage_nearby", title:"...", state:"pending", stop_when:{target_level:10}},
     ]
     roots = ["a"]
 
@@ -219,24 +304,38 @@ Keep trees small. If the user names a single zone, emit a single travel
 leaf - no composite wrapper.
 
 Worked example - user asks "Get to level 4" or "Reach level 10":
-  Roots in priority order: get to a level-appropriate area, then engage.
-  Pick `target_zone_name` from the "Direct neighbors of zone N" block in
-  the world state - those are the zones one zoneline from where the
-  player IS RIGHT NOW. NEVER copy the example zone name verbatim; always
-  resolve against the neighbors block. (E.g. if the player is currently
-  in West Ronfaure, the right neighbor leveling zone is East Ronfaure;
-  if in Bastok Markets, it's North Gustaberg or South Gustaberg.)
-  goals = [
-    {id:"travel_out", type:"travel", title:"Travel to <neighbor zone>",
-     state:"pending", origin:"auto", target_zone_name:"<neighbor zone>"},
-    {id:"farm_lvl",  type:"engage_nearby", title:"Engage low-level mobs",
-     state:"pending", origin:"auto", stop_when:{kill_count:25}, rest_hp_pct:70},
-  ]
-  roots = ["travel_out", "farm_lvl"]
-  Notes: 2 sequential roots, travel BEFORE engage_nearby (need to be in
-  the outdoor zone first), high-ish kill_count for headroom. If the
-  player is ALREADY in a leveling zone (an outdoor zone with low-level
-  mobs), drop the travel leaf and emit just the engage_nearby root.
+  This is interchangeable-value travel (any level-appropriate zone
+  serves equally), so favor the cheapest path. First, decide if you
+  need to travel AT ALL:
+
+  - If CURRENT LOCATION is already an outdoor zone with mobs near
+    the player's level: NO travel leaf. Emit just the engage_nearby
+    root with stop_when.target_level set to the user's target.
+  - If CURRENT LOCATION is a city: emit travel to the cheapest
+    appropriate outdoor zone, picked from the "Direct neighbors of
+    zone N" block (one zoneline away).
+
+  Two-leaf shape (city case only):
+    goals = [
+      {id:"travel_out", type:"travel", title:"Travel to <neighbor zone>",
+       state:"pending", origin:"auto", target_zone_name:"<neighbor zone>"},
+      {id:"farm_lvl",  type:"engage_nearby", title:"Engage low-level mobs",
+       state:"pending", origin:"auto", stop_when:{target_level:10}, rest_hp_pct:70},
+    ]
+    roots = ["travel_out", "farm_lvl"]
+
+  One-leaf shape (already in an outdoor zone — the common case):
+    goals = [
+      {id:"farm_lvl",  type:"engage_nearby", title:"Engage low-level mobs",
+       state:"pending", origin:"auto", stop_when:{target_level:10}, rest_hp_pct:70},
+    ]
+    roots = ["farm_lvl"]
+
+  Notes: stop_when.target_level matches the user's stated target so
+  the leaf doesn't auto-complete mid-grind, looping the planner.
+  Resist the urge to add a travel leaf "for a better camp" - if the
+  current outdoor zone has mobs at the player's level (it almost
+  always does), staying is the right call.
 
 # Replanning - preserve in-flight work
 
@@ -271,12 +370,12 @@ the world-state will show empty entity lists for most zones. That is
 expected, NOT a blocker. Use your training-data FFXI knowledge to fill
 the gap:
 
-  - In a starter city with no observed mobs, leave by the appropriate
-    gate to the surrounding outdoor zone. Bastok -> North/South Gustaberg
-    or Zeruhn Mines. Sandy -> East/West Ronfaure. Windy -> East/West
-    Sarutabaruta. Jeuno -> any of the surrounding fields. Selbina ->
-    Valkurm Dunes. The travel layer handles cross-zone routing - you
-    just emit `travel { target_zone: <id> }`.
+  - In a city with no observed mobs, leave by an adjacent zoneline to
+    a leveling outdoor zone. The "Direct neighbors of zone N" block
+    in the world state is the AUTHORITATIVE list of zones one
+    transition away - pick from there. Do NOT pick a zone on the
+    other side of Vana'diel because it's famous - the travel layer
+    will path through every intervening zone, taking minutes.
   - You pass zone NAMES in travel goals (`target_zone_name`), not ids.
     The planner resolves the name against the catalog. The "Direct
     neighbors of zone N" block lists names that are one zoneline away;
@@ -301,8 +400,8 @@ named `farm` goals once the catalog has built up.
 
 Default pattern for "level up in an unknown zone":
   1. travel to an appropriate outdoor zone (general FFXI knowledge)
-  2. engage_nearby with stop_when.kill_count high enough to make real
-     XP progress (15-30 typical for early levels)
+  2. engage_nearby with stop_when.target_level set to the user's
+     stated target level (NOT a kill_count - see stop_when section).
   3. Once a future plan call shows specific mob names you've cataloged,
      you can refine to named `farm` goals if you want to focus on a
      particular spawn area or mob type.
@@ -458,7 +557,10 @@ UPDATE_GOALS_TOOL = {
                             'target_name': {'type': 'string'},
                             'stop_when': {
                                 'type': 'object',
-                                'properties': {'kill_count': {'type': 'integer'}},
+                                'properties': {
+                                    'kill_count':   {'type': 'integer'},
+                                    'target_level': {'type': 'integer'},
+                                },
                             },
                             'rest_hp_pct': {'type': 'integer'},
                             'slot': {
@@ -785,7 +887,12 @@ class Planner:
             f'  {zid:>3}  {name}' for zid, name in sorted(zone_names.items())
         )
         return (
-            f'Current location: {cur_zone_name} (zone id {snap.zone_id})\n'
+            f'>>> CURRENT LOCATION: {cur_zone_name} '
+            f'(zone id {snap.zone_id}) <<<\n'
+            f'(this is the LITERAL zone the agent is standing in right '
+            f'now - not a nearby zone, not a similar-sounding one, not '
+            f'a famous zone you remember; the rationale and any '
+            f'"farm in place" claim MUST refer to this exact zone)\n'
             f'Position:         ({snap.x}, {snap.y}, {snap.z})\n'
             f'Moving:       {snap.moving}\n'
             f'\n{self._self_text()}'
@@ -853,28 +960,45 @@ class Planner:
         18: 'PUP', 19: 'DNC', 20: 'SCH', 21: 'GEO', 22: 'RUN',
     }
 
-    def _read_self_state(self) -> dict[str, Any] | None:
-        """Read combat.json's `self` block, with last-known-good caching
-        for transient "not loaded yet" windows (zoning, fresh login).
-        During those windows the addon publishes main_job=0 (NON) and
-        main_job_lvl=0; planning against that produces nonsense like
-        "NON0 in <zone>". We cache the most recent valid read on
-        self._cached_self and fall back to it when the live read
-        looks stale.
+    # Reject snapshots older than this when gating plan calls. Long
+    # enough that a busy poll loop doesn't false-trip; short enough
+    # that we catch post-respawn / post-zone "addons paused publishing"
+    # windows where the file shows pre-event state.
+    SNAPSHOT_FRESH_S = 5.0
 
-        Returns None if we have neither a fresh read nor a cache."""
+    def _is_path_fresh(self, path: Path) -> bool:
+        try:
+            mtime = path.stat().st_mtime
+        except (OSError, FileNotFoundError):
+            return False
+        return (time.time() - mtime) <= self.SNAPSHOT_FRESH_S
+
+    def _read_self_state(self) -> dict[str, Any] | None:
+        """Read combat.json's `self` block, with two staleness guards:
+
+        1. mtime check - if the file hasn't been written within
+           SNAPSHOT_FRESH_S, treat as not-published (post-zone /
+           post-respawn windows where the addon hasn't caught up yet
+           often have multi-second-old combat.json showing pre-event
+           HP / zone, which would feed bad data into the plan).
+        2. content check - main_job > 0 AND main_job_lvl > 0. The
+           addon transiently publishes main_job=0 (NON) during zoning
+           and character select.
+
+        Falls back to the last-known-good cached value if the current
+        read fails either guard. Returns None if we have neither a
+        fresh read nor a cache."""
         path = self.cfg.paths.state_dir(self.cfg.character) / 'combat.json'
         s: dict[str, Any] | None = None
-        if path.exists():
+        # Don't even read the file if mtime says it's stale - the
+        # data inside would be untrustworthy regardless of content.
+        if path.exists() and self._is_path_fresh(path):
             try:
                 with open(path) as f:
                     d = json.load(f)
                 s = d.get('self') or {}
             except (OSError, json.JSONDecodeError):
                 s = None
-        # "Loaded" heuristic: a real character has a non-zero main_job
-        # AND non-zero main_job_lvl. Either being 0 means we caught a
-        # transient window (zoning, login, character select).
         loaded = (
             isinstance(s, dict)
             and (s.get('main_job') or 0) > 0
@@ -886,10 +1010,21 @@ class Planner:
         return getattr(self, '_cached_self', None)
 
     def has_valid_self(self) -> bool:
-        """True when we can plan with confidence. Used to gate planner
-        firings - returning False means the caller should skip this
-        cycle and retry after the addon has published valid state."""
-        return self._read_self_state() is not None
+        """True when we can plan with confidence. Returns False if
+        either combat.json OR nav_status.json is stale (post-zone /
+        post-respawn window where addons paused publishing) - planning
+        against stale data produced "in East Ronfaure, need to recover
+        HP" while actually in Bastok at full HP."""
+        # combat.json freshness is enforced inside _read_self_state.
+        if self._read_self_state() is None:
+            return False
+        # nav_status.json carries the zone_id + position the rationale
+        # needs. Stale = "recently zoned, addon still publishing prior
+        # zone" = wrong zone in plan.
+        nav_path = self.cfg.paths.ipc_base / 'nav_status.json'
+        if not self._is_path_fresh(nav_path):
+            return False
+        return True
 
     def _self_text(self) -> str:
         """Render job/level/HP for the planner prompt. Falls back to
@@ -986,6 +1121,7 @@ class Planner:
 
     _VALID_GOAL_TYPES = {
         'composite', 'travel', 'goto', 'farm', 'engage_nearby', 'equip', 'wait',
+        'interact_npc',
     }
 
     def _flatten_nested_subgoals(self, goals_in: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1024,6 +1160,52 @@ class Planner:
             visit(g)
         return flat
 
+    # Zones with no engageable mobs - cities, residential areas, port
+    # towns. If a plan includes a travel goal to one of these AND an
+    # engage_nearby/farm leaf, the farm leaf would fail immediately on
+    # arrival. We reject the whole plan and force a replan rather than
+    # commit and burn a goal cycle.
+    _CITY_ZONE_NAMES = frozenset(name.lower() for name in [
+        'Bastok Markets', 'Bastok Mines',
+        'Northern San d\'Oria', 'Southern San d\'Oria', 'Port San d\'Oria',
+        'Windurst Walls', 'Windurst Waters', 'Windurst Woods', 'Port Windurst',
+        'Lower Jeuno', 'Upper Jeuno', 'Port Jeuno', 'Ru\'Lude Gardens',
+        'Tavnazian Safehold',
+        'Selbina', 'Mhaura', 'Norg', 'Kazham',
+        'Rabao', 'Aht Urhgan Whitegate',  # the latter is era-filtered
+                                          # but harmless to keep listed
+    ])
+
+    def _validate_no_city_farm(self, goals_list: list[dict[str, Any]],
+                                roots: list[str]) -> bool:
+        """Reject plans that pair travel-to-city with farm/engage_nearby.
+        Cities have no mobs - the farm leaf would activate on arrival
+        and fail. Returns True if the plan is valid (or doesn't have
+        the conflict), False if rejected."""
+        nodes = {n.get('id'): n for n in goals_list if n.get('id')}
+        # Find any farm/engage_nearby leaves in the plan.
+        farm_ids = [
+            n['id'] for n in goals_list
+            if n.get('type') in ('farm', 'engage_nearby') and n.get('id')
+        ]
+        if not farm_ids:
+            return True
+        # Find any travel leaves whose target_zone_name is a city.
+        bad_travels: list[str] = []
+        for n in goals_list:
+            if n.get('type') != 'travel':
+                continue
+            tname = (n.get('target_zone_name') or '').strip().lower()
+            if tname and tname in self._CITY_ZONE_NAMES:
+                bad_travels.append(f'{n.get("id")}->{n.get("target_zone_name")}')
+        if not bad_travels:
+            return True
+        print(f'  planner: REJECTED plan - travel(s) to city zone '
+              f'{bad_travels} alongside farm/engage_nearby leaves '
+              f'{farm_ids}. Cities have no mobs; the farm leaf would '
+              f'fail on arrival. Forcing replan.')
+        return False
+
     def _apply_goals(self, args: dict[str, Any], zone_names: dict[int, str]) -> bool:
         goals_list = args.get('goals') or []
         roots = args.get('roots') or []
@@ -1037,6 +1219,14 @@ class Planner:
         # and normalize here so the goal manager only ever sees the flat
         # form it expects (subgoals = [string, string, ...]).
         goals_list = self._flatten_nested_subgoals(goals_list)
+        # Hard server-side rejection: travel-to-city followed by
+        # engage_nearby/farm. Cities have no engageable mobs, so the
+        # farm leaf would activate after travel completes and immediately
+        # fail. The system prompt has rules against this but small models
+        # ignore them often enough to need a hard validator. Force a
+        # replan rather than commit a broken plan.
+        if not self._validate_no_city_farm(goals_list, roots):
+            return False
         # Build a name -> id lookup once. Case-insensitive match; falls
         # back to substring match (so the LLM can write "Gustaberg"
         # and we resolve to the unique full name if there is one).
@@ -1341,7 +1531,8 @@ class Planner:
         # The caller (poll_user_goal_file / poll_idle_replan / etc.)
         # will retry on the next tick once valid state lands.
         if not self.has_valid_self():
-            print('  planner: self-state not yet loaded; deferring plan.')
+            print('  planner: snapshot stale or self-state not loaded; '
+                  'deferring plan (addons probably mid-zone or post-respawn).')
             return False
 
         """Send the user instruction + world state to the LLM. Apply
@@ -1350,6 +1541,12 @@ class Planner:
         if not self.llm.available:
             print('  planner: LLM unavailable; skipping.')
             return False
+
+        # In-game heads-up: a plan call is 60-90s on the deliberative
+        # tier (research phase + plan phase). Without this echo the
+        # screen sits silent and someone watching has no way to know
+        # the agent isn't just stuck. Templated, instant - no LLM.
+        _echo.to_chat(self.cfg, 'thinking', 'Reflecting and planning...')
 
         ws = self._world_state_text(zone_names)
         # Research first - gives the LLM era-correct facts to plan

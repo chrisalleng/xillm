@@ -63,7 +63,7 @@ local function get_data_path()
     local ok, p = pcall(function() return AshitaCore:GetInstallPath() end)
     if ok and p then
         if p:sub(-1) ~= '/' and p:sub(-1) ~= '\\' then p = p .. '/' end
-        return p .. 'config/addons/nav/'
+        return p .. 'config/xillm/'
     end
     return ''
 end

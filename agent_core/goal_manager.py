@@ -75,6 +75,7 @@ class GoalManager:
         snapshot_provider: Callable[[], _Snapshot],
         farming_director: Any | None = None,
         issue_command: Callable[[str], None] | None = None,
+        interact_director: Any | None = None,
     ):
         self.cfg = cfg
         self._dispatch = dispatch_goto
@@ -83,6 +84,10 @@ class GoalManager:
         # than going through nav_request.json. None disables `equip`
         # (those leaves immediately complete as no-ops).
         self._issue_command = issue_command
+        # Interact director: state machine for interact_npc / vendor_*
+        # / home_point leaves. Optional for the same reason farming
+        # is optional - older configs without the addon shouldn't wedge.
+        self.interact_director = interact_director
         self._goals_path = cfg.paths.persistent_dir(cfg.character) / 'goals.json'
         self.goals = _persistence.Goals.load(self._goals_path)
         # Per-leaf bookkeeping for redispatch decisions:
@@ -220,6 +225,13 @@ class GoalManager:
                 # The farming director marks itself completed when the
                 # `stop_when` directive fires (e.g. kill_count reached).
                 return self.farming is not None and self.farming.is_done()
+            if t == 'interact_npc':
+                # The interact director runs the dialog state machine
+                # and marks itself completed/failed when the menu
+                # closes (or the completion clause matches). Same
+                # contract as farming.is_done().
+                return (self.interact_director is not None
+                        and self.interact_director.is_done())
             if t == 'equip':
                 # Done when the next inventory snapshot reflects the
                 # /equip we issued. equipped[slot] either (a) hasn't
@@ -307,6 +319,17 @@ class GoalManager:
                 self._last_dispatch[gid] = now
                 self._dispatched_zone[gid] = snap.zone_id
             return
+        if t == 'interact_npc':
+            # Single hand-off to the interact director; same contract
+            # as farming. The director walks the dialog script and
+            # marks done when the menu closes / completion fires.
+            if not self._should_dispatch(gid, snap, now):
+                return
+            if self.interact_director is not None:
+                self.interact_director.start(leaf)
+                self._last_dispatch[gid] = now
+                self._dispatched_zone[gid] = snap.zone_id
+            return
         if not self._should_dispatch(gid, snap, now):
             return
         if t == 'travel':
@@ -370,6 +393,12 @@ class GoalManager:
             # firing after the goal tree was cleared.
             if self.farming is not None and self.farming.is_active():
                 self.farming.stop()
+            # Same for interact - leaving a half-walked menu open in
+            # the client blocks all future input, so close it on
+            # leaf-clear.
+            if self.interact_director is not None \
+                    and self.interact_director.is_active():
+                self.interact_director.stop()
             return
         leaf = self._node(leaf_id)
         if leaf is None:
@@ -385,6 +414,13 @@ class GoalManager:
         if leaf.get('type') in ('farm', 'engage_nearby') \
                 and self.farming is not None and self.farming.is_active():
             self.farming.tick()
+        # Same pattern for the interact director - tick before checking
+        # completion so a freshly-closed menu transitions to completed
+        # this same tick rather than next.
+        if leaf.get('type') == 'interact_npc' \
+                and self.interact_director is not None \
+                and self.interact_director.is_active():
+            self.interact_director.tick()
         if self._is_complete(leaf, snap):
             # Distinguish completed vs failed for farm leaves so death
             # (FarmingDirector -> 'failed') doesn't masquerade as success.
@@ -393,6 +429,9 @@ class GoalManager:
             terminal = 'completed'
             if leaf.get('type') in ('farm', 'engage_nearby') and self.farming is not None \
                     and getattr(self.farming, 'state', None) == 'failed':
+                terminal = 'failed'
+            if leaf.get('type') == 'interact_npc' and self.interact_director is not None \
+                    and getattr(self.interact_director, 'state', None) == 'failed':
                 terminal = 'failed'
             leaf['state'] = terminal
             self._last_dispatch.pop(leaf_id, None)

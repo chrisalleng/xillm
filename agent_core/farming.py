@@ -262,6 +262,11 @@ class FarmingDirector:
         # signal than hp_remaining_pct because it isolates damage from
         # this specific fight rather than rolling resting HP into it.
         self._engage_start_hp_pct: float | None = None
+        # check_type the locked mob had at engage entry (relative to
+        # player level at that moment). Recorded into fight_history on
+        # kill/death so we can aggregate "deaths to Even-Match mobs"
+        # at this level via tier_summary().
+        self._engage_check_type: int | None = None
         # Wall-clock of the last /heal we issued. Used by _start_resting
         # to drop redundant toggle attempts within HEAL_TOGGLE_GAP_S.
         self._last_heal_at: float = 0.0
@@ -488,6 +493,7 @@ class FarmingDirector:
         # engage->killed transition.
         if new_state == 'engage':
             self._engage_start_hp_pct = None
+            self._engage_check_type = None
         # Discard any leftover rest-judgment rid when leaving the
         # judging_rest state - without this, a stale rid could resolve
         # later and confuse a subsequent post-kill cycle.
@@ -505,8 +511,30 @@ class FarmingDirector:
         )
 
     def _stop_when_satisfied(self) -> bool:
+        """Did the leaf's stop condition fire? Supports either:
+
+          stop_when.target_level - completes once snap.self_lvl >= N.
+            The right choice for "reach level X" user goals - a fixed
+            kill_count almost always under- or over-shoots the actual
+            XP needed, leading to either hand-offs back to the planner
+            mid-level or wasted kills past the target.
+
+          stop_when.kill_count - completes after N kills, regardless
+            of XP gained. Use for narrow tasks like "kill 5 Yagudo
+            for the quest" where XP is incidental.
+
+        If both are present, EITHER one firing completes the leaf
+        (target_level is the primary; kill_count is a safety cap so
+        a stalled XP curve doesn't loop forever). If neither is
+        present, the leaf never auto-completes - the planner can do
+        that on purpose for indefinite engage_nearby goals.
+        """
         d = self.directive or {}
         sw = d.get('stop_when') or {}
+        tl = sw.get('target_level')
+        if isinstance(tl, (int, float)) and self._last_known_level is not None \
+                and self._last_known_level >= int(tl):
+            return True
         kc = sw.get('kill_count')
         if isinstance(kc, (int, float)) and self.kills >= kc:
             return True
@@ -548,11 +576,20 @@ class FarmingDirector:
         # player is dead we MUST stop firing combat commands. Without
         # this, /attack on retries spam the chat log forever, and the
         # acquire/engage timeouts try to re-engage a dead character.
-        # Status 2/3 = dead in standard Ashita; raw HP=0 is the backup
-        # signal because hp_pct is unreliable when hp_max reads 0.
+        #
+        # Status alone is the authoritative death signal:
+        #   2 = dead-pending-menu, 3 = dead/lying down post-menu.
+        # The old `(hp==0 AND status NOT in {None,1})` backup was meant
+        # to catch hp=0 cases where hp_max=0 made hp_pct unreliable, but
+        # it also fired during the post-zone load-in window where the
+        # addon momentarily publishes (hp=0, status=0) while the player
+        # entity hasn't fully spawned yet. That false-positive marked
+        # the farm goal as failed the instant we zoned in. Restricting
+        # the backup to "hp=0 AND status is also a death code" keeps
+        # the hp_max=0 case covered without the load-in false positive.
         is_dead = (
             (snap.self_status in (2, 3))
-            or (snap.self_hp == 0 and snap.self_status not in (None, 1))
+            or (snap.self_hp == 0 and snap.self_status in (2, 3))
         )
         if is_dead:
             if self.state != 'failed':
@@ -573,6 +610,7 @@ class FarmingDirector:
                         self.cfg, snap.zone_id, died_to,
                         player_level=snap.self_lvl,
                         damage_taken_pct=dmg,
+                        check_type=self._engage_check_type,
                     )
                 _events.append(
                     self.cfg.paths.events_file(),
@@ -583,6 +621,30 @@ class FarmingDirector:
                     kills_at_death=self.kills,
                     died_to=died_to,
                 )
+                # First-person reflection echo. Templated rather than
+                # LLM-generated because death is a moment for fast
+                # observability, not a 10s deliberative call. Uses the
+                # mob name + (if known) prior death history to give the
+                # echo some weight.
+                if died_to:
+                    prior_deaths = 0
+                    try:
+                        if snap.zone_id is not None and snap.self_lvl is not None:
+                            h = _fight_history.summary(
+                                self.cfg, snap.zone_id, died_to, snap.self_lvl,
+                            )
+                            prior_deaths = int(h.get('death_count') or 0)
+                    except Exception:
+                        pass
+                    if prior_deaths > 1:  # this death is now >=2 incl current
+                        msg = (f"Killed by {died_to} again. "
+                               f"They keep wrecking me at this level.")
+                    else:
+                        msg = (f"Killed by {died_to}. "
+                               f"Going to be more careful with these.")
+                else:
+                    msg = "Died. Not sure exactly what got me."
+                _echo.to_chat(self.cfg, 'died', msg)
                 self._enter('failed')
             return
 
@@ -770,9 +832,17 @@ class FarmingDirector:
         rid = self._engage_judge_rid
         if rid is None:
             history = {}
+            tier_history = {}
             if snap.zone_id is not None:
                 history = _fight_history.summary(
                     self.cfg, snap.zone_id, name, plvl,
+                )
+                # Aggregate by check_type at this level so the judge
+                # generalizes "I died to Even-Match mobs at level 6"
+                # across all mobs of that con tier - even ones we
+                # haven't personally fought yet.
+                tier_history = _fight_history.tier_summary(
+                    self.cfg, snap.zone_id, locked.get('check_type'), plvl,
                 )
             mob = {
                 'name':       name,
@@ -796,6 +866,7 @@ class FarmingDirector:
             }
             new_rid = ej.request(
                 mob, player, self._read_user_goal_text(), history,
+                tier_history=tier_history,
             )
             if new_rid is None:
                 v = self._fallback_verdict(ct)
@@ -1148,6 +1219,15 @@ class FarmingDirector:
         # _enter() since re-entering engage is a new fight.
         if self._engage_start_hp_pct is None and snap.self_hp_pct is not None:
             self._engage_start_hp_pct = float(snap.self_hp_pct)
+        # Capture the locked mob's check_type at engage entry so
+        # fight_history can aggregate by difficulty tier on kill/death.
+        if self._engage_check_type is None:
+            for cand in (snap.nearby_enemies or []):
+                if cand.get('server_id') == snap.target_server_id:
+                    ct = cand.get('check_type')
+                    if isinstance(ct, int):
+                        self._engage_check_type = ct
+                    break
 
         d = snap.target_distance
         if d is None:
@@ -1172,8 +1252,12 @@ class FarmingDirector:
 
         # In attack range: fire /attack on (retried every
         # ATTACK_RETRY_S to handle the weapon-delay "must wait longer"
-        # rejection). Don't stop nav here - it'll keep tracking.
-        if d <= MELEE_DISTANCE_Y:
+        # rejection). Once snap.engaged flips true the server has
+        # accepted the attack and we're swinging - re-issuing only
+        # produces "must wait longer" spam, even if claim hasn't
+        # propagated yet. Engaged is the right signal here; claim
+        # gates the OUTER /nav stop, not the /attack on retry.
+        if d <= MELEE_DISTANCE_Y and not snap.engaged:
             if snap.self_status == 33:
                 # Still sitting from a prior rest - stand up first.
                 if now - self._last_heal_at >= HEAL_TOGGLE_GAP_S:
@@ -1236,6 +1320,7 @@ class FarmingDirector:
                     player_level=snap.self_lvl,
                     hp_remaining_pct=snap.self_hp_pct,
                     damage_taken_pct=dmg,
+                    check_type=self._engage_check_type,
                 )
             _events.append(
                 self.cfg.paths.events_file(),

@@ -4,7 +4,7 @@
 * Ashita v4 addon that publishes the inventory slice of the agent's
 * world state. Reads every container the player has access to from
 * the IInventory memory struct, atomically writes:
-*    <install>/config/addons/nav/state/<char>/inventory.json
+*    <install>/config/xillm/state/<char>/inventory.json
 * every ~2s. The orchestrator diffs successive snapshots to detect
 * item-received events (drops, vendor purchases, mog wardrobe pulls).
 *
@@ -84,7 +84,7 @@ local function get_data_path()
     local ok, p = pcall(function() return AshitaCore:GetInstallPath() end)
     if ok and p then
         if p:sub(-1) ~= '/' and p:sub(-1) ~= '\\' then p = p .. '/' end
-        return p .. 'config/addons/nav/'
+        return p .. 'config/xillm/'
     end
     return ''
 end

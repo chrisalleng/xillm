@@ -32,7 +32,7 @@ COLLISION_DIR = SCRIPT_DIR.parent / 'nav' / 'data' / 'collision'
 OBSTACLE_DIR = SCRIPT_DIR.parent / 'nav' / 'data' / 'obstacles'
 DROPOFF_DIR = SCRIPT_DIR.parent / 'nav' / 'data' / 'dropoffs'
 TRANSITIONS_FILE = SCRIPT_DIR.parent / 'nav' / 'data' / 'zone_transitions.json'
-IPC_DIR = Path('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/nav')
+IPC_DIR = Path('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/xillm')
 REQUEST_FILE = IPC_DIR / 'nav_request.json'
 PATH_FILE = IPC_DIR / 'nav_path.json'
 POLL_INTERVAL = 0.1
@@ -77,6 +77,9 @@ class NavServer:
         from . import dashboard as _dashboard
         from . import engage_judge as _engage_judge
         from . import farming as _farming
+        from . import interact as _interact
+        from . import interact_director as _interact_director
+        from . import menu_judge as _menu_judge
         from . import rest_judge as _rest_judge
         from . import gambits as _gambits
         from . import goal_manager as _gm
@@ -101,6 +104,30 @@ class NavServer:
             print(f'  dashboard: not started: {e}')
         self.engage_judge = _engage_judge.EngageJudge(self.cfg, self.llm)
         self.rest_judge = _rest_judge.RestJudge(self.cfg, self.llm)
+        # Interact driver: read state/<char>/menu.json, write
+        # commands/<char>/interact.json. The orchestrator threads this
+        # into the goal manager (interact_npc / vendor_* / home_point
+        # dispatchers) and the death_recovery watcher. Stateless beyond
+        # a seq counter so it's safe to share across consumers.
+        self.interact = _interact.InteractDriver(self.cfg)
+        # Reactive-tier LLM fallback for menu choices the script
+        # can't resolve. Same rid-based fire/poll surface as
+        # EngageJudge - the InteractDirector consumes via status/
+        # discard.
+        self.menu_judge = _menu_judge.MenuJudge(self.cfg, self.llm)
+        # Interact director - state machine for interact_npc leaves.
+        # Reads the user goal from disk so the menu_judge has full
+        # context for fallback decisions; reuses the goal manager's
+        # snapshot provider so we don't double-read nav state.
+        self.interact_director = _interact_director.InteractDirector(
+            cfg=self.cfg,
+            interact=self.interact,
+            menu_judge=self.menu_judge,
+            player_snapshot_provider=self._read_player_snapshot,
+            dispatch_goto=self.handle_request,
+            issue_command=self._issue_command,
+            user_goal_provider=self._read_user_goal,
+        )
         self.farming = _farming.FarmingDirector(
             cfg=self.cfg,
             snapshot_provider=self._read_combat_snapshot,
@@ -131,6 +158,7 @@ class NavServer:
             snapshot_provider=self._read_player_snapshot,
             farming_director=self.farming,
             issue_command=self._issue_command,
+            interact_director=self.interact_director,
         )
         self.planner = _planner.Planner(
             self.cfg, self.llm, self.goal_manager,
@@ -161,6 +189,17 @@ class NavServer:
                 self._user_goal_mtime = ugf.stat().st_mtime
             except OSError:
                 pass
+
+    def _read_user_goal(self) -> str:
+        """Return the current user_goal.txt contents (stripped). Empty
+        string when the file is missing/blank/unreadable. Used by the
+        menu_judge so it has the player's stated intent as context for
+        falling-through dialog choices."""
+        try:
+            return self.cfg.paths.user_goal_file().read_text(
+                encoding='utf-8', errors='replace').strip()
+        except (FileNotFoundError, OSError):
+            return ''
 
     # Maximum age (seconds) before a state file is treated as ghost
     # data. Addons publish at 5-10 Hz when the client is running; if
@@ -1341,15 +1380,28 @@ class NavServer:
         gm = self.goal_manager
         if gm._active_leaf_id is not None:
             return  # something is still running
+        # Empty goals tree: only skip if user_goal is ALSO empty
+        # (legitimate "stop everything"). If user_goal has text but
+        # the tree is empty, we got stranded - probably a /goals
+        # refresh that cleared goals then had its plan call die
+        # (process restart, LLM error, etc). Fire a fresh plan so
+        # the agent recovers instead of sitting idle forever.
         if not gm.goals.roots:
-            return  # tree was explicitly cleared (empty user_goal); no replan
-        # Every root must be in a terminal state for this to count as
-        # "all done." Pending or active anywhere -> not idle.
-        terminal = ('completed', 'failed', 'abandoned')
-        for rid in gm.goals.roots:
-            node = gm._node(rid)
-            if node is None or node.get('state', 'pending') not in terminal:
+            ugf_path = self.cfg.paths.user_goal_file()
+            try:
+                if not ugf_path.exists() or not ugf_path.read_text(
+                        encoding='utf-8', errors='replace').strip():
+                    return
+            except OSError:
                 return
+            # Fall through to replan with non-empty user_goal.
+        else:
+            # Tree exists - all roots must be terminal for "idle".
+            terminal = ('completed', 'failed', 'abandoned')
+            for rid in gm.goals.roots:
+                node = gm._node(rid)
+                if node is None or node.get('state', 'pending') not in terminal:
+                    return
         now = time.time()
         if now - getattr(self, '_last_idle_replan_ts', 0.0) < self.IDLE_REPLAN_COOLDOWN_S:
             return

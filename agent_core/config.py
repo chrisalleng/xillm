@@ -24,8 +24,13 @@ else:  # pragma: no cover - 3.10 fallback only
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Shared IPC root. Was previously `config/addons/nav/` - the legacy
+# layout had every addon's state living inside the nav addon's
+# config directory, which made the nav addon a kitchen-sink for
+# unrelated features. Renamed to `config/xillm/` 2026-04-30 so the
+# IPC layer is no longer pinned to one addon's identity.
 DEFAULT_ASHITA_BASE = Path(
-    '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/nav'
+    '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/xillm'
 )
 
 

@@ -4,7 +4,7 @@
 * Ashita v4 addon that publishes the combat slice of the agent's
 * world state. Reads player + target + party data from the Ashita
 * memory manager every N frames, atomically writes
-* `<install>/config/addons/nav/state/<char>/combat.json` so the
+* `<install>/config/xillm/state/<char>/combat.json` so the
 * Python orchestrator (agent_core) can build a combat-aware world
 * model. (The IPC directory still lives under nav/ for now -
 * unification under config/addons/agent/ comes with Phase 1b.)
@@ -42,7 +42,7 @@ local function get_data_path()
     local ok, p = pcall(function() return AshitaCore:GetInstallPath() end)
     if ok and p then
         if p:sub(-1) ~= '/' and p:sub(-1) ~= '\\' then p = p .. '/' end
-        return p .. 'config/addons/nav/'
+        return p .. 'config/xillm/'
     end
     return ''
 end

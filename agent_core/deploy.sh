@@ -1,16 +1,18 @@
 #!/bin/bash
 # Deploy all agent addons + restart agent_core + reload them.
 ASHITA=/home/chris/Faugus/xillm/drive_c/Ashita-v4beta
+# Shared IPC root (was config/addons/nav/ until 2026-04-30, when state
+# was factored out from under the nav addon's directory).
+IPC=$ASHITA/config/xillm
 
-# nav addon (legacy IPC under config/addons/nav/)
-mkdir -p $ASHITA/addons/nav $ASHITA/config/addons/nav/instances $ASHITA/config/addons/nav/dropoffs
+# nav addon (IPC under config/xillm/)
+mkdir -p $ASHITA/addons/nav $IPC/instances $IPC/dropoffs
 cp /home/chris/workspace/xillm/nav/nav.lua       $ASHITA/addons/nav/
 cp /home/chris/workspace/xillm/nav/entities.lua  $ASHITA/addons/nav/
-cp /home/chris/workspace/xillm/nav/data/instances/*.json $ASHITA/config/addons/nav/instances/ 2>/dev/null
-cp /home/chris/workspace/xillm/nav/data/dropoffs/*.json  $ASHITA/config/addons/nav/dropoffs/  2>/dev/null
+cp /home/chris/workspace/xillm/nav/data/instances/*.json $IPC/instances/ 2>/dev/null
+cp /home/chris/workspace/xillm/nav/data/dropoffs/*.json  $IPC/dropoffs/  2>/dev/null
 
-# combat addon (publishes to config/addons/nav/state/<char>/ for now;
-# moves to config/addons/agent/ when Phase 1b unifies the IPC layout)
+# combat addon (publishes to config/xillm/state/<char>/)
 mkdir -p $ASHITA/addons/combat
 cp /home/chris/workspace/xillm/combat/combat.lua $ASHITA/addons/combat/
 
@@ -28,6 +30,14 @@ cp /home/chris/workspace/xillm/inventory/inventory.lua $ASHITA/addons/inventory/
 mkdir -p $ASHITA/addons/goals
 cp /home/chris/workspace/xillm/goals/goals.lua $ASHITA/addons/goals/
 
+# interact addon: bridges agent_core to NPC dialog / vendor / trade
+# menus. Publishes state/<char>/menu.json, drains commands/<char>/
+# interact.json. Phase A scaffold; advance_text works via stepdialog
+# pattern (TkEventMsg2 key injection), select_option / buy / sell
+# stubbed until packet structures are verified in-game.
+mkdir -p $ASHITA/addons/interact
+cp /home/chris/workspace/xillm/interact/interact.lua $ASHITA/addons/interact/
+
 # cmdrelay (relays cmd_inbox.txt lines as /commands inside Ashita).
 # Kept under our deployment so we can fix bugs in it without manual
 # copies. Reloaded BEFORE issuing any other commands below so the
@@ -42,7 +52,7 @@ cp /home/chris/workspace/xillm/cmdrelay/cmdrelay.lua $ASHITA/addons/cmdrelay/
 # long enough for the next poll (30 frames @ 60fps = 0.5s; we use 2s
 # to absorb timing jitter), then queueing the rest in one shot which
 # v1.1 will drain in a single poll.
-echo '/addon reload cmdrelay' > $ASHITA/config/addons/nav/cmd_inbox.txt
+echo '/addon reload cmdrelay' > $IPC/cmd_inbox.txt
 sleep 2
 {
     echo '/addon reload nav'
@@ -54,5 +64,7 @@ sleep 2
     echo '/addon reload inventory'
     echo '/addon load goals'
     echo '/addon reload goals'
-} > $ASHITA/config/addons/nav/cmd_inbox.txt
+    echo '/addon load interact'
+    echo '/addon reload interact'
+} > $IPC/cmd_inbox.txt
 echo "Deployed and reloaded."

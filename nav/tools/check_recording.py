@@ -5,7 +5,7 @@ agent_core's Recast navmesh thinks about those same positions.
 
 Usage:
     python3 check_recording.py                 # reads nav_record.json from
-                                                # the default config/addons/nav/ path
+                                                # the default config/xillm/ path
     python3 check_recording.py <path>          # explicit recording file
 
 For each recorded player sample, reports:
@@ -33,7 +33,7 @@ import navmesh  # noqa: E402
 import main as server_mod  # noqa: E402
 
 DEFAULT_RECORD = Path(
-    '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/addons/nav/nav_record.json')
+    '/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/config/xillm/nav_record.json')
 # Samples farther than this from ANY poly center are "far" — poly centers
 # can legitimately be 5-10y from an interior point, so tune high.
 OFF_MESH_THRESHOLD_Y = 15.0

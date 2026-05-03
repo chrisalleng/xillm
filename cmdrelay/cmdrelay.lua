@@ -4,7 +4,7 @@
 * Polls cmd_inbox.txt every 30 frames and executes any command found.
 * Runs independently of nav so it can reload nav after a crash.
 *
-* Inbox file: <ashita>/config/addons/nav/cmd_inbox.txt
+* Inbox file: <ashita>/config/xillm/cmd_inbox.txt
 --]]
 
 addon.name    = 'cmdrelay'
@@ -29,7 +29,7 @@ local function inbox_path()
     if base ~= '' and base:sub(-1) ~= '/' and base:sub(-1) ~= '\\' then
         base = base .. '/'
     end
-    return base .. 'config/addons/nav/cmd_inbox.txt'
+    return base .. 'config/xillm/cmd_inbox.txt'
 end
 
 local function poll()

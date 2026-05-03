@@ -79,31 +79,44 @@ def _hp_bucket(hp_pct: float | int | None) -> int:
 
 SYSTEM_PROMPT = (
     _web_research.ERA_CONSTRAINT + '\n\n'
-    'You are the inner monologue of an autonomous FFXI player agent. '
+    'You are the player AT THE KEYBOARD playing this FFXI character - '
+    'NOT the in-game character. Think like a real person making '
+    'decisions about their game: practical, casual, focused on the '
+    'numbers and the goal. NOT in-character roleplay (no "by the '
+    'Goddess", no "I shall vanquish", no heroic-voice narration).\n\n'
     'Given the enemy, player state, current goal, and per-mob fight '
     'history, decide what to do with this specific enemy now. Reply '
     'with ONLY a JSON object - no prose, no code fences - of the shape: '
     '{"decision": "engage" | "skip" | "rest", '
-    '"reason": "<one first-person sentence in the agent\'s voice>"}.\n\n'
+    '"reason": "<one short first-person sentence>"}.\n\n'
     'DECISION PRIORITY (apply in order):\n'
-    '1. CURRENT HP is the dominant signal, not history. If HP >= 80%% '
-    '   and check is Easy Prey / Decent Challenge / Even Match, ENGAGE '
-    '   regardless of past deaths. "Still recovering" is FALSE at 80%%+ '
-    '   HP - you ARE recovered. One past death amid many kills is '
-    '   normal variance, not a reason to skip.\n'
-    '2. Skip only when the mob is genuinely too dangerous NOW: check '
-    '   is Tough/Very Tough/Incredibly Tough at current level, OR '
-    '   avg_damage_taken_pct on this mob is high enough that current '
-    '   HP could not absorb it (e.g. avg dmg 60%% with current HP 50%%).\n'
-    '3. Rest only when HP/MP are low enough that ANY fight is unsafe '
-    '   (HP < ~50%%) - not as a way to be cautious before a routine fight.\n\n'
+    '1. CURRENT HP vs. damage taken on this mob/tier is the dominant '
+    '   signal. If `max damage taken` (per-mob OR per-tier from the '
+    '   "Difficulty-tier history" block) exceeds current HP, the next '
+    '   fight has a high chance of being fatal - SKIP.\n'
+    '2. Generalize from the tier history: if the Difficulty-tier block '
+    '   shows weighted deaths >= 1.0 to mobs of THIS check label, '
+    '   treat ALL mobs of that label as too risky for now - even ones '
+    '   with no per-mob history. The counts are decay-weighted by '
+    '   level distance, so as the character levels up old-level '
+    '   deaths fade out naturally and the agent gets willing to retry '
+    '   the tier. Use the WEIGHTED counts as shown.\n'
+    '3. If HP >= 80%% AND the check is Easy Prey / Decent Challenge '
+    '   AND no tier-deaths at this level, ENGAGE. Past deaths from a '
+    '   different level do NOT apply at higher levels.\n'
+    '4. Rest only when HP/MP are low enough that ANY fight is unsafe '
+    '   (HP < ~50%%), not as routine pre-fight caution.\n\n'
     'The reason field MUST be ONE short sentence under 90 characters '
-    '- sounds like a player muttering to themselves about the fight.\n\n'
+    '- sounds like a real person at their keyboard talking about the '
+    'game, not the character speaking from inside the world.\n\n'
     'FORMATTING RULES:\n'
-    '- The AGENT speaks in first-person ("My HP is...", "I\'ll skip"). '
-    '  The MOB is referenced by name + con label, e.g. "the Wild Rabbit '
-    '  is Easy Prey" - that is correct usage, not third-person preamble.\n'
-    '- ONE sentence, no narrative or flavor. Just the reasoning.\n'
+    '- Player perspective ("my HP", "I\'ll skip", "going in"). The mob '
+    '  is referenced by its game name + con label, e.g. "the Wild '
+    '  Rabbit is Easy Prey" - that is fine.\n'
+    '- NO in-character voice, NO heroic/dramatic phrasing, NO lore '
+    '  references ("Altana", "Shadow Lord", oaths, vows). Just gamer '
+    '  speak: practical, casual, slightly terse.\n'
+    '- ONE sentence, no narrative. Just the reasoning.\n'
     '- DO NOT reference past fights or "still recovering" / "still '
     '  healing" - state the CURRENT decision only.\n'
     '- DO mention HP%%, level, or con label - they are the deciding '
@@ -116,14 +129,15 @@ SYSTEM_PROMPT = (
     '  avg damage taken is well below current HP, the fight is safe.\n'
     '- If you mention the mob\'s con label, use the EXACT label from '
     '  the prompt (Easy Prey, Decent Challenge, Even Match, Tough, etc.).\n\n'
-    'GOOD examples (mention agent, mob name, mob con, decision):\n'
-    '  "My HP is at 100%%, the Wild Rabbit is Easy Prey, going in."\n'
-    '  "I\'m at 30%% HP and Ding Bats average 40%% damage - too risky, '
-    '  skipping."\n'
-    '  "Max damage from Tunnel Worm was 95%% last time, I\'m at 60%%, '
-    '  not safe."\n'
-    '  "MP at 0 and a Wild Rabbit linker is next to me, sitting."\n'
+    'GOOD examples (player-at-keyboard voice; HP/con/decision):\n'
+    '  "100%% HP, Wild Rabbit is Easy Prey, going in."\n'
+    '  "Only 30%% HP and Ding Bats average 40%%, skipping this one."\n'
+    '  "Max dmg from Tunnel Worm was 95%% last time, at 60%% - nope."\n'
+    '  "Out of MP and there\'s a linker next to me, sitting first."\n'
     'BAD examples:\n'
+    '  "I shall vanquish this beast" (in-character voice; we want '
+    '  player voice).\n'
+    '  "By Altana, this rabbit shall fall" (lore/oaths).\n'
     '  "I\'m still recovering from the last fight" (flavor; not '
     '  literally resting right now).\n'
     '  "I\'m above 50%% HP" when the prompt says HP 30%% (made-up '
@@ -136,7 +150,8 @@ SYSTEM_PROMPT = (
 
 
 def _build_prompt(mob: dict[str, Any], player: dict[str, Any],
-                  goal: str, history: dict[str, Any]) -> str:
+                  goal: str, history: dict[str, Any],
+                  tier_history: dict[str, Any] | None = None) -> str:
     name  = mob.get('name') or 'unknown'
     lvl   = mob.get('level')
     ct    = mob.get('check_type')
@@ -180,6 +195,34 @@ def _build_prompt(mob: dict[str, Any], player: dict[str, Any],
         if d < 3600:  return f'{d/60:.0f}m ago'
         return f'{d/3600:.1f}h ago'
 
+    # Tier-history block: weighted aggregate across ALL mobs of THIS
+    # check_type the character has ever fought. Records from past
+    # levels are decay-weighted by level distance (~0.25 per level
+    # away) so old-level deaths still influence the decision but
+    # fade as the character outgrows them. At level 6, a level-5
+    # Even-Match death contributes 0.75x; a level-3 one contributes
+    # 0.25x. Counts are floats; an entry like "deaths: 1.5" means
+    # "two distant-past deaths weighted to 1.5 effective".
+    tier_block = ''
+    if isinstance(tier_history, dict) and tier_history:
+        t_kc  = float(tier_history.get('kill_count')  or 0)
+        t_dc  = float(tier_history.get('death_count') or 0)
+        t_n   = int(tier_history.get('distinct_mobs') or 0)
+        t_avg = tier_history.get('avg_damage_taken_pct')
+        t_max = tier_history.get('max_damage_taken_pct')
+        t_avg_s = f'{t_avg:.0f}%' if isinstance(t_avg, (int, float)) else 'n/a'
+        t_max_s = f'{t_max:.0f}%' if isinstance(t_max, (int, float)) else 'n/a'
+        if t_kc + t_dc > 0:
+            tier_block = (
+                f'\nDifficulty-tier history '
+                f'(weighted by level distance; all "{ct_s}" mobs across '
+                f'{t_n} distinct mob name{"s" if t_n != 1 else ""}):\n'
+                f'  kills (weighted):    {t_kc:.1f}\n'
+                f'  deaths (weighted):   {t_dc:.1f}\n'
+                f'  avg damage taken:    {t_avg_s}\n'
+                f'  max damage taken:    {t_max_s}    <- max is unweighted\n'
+            )
+
     return (
         f'Enemy:\n'
         f'  name:       {name}\n'
@@ -203,6 +246,7 @@ def _build_prompt(mob: dict[str, Any], player: dict[str, Any],
         f'  max damage taken:    {max_dmg_s}    <- worst single fight\n'
         f'  last killed:         {_ago(last_killed)}\n'
         f'  last died:           {_ago(last_died)}\n'
+        f'{tier_block}'
     )
 
 
@@ -271,9 +315,15 @@ class EngageJudge:
             self._results.pop(rid, None)
 
     def request(self, mob: dict[str, Any], player: dict[str, Any],
-                goal: str, history: dict[str, Any]) -> int | None:
+                goal: str, history: dict[str, Any],
+                tier_history: dict[str, Any] | None = None) -> int | None:
         """Fire a fresh judgment. Returns the rid for polling, or None
-        if the LLM is unavailable (caller should fall back immediately)."""
+        if the LLM is unavailable (caller should fall back immediately).
+
+        `tier_history` is the aggregate kill/death/damage stats across
+        all mobs of THIS check_type at the player's current level -
+        lets the judge generalize "Even-Match mobs at this level keep
+        killing me" across mobs we haven't personally fought."""
         if not self.available():
             return None
         with self._lock:
@@ -281,7 +331,8 @@ class EngageJudge:
             self._next_rid += 1
             self._pending.add(rid)
         t = threading.Thread(
-            target=self._worker, args=(rid, mob, player, goal, history),
+            target=self._worker,
+            args=(rid, mob, player, goal, history, tier_history or {}),
             name=f'engage-judge-{rid}', daemon=True,
         )
         t.start()
@@ -289,30 +340,9 @@ class EngageJudge:
 
     def _worker(self, rid: int, mob: dict[str, Any],
                 player: dict[str, Any], goal: str,
-                history: dict[str, Any]) -> None:
-        prompt = _build_prompt(mob, player, goal, history)
-        # Echo the key fields we're sending to the LLM (job/level/HP +
-        # mob name/con/level) BEFORE the call so a watcher can verify
-        # the values were correct as the decision is forming. Pairs
-        # with the reply echo fired after the call returns.
-        try:
-            hp = player.get('hp_pct')
-            mp = player.get('mp_pct')
-            mj = player.get('main_job') or '?'
-            plvl = player.get('level')
-            ct = mob.get('check_type')
-            ct_label = CHECK_TYPE_LABEL.get(ct, '?') if isinstance(ct, int) else '?'
-            mob_name = mob.get('name') or '?'
-            mob_lvl = mob.get('level')
-            hp_s = f'HP {hp:.0f}%' if isinstance(hp, (int, float)) else 'HP?'
-            mp_s = f'MP {mp:.0f}%' if isinstance(mp, (int, float)) else 'MP?'
-            plvl_s = f'{plvl}' if plvl is not None else '?'
-            mlvl_s = f'lvl{mob_lvl}' if mob_lvl is not None else 'lvl?'
-            _echo.to_chat(self.cfg, 'query',
-                          f'{mj}{plvl_s} {hp_s} {mp_s} vs {mob_name} '
-                          f'{ct_label} {mlvl_s}')
-        except Exception:
-            pass
+                history: dict[str, Any],
+                tier_history: dict[str, Any]) -> None:
+        prompt = _build_prompt(mob, player, goal, history, tier_history)
         decision: dict[str, Any] | None = None
         err: str | None = None
         raw_text: str = ''
@@ -347,14 +377,6 @@ class EngageJudge:
                     'reason':   err or 'unknown',
                 }
 
-        # Echo the LLM's raw text response verbatim so a watcher can
-        # see exactly what the model returned (verifying for
-        # hallucinated numbers etc.). Errors / empty replies surface
-        # as "(no reply)" so the absence is visible in chat.
-        try:
-            _echo.to_chat(self.cfg, 'reply', raw_text.strip() or '(no reply)')
-        except Exception:
-            pass
         verdict = (decision or {}).get('decision') or 'error'
         reason  = (decision or {}).get('reason') or err
         event_kwargs: dict[str, Any] = {

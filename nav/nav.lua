@@ -120,7 +120,10 @@ local function get_data_path()
         if path:sub(-1) ~= '/' and path:sub(-1) ~= '\\' then
             path = path .. '/'
         end
-        return path .. 'config/addons/nav/'
+        -- Shared IPC root - was 'config/addons/nav/' historically
+        -- (the nav addon owned the dir), now 'config/xillm/' so the
+        -- IPC layer doesn't masquerade as nav-private state.
+        return path .. 'config/xillm/'
     end
     return ''
 end

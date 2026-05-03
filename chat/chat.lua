@@ -5,7 +5,7 @@
 * world state. Hooks `text_in` for every incoming chat line,
 * maintains a rolling buffer of the last 200 lines, atomically
 * writes:
-*    <install>/config/addons/nav/state/<char>/chat.json
+*    <install>/config/xillm/state/<char>/chat.json
 * every ~1s, and appends a `chat_received` event line to
 * events.jsonl whenever a new line arrives so agent_core can
 * dispatch the LLM on /tells, party-chat mentions, etc.
@@ -35,7 +35,7 @@ local function get_data_path()
     local ok, p = pcall(function() return AshitaCore:GetInstallPath() end)
     if ok and p then
         if p:sub(-1) ~= '/' and p:sub(-1) ~= '\\' then p = p .. '/' end
-        return p .. 'config/addons/nav/'
+        return p .. 'config/xillm/'
     end
     return ''
 end

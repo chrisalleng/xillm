@@ -1151,7 +1151,7 @@ def extract_zone(ffxi_path, zone_id, output_dir, debug_edge_names=None):
         # path is hardcoded to match deploy.sh; if it doesn't exist,
         # skip silently.
         deploy_inst = ('/home/chris/Faugus/xillm/drive_c/Ashita-v4beta/'
-                       'config/addons/nav/instances')
+                       'config/xillm/instances')
         if os.path.isdir(os.path.dirname(deploy_inst)):
             os.makedirs(deploy_inst, exist_ok=True)
             shutil.copy2(inst_path, os.path.join(deploy_inst, f"{zone_id}.json"))

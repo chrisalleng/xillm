@@ -102,7 +102,8 @@ _TIMESTAMP_RE = re.compile(r'^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*')
 # names, jp emojis). We want to filter our own addons, not arbitrary
 # bracketed content.
 _ADDON_PREFIXES = ('[nav]', '[combat]', '[chat]', '[cmdrelay]',
-                   '[inventory]', '[mapper]', '[agent]', '[debug]')
+                   '[inventory]', '[mapper]', '[agent]', '[debug]',
+                   '[interact]')
 
 # Ashita's own system rendering uses these markers. They're never
 # player chat under any mode value.
