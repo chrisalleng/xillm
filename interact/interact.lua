@@ -168,7 +168,7 @@
 
 addon.name    = 'interact'
 addon.author  = 'xillm'
-addon.version = '0.43'
+addon.version = '0.50'
 addon.desc    = 'NPC menu / vendor / dialog bridge for agent_core'
 addon.commands = {'/interact'}
 
@@ -821,7 +821,8 @@ ashita.events.register('packet_out', 'interact_packet_out', function(e)
     -- transmitting (sometimes Ashita rewrites the header before
     -- send). Helpful when "we sent the packet" prints in chat but
     -- the server never responds.
-    if e.id == 0x05B or e.id == 0x01A or e.id == 0x083 or e.id == 0x085 then
+    if e.id == 0x05B or e.id == 0x01A or e.id == 0x083 or e.id == 0x085
+            or e.id == 0x04E or e.id == 0x04C or e.id == 0x04A then
         local hex = {}
         for i = 1, math.min(#e.data, 32) do
             hex[#hex + 1] = ('%02X'):format(e.data:byte(i))
@@ -861,6 +862,18 @@ ashita.events.register('packet_in', 'interact_packet_in', function(e)
         debug_log_packet('in', e.id, e.data)
     end
     capture_packet('in', e.id, e.data)
+
+    -- Always log auction house incoming packets for debugging.
+    -- 0x04C = AH command response (carries result codes for ASK_COMMIT,
+    -- LOT_IN, BID, etc.) - we want to see these to diagnose silent
+    -- server rejections.
+    if e.id == 0x04C then
+        local hex = {}
+        for i = 1, math.min(#e.data, 32) do
+            hex[#hex + 1] = ('%02X'):format(e.data:byte(i))
+        end
+        msg(('IN 0x04C len=%d %s'):format(#e.data, table.concat(hex, ' ')))
+    end
 
     -- Event begin / variants: capture the event context.
     if e.id == 0x032 or e.id == 0x033 or e.id == 0x034 then
@@ -1614,6 +1627,143 @@ local function action_sell(item_index, qty)
     return false
 end
 
+-- ============================================================
+-- Auction house helpers (0x4E packet builders)
+-- ============================================================
+-- Three sequenced operations:
+--   action_ah_open       - WORK_CHECK to start an AH session with the
+--                          counter NPC. Required when no AH UI was
+--                          opened via the dialog flow first.
+--   action_ah_sell_ask   - ASK_COMMIT phase 1 of a listing. Server
+--                          responds with a confirmation prompt
+--                          (0x4C) showing the listing fee.
+--   action_ah_sell_lot   - LOT_IN phase 2 of a listing. Commits the
+--                          listing after the player would have
+--                          confirmed in the UI.
+--   action_ah_bid        - BID on an existing listing.
+--
+-- Packet structure references:
+--   atom0s/XiPackets/world/client/0x004E - field offsets
+--   LSB src/map/packets/c2s/0x04e_auc.h  - struct definitions
+--   LSB src/map/packets/c2s/0x04e_auc.cpp - validation rules
+--
+-- Returns true on queue success, false otherwise.
+
+local function action_ah_open()
+    local pm = AshitaCore:GetPacketManager()
+    if pm == nil then return false end
+    -- LSB validate(): WorkCheck requires AucWorkIndex == -1
+    pm:QueuePacket(0x4E, 0x3C, 0x00, 0x00, 0x00, function(ptr)
+        local p = ffi.cast('uint8_t*', ptr)
+        ffi.fill(p + 0x04, 0x38)
+        p[0x04] = 0x0A    -- WORK_CHECK
+        p[0x05] = 0xFF    -- AucWorkIndex = -1
+    end)
+    msg('ah_open: queued WORK_CHECK')
+    return true
+end
+
+local function action_ah_sell_ask(slot, item_id, price, single)
+    -- Phase 1: ASK_COMMIT - server validates the listing and replies
+    -- with the listing fee in a 0x4C response.
+    --
+    -- Layout:
+    --   +0x04  u8   Command = 0x04 (ASK_COMMIT)
+    --   +0x08  u32  Commission (asking price in gil)
+    --   +0x0C  u16  ItemWorkIndex (inventory slot)
+    --   +0x0E  u16  ItemNo (item ID)
+    --   +0x10  u32  ItemStacks (0 = stack, 1 = single)
+    local pm = AshitaCore:GetPacketManager()
+    if pm == nil then return false end
+    pm:QueuePacket(0x4E, 0x3C, 0x00, 0x00, 0x00, function(ptr)
+        local p = ffi.cast('uint8_t*', ptr)
+        ffi.fill(p + 0x04, 0x38)
+        p[0x04] = 0x04
+        ffi.cast('uint32_t*', p + 0x08)[0] = price
+        ffi.cast('uint16_t*', p + 0x0C)[0] = slot
+        ffi.cast('uint16_t*', p + 0x0E)[0] = item_id
+        ffi.cast('uint32_t*', p + 0x10)[0] = single
+    end)
+    msg(('ah_sell_ask: slot=%d item=%d price=%d %s')
+        :format(slot, item_id, price, single == 0 and '(stack)' or '(single)'))
+    return true
+end
+
+local function action_ah_sell_lot(slot, price, single, auc_idx)
+    -- Phase 2: LOT_IN - commits the listing after the server's
+    -- confirmation prompt. price/single MUST match what was passed
+    -- to ASK_COMMIT.
+    --
+    -- Layout:
+    --   +0x04  u8   Command = 0x0B (LOT_IN)
+    --   +0x05  i8   AucWorkIndex (0..6 - which sales slot to occupy)
+    --   +0x08  u32  LimitPrice (matches ASK_COMMIT price)
+    --   +0x0C  u16  ItemWorkIndex (inventory slot)
+    --   +0x10  u32  ItemStacks (0 / 1, must match ASK_COMMIT)
+    local pm = AshitaCore:GetPacketManager()
+    if pm == nil then return false end
+    auc_idx = auc_idx or 0
+    -- Resolve item name for the audit-trail echo
+    local item_name = '?'
+    local item_id_at_slot = nil
+    local ok, inv = pcall(function() return AshitaCore:GetMemoryManager():GetInventory() end)
+    if ok and inv then
+        local item = inv:GetContainerItem(0, slot)
+        if item ~= nil then
+            item_id_at_slot = item.Id
+            local res = AshitaCore:GetResourceManager():GetItemById(item.Id)
+            if res then item_name = res.Name[1] end
+        end
+    end
+    pm:QueuePacket(0x4E, 0x3C, 0x00, 0x00, 0x00, function(ptr)
+        local p = ffi.cast('uint8_t*', ptr)
+        ffi.fill(p + 0x04, 0x38)
+        p[0x04] = 0x0B
+        p[0x05] = auc_idx
+        ffi.cast('uint32_t*', p + 0x08)[0] = price
+        ffi.cast('uint16_t*', p + 0x0C)[0] = slot
+        ffi.cast('uint32_t*', p + 0x10)[0] = single
+    end)
+    msg(('ah_sell_lot: listed %s (slot=%d, id=%s) for %d gil %s')
+        :format(item_name, slot,
+                item_id_at_slot and tostring(item_id_at_slot) or '?',
+                price, single == 0 and '(stack)' or '(single)'))
+    return true
+end
+
+local function action_ah_bid(item_id, price, single, auc_idx)
+    -- Place a bid on a listing. Server matches against the cheapest
+    -- listing at or below price. If matched, item is delivered to
+    -- the inbox and gil deducted; if no match, server replies with
+    -- "no item available at this price" via 0x4C error.
+    --
+    -- Layout:
+    --   +0x04  u8   Command = 0x0E (BID)
+    --   +0x05  i8   AucWorkIndex (0..6 - bid history slot)
+    --   +0x08  u32  BidPrice
+    --   +0x0C  u16  ItemNo (item ID)
+    --   +0x10  u32  ItemStacks (0 = stack, 1 = single)
+    local pm = AshitaCore:GetPacketManager()
+    if pm == nil then return false end
+    auc_idx = auc_idx or 0
+    local item_name = '?'
+    local res = AshitaCore:GetResourceManager():GetItemById(item_id)
+    if res then item_name = res.Name[1] end
+    pm:QueuePacket(0x4E, 0x3C, 0x00, 0x00, 0x00, function(ptr)
+        local p = ffi.cast('uint8_t*', ptr)
+        ffi.fill(p + 0x04, 0x38)
+        p[0x04] = 0x0E
+        p[0x05] = auc_idx
+        ffi.cast('uint32_t*', p + 0x08)[0] = price
+        ffi.cast('uint16_t*', p + 0x0C)[0] = item_id
+        ffi.cast('uint32_t*', p + 0x10)[0] = single
+    end)
+    msg(('ah_bid: bid %s (id=%d) at %d gil %s')
+        :format(item_name, item_id, price,
+                single == 0 and '(stack)' or '(single)'))
+    return true
+end
+
 -- Close any open event/menu cleanly. Sends 0x05B Mode=End (0) with
 -- EndPara=0 + EventPara=0, which the server interprets as "the player
 -- closed the menu without picking an actionable option" and runs
@@ -1744,6 +1894,33 @@ local function dispatch_action(act)
         -- conquest items). Also dismisses the UI cleanly because
         -- input flows through the real handler.
         action_select_by_input(tonumber(act.index) or 0)
+    elseif kind == 'ah_open' then
+        -- Open AH session via WORK_CHECK. Required before sell/bid
+        -- when no AH UI was opened via the dialog flow first.
+        action_ah_open()
+    elseif kind == 'ah_sell_ask' then
+        -- Phase 1 of selling: ASK_COMMIT. Server returns listing fee.
+        action_ah_sell_ask(
+            tonumber(act.slot)    or 0,
+            tonumber(act.item_id) or 0,
+            tonumber(act.price)   or 0,
+            tonumber(act.single)  or 0)
+    elseif kind == 'ah_sell_lot' then
+        -- Phase 2 of selling: LOT_IN. Commits the listing.
+        -- act.price/single MUST match the prior ask.
+        action_ah_sell_lot(
+            tonumber(act.slot)    or 0,
+            tonumber(act.price)   or 0,
+            tonumber(act.single)  or 0,
+            tonumber(act.auc_idx) or 0)
+    elseif kind == 'ah_bid' then
+        -- Bid on a listing. Item-name resolution + matching happens
+        -- server-side based on item_id.
+        action_ah_bid(
+            tonumber(act.item_id) or 0,
+            tonumber(act.price)   or 0,
+            tonumber(act.single)  or 0,
+            tonumber(act.auc_idx) or 0)
     else
         msg('unknown action: ' .. tostring(kind))
     end
@@ -1920,6 +2097,47 @@ ashita.events.register('command', 'interact_command', function(e)
         else
             action_select_by_input(idx)
         end
+    elseif sub == 'ah_open' then
+        -- Manual: open AH session. Equivalent to writing
+        -- {"action":"ah_open"} to interact.json.
+        action_ah_open()
+    elseif sub == 'ah_sell' then
+        -- Manual: ASK_COMMIT phase 1. Equivalent to writing
+        -- {"action":"ah_sell_ask", "slot":N, "item_id":N, "price":N, "single":0|1}.
+        -- Usage: /interact ah_sell <slot> <item_id> <price> [single=0]
+        if not args[5] then
+            msg('usage: /interact ah_sell <slot> <item_id> <price> [single=0]')
+            return
+        end
+        action_ah_sell_ask(
+            tonumber(args[3]) or 0,
+            tonumber(args[4]) or 0,
+            tonumber(args[5]) or 0,
+            tonumber(args[6]) or 0)
+    elseif sub == 'ah_confirm' then
+        -- Manual: LOT_IN phase 2.
+        -- Usage: /interact ah_confirm <slot> <price> [single=0] [auc_idx=0]
+        if not args[4] then
+            msg('usage: /interact ah_confirm <slot> <price> [single=0] [auc_idx=0]')
+            return
+        end
+        action_ah_sell_lot(
+            tonumber(args[3]) or 0,
+            tonumber(args[4]) or 0,
+            tonumber(args[5]) or 0,
+            tonumber(args[6]) or 0)
+    elseif sub == 'ah_bid' then
+        -- Manual: BID on a listing.
+        -- Usage: /interact ah_bid <item_id> <max_price> [single=0] [auc_idx=0]
+        if not args[4] then
+            msg('usage: /interact ah_bid <item_id> <max_price> [single=0] [auc_idx=0]')
+            return
+        end
+        action_ah_bid(
+            tonumber(args[3]) or 0,
+            tonumber(args[4]) or 0,
+            tonumber(args[5]) or 0,
+            tonumber(args[6]) or 0)
     elseif sub == 'pick' then
         -- Manual menu pick. Usage:
         --   /interact pick <hex_option_index> [automated]

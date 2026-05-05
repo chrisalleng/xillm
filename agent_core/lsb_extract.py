@@ -447,6 +447,93 @@ def tag_npc_roles(zones_dir: Path,
 
 
 # ---------------------------------------------------------------------------
+# Item catalog (from sql/item_basic.sql)
+# ---------------------------------------------------------------------------
+#
+# Each row:
+#   INSERT INTO `item_basic` VALUES (
+#       itemid, subid, 'name', 'sortname', 'name_jp',
+#       type, stackSize, flags, aH, BaseSell
+#   );
+#
+# Most useful fields for the agent:
+#   - itemid: the FFXI item ID (also matches xi.item enum values).
+#   - name: lowercase snake_case ("rabbit_hide"). The display form
+#     ("Rabbit Hide") is stored on the client side; we generate it
+#     from the snake_case name with title-case + underscore->space.
+#   - stackSize: max stack size (1 = unstackable; 12/99 typical).
+#     Critical for AH listings - "list as stack" requires a full
+#     stackSize-count item in the slot.
+#   - aH: auction house category (99 = NOT sellable on AH; other
+#     values map to AH category trees).
+#   - BaseSell: NPC vendor sell price; rough floor for AH listings.
+_ITEM_BASIC_ROW = re.compile(
+    r"INSERT INTO `item_basic` VALUES \("
+    r"(\d+)\s*,"                       # itemid
+    r"\s*\d+\s*,"                      # subid (skip)
+    r"\s*'([^']*)'\s*,"                # name (snake_case)
+    r"\s*'[^']*'\s*,"                  # sortname (skip - same as name)
+    r"\s*'[^']*'\s*,"                  # name_jp (skip)
+    r"[^,]*,"                          # type (constant or @MACRO)
+    r"\s*(\d+)\s*,"                    # stackSize
+    r"[^,]*,"                          # flags (constant or @MACRO)
+    r"[^,]*,"                          # aH category (constant or @MACRO)
+    r"\s*(\d+)\s*\)"                   # BaseSell
+)
+
+
+def parse_item_basic(item_basic_sql: Path) -> list[dict[str, Any]]:
+    """Parse sql/item_basic.sql. Returns one record per item with
+    {id, name, display_name, stack_size, base_sell}.
+
+    Skips itemid 0 (placeholder) and id < 65 (system flags / unused
+    slots) to keep the catalog focused on real items."""
+    rows: list[dict[str, Any]] = []
+    text = item_basic_sql.read_text(encoding='utf-8')
+    for m in _ITEM_BASIC_ROW.finditer(text):
+        item_id    = int(m.group(1))
+        snake_name = m.group(2)
+        stack      = int(m.group(3))
+        base_sell  = int(m.group(4))
+        if item_id < 65 or not snake_name:
+            continue
+        # Build display name: "rabbit_hide" -> "Rabbit Hide"
+        display = ' '.join(part.capitalize() for part in snake_name.split('_'))
+        rows.append({
+            'id':           item_id,
+            'name':         snake_name,
+            'display_name': display,
+            'stack_size':   stack,
+            'base_sell':    base_sell,
+        })
+    rows.sort(key=lambda r: r['id'])
+    return rows
+
+
+def extract_items(lsb_root: Path) -> dict[str, Any]:
+    """Build the items catalog: every server-known item with id, name,
+    stack size, and base vendor sell price.
+
+    Returns {items: [...], by_name: {snake_name: id}, by_display: {display: id}}.
+    The two name indexes let consumers do exact lookups by either form
+    without scanning the items list."""
+    items = parse_item_basic(lsb_root / 'sql/item_basic.sql')
+    by_name:    dict[str, int] = {}
+    by_display: dict[str, int] = {}
+    for r in items:
+        # First-seen wins for duplicates (some snake_names repeat across
+        # equipment variants; the lower id is usually the canonical one).
+        by_name.setdefault(r['name'], r['id'])
+        by_display.setdefault(r['display_name'].lower(), r['id'])
+    return {
+        'lsb_source': str(lsb_root),
+        'items':      items,
+        'by_name':    by_name,
+        'by_display': by_display,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Top-level extract
 # ---------------------------------------------------------------------------
 
@@ -566,9 +653,11 @@ def main() -> None:
                    help='Output path for npcs.json.')
     p.add_argument('--out-zones', default=None,
                    help='Output path for zone_meta.json.')
+    p.add_argument('--out-items', default=None,
+                   help='Output path for items.json.')
     p.add_argument('--out',       default=None,
                    help='LEGACY: write menu_catalog only to this path. '
-                        'Prefer --out-menu / --out-npcs / --out-zones.')
+                        'Prefer --out-menu / --out-npcs / --out-zones / --out-items.')
     args = p.parse_args()
 
     lsb_root = Path(args.lsb)
@@ -580,9 +669,10 @@ def main() -> None:
     out_menu  = args.out_menu  or args.out
     out_npcs  = args.out_npcs
     out_zones = args.out_zones
+    out_items = args.out_items
 
-    if not (out_menu or out_npcs or out_zones):
-        p.error('at least one of --out-menu / --out-npcs / --out-zones / --out is required')
+    if not (out_menu or out_npcs or out_zones or out_items):
+        p.error('at least one of --out-menu / --out-npcs / --out-zones / --out-items / --out is required')
 
     if out_menu:
         catalog = extract_menu_catalog(lsb_root, zone_enum, region_enum)
@@ -625,6 +715,17 @@ def main() -> None:
         print(f'  npcs:       {len(npcs["npcs"])}')
         for tag, idxs in sorted(npcs['role_index'].items()):
             print(f'  role/{tag:18s} {len(idxs)}')
+
+    if out_items:
+        items = extract_items(lsb_root)
+        path = Path(out_items)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(items, indent=2, sort_keys=True),
+                        encoding='utf-8')
+        print(f'Wrote {path}')
+        print(f'  items:      {len(items["items"])}')
+        print(f'  by_name:    {len(items["by_name"])}')
+        print(f'  by_display: {len(items["by_display"])}')
 
 
 if __name__ == '__main__':

@@ -99,6 +99,9 @@ class Paths:
     # find_npc(role=) and closest_npc(...) without live exploration.
     zone_meta_file: Path = REPO_ROOT / 'nav' / 'data' / 'zone_meta.json'
     npcs_file: Path = REPO_ROOT / 'nav' / 'data' / 'npcs.json'
+    # items.json: item_id -> {name, display_name, stack_size, base_sell}.
+    # Resolves AH names ("Rabbit Hide") to numeric ids the AH packets need.
+    items_file: Path = REPO_ROOT / 'nav' / 'data' / 'items.json'
 
     def state_dir(self, character: str) -> Path:
         return self.ipc_base / 'state' / character

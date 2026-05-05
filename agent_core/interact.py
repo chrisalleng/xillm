@@ -266,3 +266,94 @@ class InteractDriver:
         flow). The addon translates this to an Enter injection."""
         return self._send({'action': 'open_dialog',
                            'target_sid': int(target_sid)})
+
+    # ---- auction house --------------------------------------------------
+    #
+    # Three primitives for AH interaction. Player must be standing within
+    # interaction range of an auction house counter NPC; no /target or
+    # dialog open required - the WORK_CHECK packet establishes the AH
+    # session directly.
+    #
+    # Sell flow (two-step):
+    #   1. ah_open()           - one-time per session
+    #   2. ah_sell_ask(...)    - server replies with listing fee
+    #   3. ah_sell_lot(...)    - commits the listing
+    #
+    # Buy flow:
+    #   1. ah_open()           - one-time per session
+    #   2. ah_bid(...)         - server matches against cheapest listing
+
+    def ah_open(self) -> bool:
+        """Open an AH session with the nearest counter NPC. Send once
+        per session; subsequent ah_sell_ask / ah_bid calls reuse it.
+        Equivalent to walking up to an AH counter and clicking the
+        'Auction' option in the dialog menu (the LSB server doesn't
+        require the dialog flow - WORK_CHECK alone establishes the
+        session)."""
+        return self._send({'action': 'ah_open'})
+
+    def ah_sell_ask(self, slot: int, item_id: int, price: int,
+                    *, single: bool = False) -> bool:
+        """Phase 1 of selling: ASK_COMMIT. Server validates the
+        listing and replies with the listing fee in a 0x4C packet.
+
+        Args:
+            slot: inventory slot (1..30) of the item to list.
+            item_id: FFXI item ID. Must match what's at `slot`.
+            price: asking price in gil.
+            single: True to list as a single item, False (default) to
+                list as a stack. A stack listing requires a full stack
+                in the slot (12 for most items, 99 for some).
+        """
+        return self._send({
+            'action':  'ah_sell_ask',
+            'slot':    int(slot),
+            'item_id': int(item_id),
+            'price':   int(price),
+            'single':  1 if single else 0,
+        })
+
+    def ah_sell_lot(self, slot: int, price: int,
+                    *, single: bool = False, auc_idx: int = 0) -> bool:
+        """Phase 2 of selling: LOT_IN. Commits the listing the player
+        just previewed via ah_sell_ask. `price` and `single` MUST match
+        what was passed to ah_sell_ask or the server rejects the commit.
+
+        Args:
+            slot: inventory slot (must match the ASK_COMMIT slot).
+            price: must match the ASK_COMMIT price.
+            single: must match the ASK_COMMIT single flag.
+            auc_idx: which player sales-history slot to occupy (0..6).
+                Defaults to 0; server will reject if that slot is
+                already in use.
+        """
+        return self._send({
+            'action':  'ah_sell_lot',
+            'slot':    int(slot),
+            'price':   int(price),
+            'single':  1 if single else 0,
+            'auc_idx': int(auc_idx),
+        })
+
+    def ah_bid(self, item_id: int, max_price: int,
+               *, single: bool = False, auc_idx: int = 0) -> bool:
+        """Bid on a listing. Server matches against the cheapest
+        listing of `item_id` at or below `max_price`. If a match is
+        found, gil is deducted and the item lands in the player's
+        delivery box. If no match, server replies with an error in
+        the 0x4C response.
+
+        Args:
+            item_id: FFXI item ID being bid on.
+            max_price: maximum gil willing to pay.
+            single: True to bid on a single, False (default) for a
+                stack listing.
+            auc_idx: which player bid-history slot (0..6).
+        """
+        return self._send({
+            'action':  'ah_bid',
+            'item_id': int(item_id),
+            'price':   int(max_price),
+            'single':  1 if single else 0,
+            'auc_idx': int(auc_idx),
+        })

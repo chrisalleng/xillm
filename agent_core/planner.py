@@ -272,6 +272,18 @@ Goal types you can emit:
                   this for: signet, conquest item purchases, home-point
                   registration, vendor buys with simple branching.
 
+Auction house (no goal type yet - do NOT emit ah_buy / ah_sell goals;
+they will be silently dropped):
+  Auction-house listing and bidding ARE wired end-to-end as low-level
+  primitives (interact.ah_open / ah_sell_ask / ah_sell_lot / ah_bid in
+  the python client + matching /interact ah_* slash commands), but
+  there is not yet a director that drives them from a goal. When the
+  user explicitly asks for an AH purchase or sale, plan a `travel`
+  goal to the relevant city and stop there - the operator runs the
+  AH transaction by hand for now. Use `find_item(name_contains=)` in
+  research to surface the relevant item id, stack size, and base sell
+  price so the resulting plan / response cites accurate numbers.
+
 Each goal: id (short string), title, origin ("user" / "auto"),
 state ("pending"), type, subgoals (composite only), and type-specific fields.
 The `roots` list names top-level goal ids in priority order.
@@ -1590,7 +1602,12 @@ class Planner:
               "level/job. Use 'safe' when the character is overlevel "
               "for the zone's mob aggro range so future closest_npc "
               "queries can route through it (default treats DUNGEON "
-              "zones as 100x cost, so they're avoided).\n\n"
+              "zones as 100x cost, so they're avoided).\n"
+              '  - find_item(name_contains=): resolve a human-readable '
+              'item name ("Rabbit Hide", "Legionnaire\'s Axe") to its '
+              'numeric item_id, stack_size, and base_sell. REQUIRED '
+              'before any auction-house buy/sell goal - the AH packets '
+              'address items by id, not name.\n\n'
               'End with a concise 3-6 sentence summary of the facts '
               'that will inform the plan. Do NOT propose a plan or '
               'list goals - that is the next step.'
@@ -1616,7 +1633,8 @@ class Planner:
                        _planner_tools.FIND_NPC_TOOL,
                        _planner_tools.CLOSEST_NPC_TOOL,
                        _planner_tools.LIST_ZONES_TOOL,
-                       _planner_tools.SET_ZONE_SAFETY_TOOL],
+                       _planner_tools.SET_ZONE_SAFETY_TOOL,
+                       _planner_tools.FIND_ITEM_TOOL],
                 tool_handlers=handlers,
                 # Bumped from 8 -> 16 after observing the LLM hit max
                 # before converging on a final summary when it had to

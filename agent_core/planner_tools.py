@@ -20,12 +20,19 @@ Tools:
     Inspect zone metadata. Useful when the LLM wants to know what
     zones connect or whether a zone is a dungeon vs outdoors.
 
+  find_item(name_contains=, limit=)
+    Resolve a human-readable item name to its FFXI item id (and
+    stack/sell metadata). Required before any auction-house buy or
+    sell goal because the AH packets address items by numeric id,
+    not name.
+
 The handlers close over a Router + NPCCatalog so they always reflect
 the current per-character zone_safety overrides (the planner reload()s
 between sessions).
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +177,44 @@ SET_ZONE_SAFETY_TOOL: dict[str, Any] = {
 }
 
 
+FIND_ITEM_TOOL: dict[str, Any] = {
+    'type': 'function',
+    'function': {
+        'name': 'find_item',
+        'description': (
+            'Resolve a human-readable item name (e.g. "Rabbit Hide", '
+            '"Legionnaire\'s Axe") to its numeric FFXI item id, stack '
+            'size, and base vendor sell price from the LSB item catalog. '
+            'Required before any auction-house goal: the ah_bid / '
+            'ah_sell_ask actions take an integer item_id, NOT a name. '
+            'The match is a case-insensitive substring scan against both '
+            'the snake_case lua name ("rabbit_hide") and the display '
+            'name ("Rabbit Hide"). Returns at most `limit` records '
+            '(default 10, hard cap 50). Use the `id` and `stack_size` '
+            'from the result to build the AH action; `base_sell` is a '
+            'rough floor for sane listing prices.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'name_contains': {
+                    'type': 'string',
+                    'description': (
+                        'Case-insensitive substring of the item name. '
+                        'Required.'
+                    ),
+                },
+                'limit': {
+                    'type':        'integer',
+                    'description': 'Max results (default 10, hard cap 50).',
+                },
+            },
+            'required': ['name_contains'],
+        },
+    },
+}
+
+
 LIST_ZONES_TOOL: dict[str, Any] = {
     'type': 'function',
     'function': {
@@ -216,6 +261,38 @@ def _safety_path_for(cfg: _config.Config) -> Path | None:
     return cfg.paths.persistent_dir(char) / 'zone_safety.json'
 
 
+class _ItemCatalog:
+    """Lazy loader for items.json. Keeps the parsed items list on
+    first access; the file is ~5 MB so we load once per Planner
+    instance rather than rescanning per tool call."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: list[dict[str, Any]] | None = None
+
+    def _load(self) -> list[dict[str, Any]]:
+        if self._items is None:
+            try:
+                blob = json.loads(self.path.read_text(encoding='utf-8'))
+                self._items = blob.get('items') or []
+            except (OSError, json.JSONDecodeError):
+                self._items = []
+        return self._items
+
+    def find(self, name_contains: str, limit: int) -> list[dict[str, Any]]:
+        needle = (name_contains or '').lower().strip()
+        if not needle:
+            return []
+        out: list[dict[str, Any]] = []
+        for r in self._load():
+            if (needle in r.get('name', '').lower()
+                    or needle in r.get('display_name', '').lower()):
+                out.append(r)
+                if len(out) >= limit:
+                    break
+        return out
+
+
 def _npc_summary(n: dict[str, Any]) -> dict[str, Any]:
     """Compact NPC record we return to the LLM. Drops the raw lua_name
     + look fields that don't help planning, keeps name + zone + coords
@@ -238,8 +315,10 @@ def make_handlers(cfg: _config.Config) -> dict[str, Any]:
     npc_path  = cfg.paths.npcs_file
     zone_path = cfg.paths.zone_meta_file
     trans_path = cfg.paths.transitions_file
+    items_path = cfg.paths.items_file
 
     catalog = _nr.NPCCatalog(npc_path)
+    items   = _ItemCatalog(items_path)
 
     def _router() -> _nr.Router:
         return _nr.Router(trans_path, zone_path, _safety_path_for(cfg))
@@ -359,9 +438,22 @@ def make_handlers(cfg: _config.Config) -> dict[str, Any]:
                               zone_id, verdict, reason)
         return {'zone_id': zone_id, 'override': rec}
 
+    def _handle_find_item(args: dict[str, Any]) -> dict[str, Any]:
+        nc = args.get('name_contains') or ''
+        if not nc:
+            return {'error': 'name_contains is required'}
+        limit = int(args.get('limit') or 10)
+        limit = max(1, min(50, limit))
+        results = items.find(nc, limit)
+        return {
+            'count':   len(results),
+            'results': results,
+        }
+
     return {
         'find_npc':        _handle_find_npc,
         'closest_npc':     _handle_closest_npc,
         'list_zones':      _handle_list_zones,
         'set_zone_safety': _handle_set_zone_safety,
+        'find_item':       _handle_find_item,
     }
