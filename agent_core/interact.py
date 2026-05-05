@@ -27,8 +27,8 @@ Action shape (one JSON object per file; we write fresh on each call):
 
     {"seq": int, "action": "advance_text"}
     {"seq": int, "action": "select_option", "index": int}
-    {"seq": int, "action": "buy",  "item": str, "qty": int}
-    {"seq": int, "action": "sell", "item": str, "qty": int}
+    {"seq": int, "action": "buy",  "index": int, "qty": int}
+    {"seq": int, "action": "sell", "slot": int, "item_id": int, "qty": int}
     {"seq": int, "action": "close_menu"}
     {"seq": int, "action": "open_dialog", "target_sid": int}
 
@@ -211,25 +211,47 @@ class InteractDriver:
         return self._send(payload)
 
     def buy(self, item_index: int, qty: int = 1) -> bool:
-        """Purchase item at vendor stock position `item_index`. The
-        addon emits outgoing 0x083 (SHOP_BUY). The orchestrator
-        resolves item-name -> index via the LSB-mined vendor catalog
-        before calling this; the addon doesn't see the name."""
+        """Purchase from a standard NPC vendor (not auction house).
+        Addon sends 0x083 SHOP_BUY directly.
+
+        Prerequisites: the agent must have just talked to the vendor
+        (open_dialog) so the server's PChar->Container is populated
+        with the shop stock. The dialog event will have closed by the
+        time control returns; that's fine - 0x083 is allowed when
+        not InEvent. The agent reads `state/<char>/menu.json`'s
+        `vendor_items` array (populated from the server's 0x03C list)
+        to decide which `item_index` to pass.
+
+        Args:
+            item_index: shop_index from menu.json's vendor_items
+                (NOT the FFXI item id; it's the per-shop stock
+                position assigned by xi.shop.general).
+            qty: how many to buy. Must be <= item's stack size.
+        """
         return self._send({
             'action': 'buy',
             'index':  int(item_index),
             'qty':    int(qty),
         })
 
-    def sell(self, item_index: int, qty: int = 1) -> bool:
-        """Sell inventory item at slot `item_index`. Two-step protocol
-        in FFXI (0x084 sell-req + 0x085 sell-set); current addon
-        implementation stubs this until the orchestrator-driven /sell
-        chat command flow is wired up."""
+    def sell(self, slot: int, item_id: int, qty: int = 1) -> bool:
+        """Sell inventory item at `slot` (1..30) of NPC vendor. Addon
+        sends both 0x084 SHOP_SELL_REQ and 0x085 SHOP_SELL_SET back-
+        to-back; the server validates that the slot really holds the
+        named item id and that we recently talked to a vendor (so its
+        Container is populated). The dialog event must be closed.
+
+        Args:
+            slot: inventory slot (1..30) of the item to sell.
+            item_id: FFXI item ID. Must match what's at `slot`.
+            qty: how many to sell. Capped to the slot's actual count
+                server-side.
+        """
         return self._send({
-            'action': 'sell',
-            'index':  int(item_index),
-            'qty':    int(qty),
+            'action':  'sell',
+            'slot':    int(slot),
+            'item_id': int(item_id),
+            'qty':     int(qty),
         })
 
     def close_menu(self) -> bool:

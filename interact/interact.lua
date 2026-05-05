@@ -168,7 +168,7 @@
 
 addon.name    = 'interact'
 addon.author  = 'xillm'
-addon.version = '0.50'
+addon.version = '0.52'
 addon.desc    = 'NPC menu / vendor / dialog bridge for agent_core'
 addon.commands = {'/interact'}
 
@@ -576,7 +576,36 @@ local state = {
     frame = 0,
     last_character = nil,
     last_publish_frame = 0,
+    -- Deferred functions keyed by the frame they should fire on. Used
+    -- so two related packets (e.g. 0x084 sell-req + 0x085 sell-set)
+    -- can be split across frames - if we send them in the same frame
+    -- the client's per-frame position update (0x015) can land between
+    -- them on the wire and clobber the server's m_LastPacketType,
+    -- which breaks the requiresPriorPacket validator on 0x085.
+    deferred = {},  -- {{frame=N, fn=function() ... end}, ...}
 }
+
+-- Schedule `fn` to run `frames` frames from now. Used by action_sell
+-- to space the 0x084 and 0x085 packets across frames.
+local function defer(frames, fn)
+    state.deferred[#state.deferred + 1] = {
+        frame = state.frame + math.max(0, frames),
+        fn    = fn,
+    }
+end
+
+local function tick_deferred()
+    if #state.deferred == 0 then return end
+    local kept = {}
+    for _, entry in ipairs(state.deferred) do
+        if state.frame >= entry.frame then
+            pcall(entry.fn)
+        else
+            kept[#kept + 1] = entry
+        end
+    end
+    state.deferred = kept
+end
 
 -- Debug packet capture: when /interact debug is on, every packet of
 -- interest gets a hex dump appended to debug_packets.log. Use this to
@@ -821,8 +850,9 @@ ashita.events.register('packet_out', 'interact_packet_out', function(e)
     -- transmitting (sometimes Ashita rewrites the header before
     -- send). Helpful when "we sent the packet" prints in chat but
     -- the server never responds.
-    if e.id == 0x05B or e.id == 0x01A or e.id == 0x083 or e.id == 0x085
-            or e.id == 0x04E or e.id == 0x04C or e.id == 0x04A then
+    if e.id == 0x05B or e.id == 0x01A or e.id == 0x083 or e.id == 0x084
+            or e.id == 0x085 or e.id == 0x04E or e.id == 0x04C
+            or e.id == 0x04A then
         local hex = {}
         for i = 1, math.min(#e.data, 32) do
             hex[#hex + 1] = ('%02X'):format(e.data:byte(i))
@@ -849,8 +879,9 @@ ashita.events.register('packet_in', 'interact_packet_in', function(e)
         _probe_count = _probe_count + 1
         if e.id == 0x032 or e.id == 0x033 or e.id == 0x034
                 or e.id == 0x036 or e.id == 0x052 or e.id == 0x03B
-                or e.id == 0x03C or e.id == 0x03E or e.id == 0x05A
-                or e.id == 0x05B or e.id == 0x05C then
+                or e.id == 0x03C or e.id == 0x03D or e.id == 0x03E
+                or e.id == 0x03F or e.id == 0x05A or e.id == 0x05B
+                or e.id == 0x05C then
             msg(('PROBE in: id=0x%03X len=%d'):format(e.id, #e.data))
         end
     end
@@ -938,17 +969,63 @@ ashita.events.register('packet_in', 'interact_packet_in', function(e)
         return
     end
 
-    -- 0x03C (shop_list): vendor item list. Phase C will parse the
-    -- item array into menu.vendor_items.
+    -- 0x03C (shop_list): vendor item list.
+    --
+    -- Layout (LSB src/map/packets/s2c/0x03c_shop_list.cpp):
+    --   header (4):
+    --   0x04: ShopItemOffsetIndex   u16  (0 for first packet, 19 for second, etc.)
+    --   0x06: Flags                 u8   (0x00 = more packets, 0x89 = last)
+    --   0x07: padding               u8
+    --   0x08: GP_SHOP[N], 12 bytes each:
+    --     +0x00: ItemPrice          u32
+    --     +0x04: ItemNo             u16
+    --     +0x06: ShopIndex          u8
+    --     +0x07: padding            u8
+    --     +0x08: Skill              u16
+    --     +0x0A: GuildInfo          u16
+    -- N is at most 19 per packet. Multiple packets accumulate into one
+    -- vendor session; we reset when the next 0x03E (shop_open) lands.
     if e.id == 0x03C then
         menu.kind = 'vendor'
+        local offset_index = read_u16(e.data, 0x04)
+        if offset_index == 0 then
+            -- First packet of a fresh shop list - clear stale rows.
+            menu.vendor_items = {}
+        end
+        local rm = AshitaCore:GetResourceManager()
+        local body_start = 0x08
+        local n = math.floor((#e.data - body_start) / 12)
+        if n > 19 then n = 19 end
+        for i = 0, n - 1 do
+            local row = body_start + i * 12
+            local price       = read_u32(e.data, row + 0x00)
+            local item_id     = read_u16(e.data, row + 0x04)
+            local shop_index  = e.data:byte(row + 0x06 + 1)
+            if item_id ~= 0 then
+                local nm = '?'
+                if rm ~= nil then
+                    local res = pcget(function() return rm:GetItemById(item_id) end)
+                    if res ~= nil then
+                        nm = pcget(function() return res.Name[1] end) or '?'
+                    end
+                end
+                menu.vendor_items[#menu.vendor_items + 1] = {
+                    shop_index = shop_index,
+                    item_id    = item_id,
+                    price      = price,
+                    name       = nm,
+                }
+            end
+        end
         menu.last_active = state.frame
         menu.dirty = true
-        -- TODO(phase-c): parse item rows from this packet's body.
         return
     end
 
-    -- 0x03E (shop_open): shop UI fully opened (after 0x03C).
+    -- 0x03E (shop_open): shop UI fully opened. Sometimes arrives
+    -- BEFORE 0x03C, sometimes after - depends on server packet
+    -- ordering. We don't reset here because the per-0x03C handler
+    -- already clears on offset_index==0.
     if e.id == 0x03E then
         menu.kind = 'vendor'
         menu.last_active = state.frame
@@ -1613,18 +1690,84 @@ local function action_buy(item_index, qty)
 end
 
 -- Sell is a TWO-STEP flow in FFXI:
---   1. Client sends 0x084 (SHOP_SELL_REQ) with the inventory item to
---      "appraise" - server responds with the price via 0x03D.
---   2. Client sends 0x085 (SHOP_SELL_SET) with SellFlag=1 to confirm.
--- We implement only step (2) here; the orchestrator does step (1)
--- via a /sell <item> chat command (which is built-in FFXI). Once the
--- appraisal dialog is up, this confirms the sale.
-local function action_sell(item_index, qty)
-    -- TODO(phase-c): full two-step implementation. For now this
-    -- is a stub - see comment above for the protocol shape.
-    msg(('sell(%s, %d) - two-step protocol not yet implemented')
-        :format(tostring(item_index), tonumber(qty) or 1))
-    return false
+--
+--   1. Client sends 0x084 (SHOP_SELL_REQ) with {ItemNum, ItemNo,
+--      ItemIndex}. Server validates the slot and replies with
+--      0x03D (shop_sell) carrying the basePrice. This also stores
+--      the item in the player's shop container's last slot, which
+--      the SHOP_SELL_SET handler reads back when committing.
+--
+--   2. Client sends 0x085 (SHOP_SELL_SET) with {ItemNum, ItemNo,
+--      ItemIndex, SellFlag=1}. Server validates `requiresPriorPacket
+--      (SHOP_SELL_REQ)` AND `mustEqual(SellFlag, 1)`, then debits
+--      the inventory + credits gil.
+--
+-- Both packets must match the same slot/item/qty. We send them
+-- back-to-back with no UI; the server resolves the basePrice from
+-- the item itself, so we don't need to wait for 0x03D before firing
+-- 0x085.
+--
+-- Layout from LSB:
+--   src/map/packets/c2s/0x084_shop_sell_req.h
+--     +0x04: ItemNum    u32  (quantity)
+--     +0x08: ItemNo     u16  (item id)
+--     +0x0A: ItemIndex  u8   (inventory slot)
+--     +0x0B: padding00  u8
+--   src/map/packets/c2s/0x085_shop_sell_set.h
+--     +0x04: SellFlag   u16  (must be 1)
+--     +0x06: padding00  u16
+--   Note: 0x085's body is ONLY the sell flag + padding (4 bytes
+--   total). The item info is read server-side from the container
+--   that 0x084 just populated, NOT from this packet. Total packet
+--   size 8 bytes; the server's size validator rejects anything
+--   larger.
+local function action_sell(slot, item_id, qty)
+    slot    = tonumber(slot)    or -1
+    item_id = tonumber(item_id) or 0
+    qty     = tonumber(qty)     or 1
+    if slot < 1 or item_id == 0 then
+        msg('sell: missing slot or item_id')
+        return false
+    end
+    local pm = AshitaCore:GetPacketManager()
+    if pm == nil then return false end
+
+    -- Phase 1: SHOP_SELL_REQ (0x084). Total = 4 header + 8 body = 12.
+    pm:QueuePacket(0x84, 0x0C, 0x00, 0x00, 0x00, function(ptr)
+        local p = ffi.cast('u8*', ptr)
+        ffi.fill(p + 0x04, 0x08)
+        ffi.cast('u32*', p + 0x04)[0] = qty
+        ffi.cast('u16*', p + 0x08)[0] = item_id
+        p[0x0A] = slot
+        p[0x0B] = 0
+    end)
+
+    -- Phase 2: SHOP_SELL_SET (0x085). Sent on a slightly-deferred
+    -- frame so it lands in a separate Ashita send tick from 0x084
+    -- (different sync field, so the server's per-buffer sync filter
+    -- at map_networking.cpp:425 doesn't drop it). BUT the gap MUST
+    -- stay under the client's 0x015 position-update cadence (~400ms)
+    -- because the server's requiresPriorPacket(SHOP_SELL_REQ) check
+    -- compares m_LastPacketType - which gets clobbered by every
+    -- successfully-validated incoming packet, including 0x015. In
+    -- the real player flow this is fine because the shop UI freezes
+    -- the player so 0x015 stops firing; here we have to thread the
+    -- needle. 2 frames (~33ms) is well under 400ms.
+    defer(2, function()
+        local pm2 = AshitaCore:GetPacketManager()
+        if pm2 == nil then return end
+        -- Total = 4 header + 4 body = 8 bytes (0x08).
+        pm2:QueuePacket(0x85, 0x08, 0x00, 0x00, 0x00, function(ptr)
+            local p = ffi.cast('u8*', ptr)
+            ffi.fill(p + 0x04, 0x04)
+            ffi.cast('u16*', p + 0x04)[0] = 1   -- SellFlag = 1 (commit)
+            -- u16 padding at +0x06 stays zero
+        end)
+    end)
+
+    msg(('sell: queued 0x084 (slot=%d, item_id=%d, qty=%d); 0x085 deferred')
+        :format(slot, item_id, qty))
+    return true
 end
 
 -- ============================================================
@@ -1861,7 +2004,7 @@ local function dispatch_action(act)
         -- LSB-mined catalog before dispatching this action.
         action_buy(act.index, act.qty or 1)
     elseif kind == 'sell' then
-        action_sell(act.index, act.qty or 1)
+        action_sell(act.slot, act.item_id, act.qty or 1)
     elseif kind == 'close_menu' then
         action_close_menu()
     elseif kind == 'escape' then
@@ -2138,6 +2281,42 @@ ashita.events.register('command', 'interact_command', function(e)
             tonumber(args[4]) or 0,
             tonumber(args[5]) or 0,
             tonumber(args[6]) or 0)
+    elseif sub == 'shop' then
+        -- Dump the parsed vendor stock. Useful for verifying 0x03C
+        -- parsing and discovering shop_index values for /interact buy.
+        if #menu.vendor_items == 0 then
+            msg('shop: no vendor stock cached (open a vendor dialog first)')
+            return
+        end
+        msg(('shop: %d items'):format(#menu.vendor_items))
+        for _, row in ipairs(menu.vendor_items) do
+            msg(('shop: [%2d] %-30s id=%5d  %d gil')
+                :format(row.shop_index, row.name, row.item_id, row.price))
+        end
+    elseif sub == 'buy' then
+        -- Manual buy: send 0x083 SHOP_BUY directly. Requires that we
+        -- previously talked to a vendor (so the server has Container
+        -- populated). The dialog event must be CLOSED (validate
+        -- blockedBy({InEvent})) - normally true seconds after 0x03E
+        -- arrives. Usage: /interact buy <shop_index> [qty=1]
+        if not args[3] then
+            msg('usage: /interact buy <shop_index> [qty=1]')
+            return
+        end
+        action_buy(tonumber(args[3]) or -1, tonumber(args[4]) or 1)
+    elseif sub == 'sell' then
+        -- Manual sell: send 0x084 + 0x085 back-to-back. Requires that
+        -- we previously talked to a vendor (Container set), event
+        -- closed, AND that the inventory slot really holds the named
+        -- item id (server validates).
+        -- Usage: /interact sell <inventory_slot> <item_id> [qty=1]
+        if not args[4] then
+            msg('usage: /interact sell <inventory_slot> <item_id> [qty=1]')
+            return
+        end
+        action_sell(tonumber(args[3]) or -1,
+                    tonumber(args[4]) or 0,
+                    tonumber(args[5]) or 1)
     elseif sub == 'pick' then
         -- Manual menu pick. Usage:
         --   /interact pick <hex_option_index> [automated]
@@ -2388,6 +2567,9 @@ ashita.events.register('d3d_present', 'interact_render', function()
     if state.frame % POLL_EVERY_FRAMES == 0 then
         pcall(poll_actions)
     end
+
+    -- Fire any deferred sends whose target frame has arrived.
+    tick_deferred()
 end)
 
 ashita.events.register('unload', 'interact_unload', function()
