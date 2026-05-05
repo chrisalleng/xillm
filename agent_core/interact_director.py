@@ -809,6 +809,35 @@ class InteractDirector:
         if decision == 'pick':
             idx = verdict.get('index')
             if isinstance(idx, int):
+                # Vendor menus don't go through the dialog widget pick
+                # mechanism; the labels we showed the LLM were
+                # synthesized from the 0x03C shop list. Map the picked
+                # option back to a shop_index and fire 0x083 (SHOP_BUY)
+                # directly. The shop UI doesn't auto-close after a buy
+                # so we send escape to dismiss before completing.
+                menu = self.interact.current_menu() or {}
+                if menu.get('kind') == 'vendor':
+                    vendor_items = menu.get('vendor_items') or []
+                    if 0 <= idx < len(vendor_items):
+                        row = vendor_items[idx]
+                        shop_index = int(row.get('shop_index', idx))
+                        item_name  = row.get('name', '?')
+                        self.interact.buy(shop_index, qty=1)
+                        self._last_action_at = time.time()
+                        self._last_script_pick_at = time.time()
+                        _echo.to_chat(
+                            self.cfg, 'interact',
+                            f"buy {item_name} (shop_index={shop_index})")
+                        # Give the server a moment to process the buy
+                        # before we dismiss the UI; otherwise escape
+                        # races the 0x083 handler and the UI looks
+                        # frozen.
+                        self._enter('completed')
+                        return
+                    # Unparseable index -> fail rather than wedge.
+                    self._fail(f"vendor pick index {idx} out of range "
+                               f"({len(vendor_items)} items)")
+                    return
                 # Memory-write driver: addon writes cursor state then
                 # sends 0x05B. With mode=End the server closes the
                 # event and the client dismisses the dialog; mode=

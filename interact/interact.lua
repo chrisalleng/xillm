@@ -168,7 +168,7 @@
 
 addon.name    = 'interact'
 addon.author  = 'xillm'
-addon.version = '0.52'
+addon.version = '0.54'
 addon.desc    = 'NPC menu / vendor / dialog bridge for agent_core'
 addon.commands = {'/interact'}
 
@@ -2119,6 +2119,16 @@ local function publish()
     local mem = read_menu_state()
     local is_open = menu.open or (mem ~= nil)
 
+    -- Vendor sessions don't go through the cursor_struct dialog widget
+    -- (mem is nil for them) AND the dialog event closes immediately
+    -- after 0x03E (so menu.open also flips false). Keep is_open=true
+    -- as long as we have a parsed vendor stock - the agent uses that
+    -- as the "shop is available" signal.
+    if menu.kind == 'vendor' and menu.vendor_items
+            and #menu.vendor_items > 0 then
+        is_open = true
+    end
+
     local prompt = menu.prompt
     local cursor = menu.cursor
     local options = menu.options
@@ -2142,6 +2152,20 @@ local function publish()
         -- be stale across menu transitions within a single event.
         if mem.kind ~= nil and mem.kind ~= 'unknown' then
             kind = mem.kind
+        end
+    end
+
+    -- Vendor synthesized labels: when kind=='vendor' AND we have no
+    -- memory-widget options (vendor UI doesn't use the cursor_struct
+    -- widget list), synthesize options[] from menu.vendor_items so
+    -- the LLM judge sees real labels. The director maps the picked
+    -- option back to a shop_index via the same vendor_items array.
+    if kind == 'vendor' and (#options == 0)
+            and menu.vendor_items and #menu.vendor_items > 0 then
+        options = {}
+        for _, row in ipairs(menu.vendor_items) do
+            options[#options + 1] = ('%s - %d gil'):format(
+                row.name or '?', row.price or 0)
         end
     end
 
