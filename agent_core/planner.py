@@ -39,6 +39,7 @@ from . import goal_manager as _gm
 from . import llm_gateway as _llm
 from . import persistence as _persistence
 from . import relationships as _relationships
+from . import planner_tools as _planner_tools
 from . import web_research as _web_research
 
 
@@ -251,10 +252,47 @@ Goal types you can emit:
                   current main-job level - the command will silently
                   fail and the goal will hang.
   wait            { seconds: <float> }
+  interact_npc    { npc_name:   <str>,
+                    npc_zone:   <int>,
+                    title:      <str>,
+                    completion: { type: "menu_closed" },
+                    hints:      <str>? }
+                  Open dialog with the named NPC and walk every menu
+                  the server presents. The interact director paths to
+                  the NPC's coords from the LSB-derived NPC catalog
+                  (use find_npc / closest_npc in research to discover
+                  the right name + zone). The LLM judge picks options
+                  by phrase-matching the live menu labels against the
+                  goal title and any `hints` text - no `script` is
+                  required for typical shops, signets, home points.
+                  `hints` is free-text guidance ("buy chariot band:
+                  spend conquest points -> Common items -> chariot
+                  band -> Yes"); the judge weights it but still
+                  validates against what's actually on screen. Use
+                  this for: signet, conquest item purchases, home-point
+                  registration, vendor buys with simple branching.
 
 Each goal: id (short string), title, origin ("user" / "auto"),
 state ("pending"), type, subgoals (composite only), and type-specific fields.
 The `roots` list names top-level goal ids in priority order.
+
+NPC DISCOVERY (research phase only):
+  Before emitting interact_npc / travel goals targeting a specific NPC,
+  use the find_npc / closest_npc tools to confirm the NPC's name, zone,
+  and shortest reachable instance. NEVER hard-code an NPC's zone from
+  training data without verifying via the catalog - LSB sometimes moves
+  NPCs across server versions and the catalog is the source of truth.
+  When a goal can be satisfied at multiple NPCs (any nation's conquest
+  overseer, any home-point registrar), use closest_npc(role=...) to pick
+  the easiest one to reach from the player's current zone.
+
+  When you emit an interact_npc goal, `npc_name` MUST be the SPECIFIC
+  NPC name returned by find_npc / closest_npc (e.g. "Rabid Wolf, I.M."),
+  NOT a generic role label ("Conquest Overseer", "Vendor", etc.) and
+  NOT a guess. The director's locate phase looks up that exact name in
+  the catalog; a role label or generic title fails because no such
+  entity exists. Always copy the `name` field verbatim from the
+  closest_npc result.
 
 **The goal tree is FLAT.** `goals` is a single flat array of all
 goal nodes (composites + leaves, in any order). Tree structure comes
@@ -509,7 +547,41 @@ UPDATE_GOALS_TOOL = {
                             'type': {
                                 'type': 'string',
                                 'enum': ['composite', 'travel', 'goto', 'farm',
-                                         'engage_nearby', 'equip', 'wait'],
+                                         'engage_nearby', 'equip', 'wait',
+                                         'interact_npc'],
+                            },
+                            'npc_name': {
+                                'type':        'string',
+                                'description': (
+                                    'For interact_npc goals: the NPC '
+                                    "name as in the LSB catalog "
+                                    "(polutils form, e.g. 'Rabid Wolf, "
+                                    "I.M.'). Verify via find_npc."
+                                ),
+                            },
+                            'npc_zone': {
+                                'type':        'integer',
+                                'description': (
+                                    'For interact_npc goals: the zone '
+                                    'id where the NPC lives (verify '
+                                    'via find_npc).'
+                                ),
+                            },
+                            'completion': {
+                                'type':        'object',
+                                'description': (
+                                    'For interact_npc goals: completion '
+                                    "criterion. Use {type: 'menu_closed'} "
+                                    'for normal shop / dialog purchases.'
+                                ),
+                            },
+                            'hints': {
+                                'type':        'string',
+                                'description': (
+                                    'For interact_npc goals: free-text '
+                                    'menu navigation guidance the judge '
+                                    "weights when picking options."
+                                ),
                             },
                             'subgoals': {
                                 'type': 'array',
@@ -1491,13 +1563,37 @@ class Planner:
         research_system = (
             _web_research.ERA_CONSTRAINT
             + '\n\nYou are doing pre-plan research, NOT yet committing '
-              'to a plan. Use web_search and web_fetch to gather facts '
-              'relevant to the user instruction (zone level ranges, '
-              'mob types, quest prereqs, job-unlock steps). Prefer '
-              'queries that target classicffxi.fandom.com or the '
-              'LandSandBoat repo. End with a concise 3-6 sentence '
-              'summary of the facts that will inform the plan. Do NOT '
-              'propose a plan or list goals - that is the next step.'
+              'to a plan. Tools available:\n\n'
+              '  - web_search / web_fetch: era-correct facts (zone '
+              'level ranges, mob types, quest prereqs, job-unlock '
+              'steps). Prefer classicffxi.fandom.com or the '
+              'LandSandBoat repo.\n'
+              '  - find_npc(role=, name_contains=, zone_id=, '
+              'zone_name=): query the LSB-derived NPC catalog. Useful '
+              "role tags include 'conquest_overseer' (signet, rank "
+              "gear), 'vendor', 'homepoint', 'survival_guide', "
+              "'moghouse', 'auction_house', 'trust_master', "
+              "'storage'. Prefer find_npc over web_search when you "
+              "need an NPC's exact name, zone, or position - the "
+              'catalog has world coords scraped from the server.\n'
+              '  - closest_npc(from_zone=, role= or name_contains= '
+              'or candidate_ids=): rank matching NPCs by safety-'
+              "weighted travel cost from the character's current "
+              "zone. Picks the easiest one to reach when a goal can "
+              "be satisfied at multiple NPCs (any nation's overseer, "
+              "any homepoint, etc.).\n"
+              '  - list_zones(zone_id= or type=): inspect zone meta '
+              '(name, type CITY/OUTDOORS/DUNGEON/...). Use to verify '
+              "a zone is safe to traverse.\n"
+              '  - set_zone_safety(zone_id, verdict, reason): mark a '
+              "zone safe or dangerous for THIS character based on "
+              "level/job. Use 'safe' when the character is overlevel "
+              "for the zone's mob aggro range so future closest_npc "
+              "queries can route through it (default treats DUNGEON "
+              "zones as 100x cost, so they're avoided).\n\n"
+              'End with a concise 3-6 sentence summary of the facts '
+              'that will inform the plan. Do NOT propose a plan or '
+              'list goals - that is the next step.'
         )
         user_prompt = (
             f'User instruction:\n  "{user_text}"\n\n'
@@ -1507,15 +1603,30 @@ class Planner:
             f'fetches is usually enough.'
         )
         try:
+            handlers = {
+                **_web_research.make_handlers(self.cfg),
+                **_planner_tools.make_handlers(self.cfg),
+            }
             result = self.llm.run_tool_loop(
                 tier='deliberative',
                 system_prompt=research_system,
                 user_prompt=user_prompt,
                 tools=[_web_research.WEB_SEARCH_TOOL,
-                       _web_research.WEB_FETCH_TOOL],
-                tool_handlers=_web_research.make_handlers(self.cfg),
-                max_iters=6,
-                max_tokens=1024,
+                       _web_research.WEB_FETCH_TOOL,
+                       _planner_tools.FIND_NPC_TOOL,
+                       _planner_tools.CLOSEST_NPC_TOOL,
+                       _planner_tools.LIST_ZONES_TOOL,
+                       _planner_tools.SET_ZONE_SAFETY_TOOL],
+                tool_handlers=handlers,
+                # Bumped from 8 -> 16 after observing the LLM hit max
+                # before converging on a final summary when it had to
+                # interleave find_npc + closest_npc + web_search calls.
+                # Worst-case research time goes from ~80s to ~160s but
+                # only on failed-convergence runs; normal 3-5 iter runs
+                # are unaffected. Keep proportional max_tokens so the
+                # final summary doesn't truncate.
+                max_iters=16,
+                max_tokens=2048,
                 source='planner_research',
             )
             return (result.final_text or '').strip()

@@ -319,16 +319,101 @@ class InteractDirector:
         # along with mobs, but the LLM should not be naming mobs in
         # interact_npc directives so substring match is fine.
         candidates = _entities.find_mobs(self.cfg, snap.zone_id, npc_name)
-        if not candidates:
-            self._fail(f'no entity matching {npc_name!r} in zone {snap.zone_id} '
-                       f'(catalog may not have observed this NPC yet)')
+        if candidates:
+            rec = _entities.closest_mob(
+                self.cfg, snap.zone_id, npc_name,
+                snap.x or 0.0, snap.y or 0.0,
+            )
+            self._npc_record = rec or candidates[0]
+            self._enter('approach')
             return
-        rec = _entities.closest_mob(
-            self.cfg, snap.zone_id, npc_name,
-            snap.x or 0.0, snap.y or 0.0,
-        )
-        self._npc_record = rec or candidates[0]
-        self._enter('approach')
+
+        # Fallback to the LSB-derived NPC catalog. The live entities
+        # catalog only contains NPCs the agent has personally observed
+        # (populated via 0x05B widescan results), which fails for
+        # planner-driven first visits. The LSB catalog has every
+        # server-known NPC with stable npcids (= server_id) and world
+        # coordinates baked in, so we can synthesize a usable record
+        # without prior in-game observation.
+        #
+        # Two lookup strategies, in order:
+        #  1. Substring name match: handles the common case where the
+        #     planner correctly emits an NPC's polutils-form name from
+        #     find_npc results ("Rabid Wolf, I.M.").
+        #  2. Role-tag interpretation: if the planner emits a role
+        #     description instead ("Conquest Overseer", "Vendor"),
+        #     translate to the role index keys (lowercase, underscored)
+        #     and pick the closest matching NPC in this zone. This is
+        #     a fallback for when the LLM's output drifts from the
+        #     prompt requirement to use specific names.
+        try:
+            from . import nav_router as _nr
+            cat = _nr.NPCCatalog(self.cfg.paths.npcs_file)
+            matches = cat.find(name_contains=npc_name, zone_id=snap.zone_id, limit=10)
+            if not matches:
+                role_key = (
+                    npc_name.lower()
+                            .replace("'", '')
+                            .replace(',', '')
+                            .replace('.', '')
+                            .strip()
+                            .replace(' ', '_')
+                )
+                if role_key in cat.role_tags:
+                    matches = cat.find(role=role_key, zone_id=snap.zone_id, limit=20)
+                    if matches:
+                        print(f'  interact_director: directive npc_name={npc_name!r} '
+                              f'matched role tag {role_key!r}; resolving to '
+                              f'{matches[0].get("name")!r} (closest in zone)')
+        except Exception as e:
+            print(f'  interact_director: LSB catalog lookup failed: {e}')
+            matches = []
+        if matches:
+            # Closest by 2D distance from current position.
+            cx = snap.x or 0.0
+            cz = snap.z or 0.0
+            def dist2(n: dict[str, Any]) -> float:
+                dx = (n.get('x') or 0.0) - cx
+                dz = (n.get('z') or 0.0) - cz
+                return dx*dx + dz*dz
+            best = sorted(matches, key=dist2)[0]
+            # Synthesize a record matching the entities-catalog shape
+            # (center_x/y/z, server_id). `server_id` from npc_list.sql
+            # IS the same value the client's 0x01A Talk packet targets
+            # (verified: Rabid Wolf, I.M. = 17739828 = npcid in SQL =
+            # target in live packet capture).
+            #
+            # Coordinate convention swap: LSB SQL uses (pos_x, pos_y,
+            # pos_z) where pos_y = elevation and pos_z = north-south.
+            # Ashita / nav addon / entities catalog uses (x, y, z)
+            # where y = north-south and z = elevation. So we map
+            # LSB(x, y, z) -> Ashita(x, z, y). Verified against the
+            # live entities catalog record for Rabid Wolf (LSB SQL
+            # = (-346.354, -10.002, -184.252); live catalog center_y
+            # = -184.252, center_z = -10.002).
+            lsb_x = best.get('x') or 0.0
+            lsb_y = best.get('y') or 0.0
+            lsb_z = best.get('z') or 0.0
+            ashita_x = lsb_x
+            ashita_y = lsb_z
+            ashita_z = lsb_y
+            self._npc_record = {
+                'name':      best.get('name') or best.get('lua_name'),
+                'server_id': best.get('id'),
+                'center_x':  ashita_x,
+                'center_y':  ashita_y,
+                'center_z':  ashita_z,
+                'min_x':     ashita_x, 'max_x': ashita_x,
+                'min_y':     ashita_y, 'max_y': ashita_y,
+                'zone_id':   best.get('zone_id'),
+                'type':      2,  # NPC
+                '_source':   'lsb_catalog',
+            }
+            self._enter('approach')
+            return
+
+        self._fail(f'no entity matching {npc_name!r} in zone {snap.zone_id} '
+                   f'(neither live catalog nor LSB-derived catalog has it)')
 
     def _tick_approach(self) -> None:
         rec = self._npc_record

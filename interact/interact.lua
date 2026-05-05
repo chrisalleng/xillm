@@ -168,7 +168,7 @@
 
 addon.name    = 'interact'
 addon.author  = 'xillm'
-addon.version = '0.42'
+addon.version = '0.43'
 addon.desc    = 'NPC menu / vendor / dialog bridge for agent_core'
 addon.commands = {'/interact'}
 
@@ -1426,14 +1426,28 @@ local function submit_menu_pick(index)
     end)
     if cursor_struct == nil or cursor_struct == 0 then return false end
 
-    -- Translate visible position -> master index. Critical for menus
-    -- that filter rank-locked items: visible position 4 may be master
-    -- option 12 (Chariot band) while master option 4 is the rank-10
-    -- Republic Signet staff that's hidden from this player.
-    -- The alt-path in 0x01B02909 stores (flag - 1) as the picked
-    -- option, so flag must fit in uint16 and not equal 0xFF (the
-    -- special crash path). Useful range: 1..0xFE.
-    local flag = visible_to_master(cursor_struct, tonumber(index) or 0)
+    -- Flag = visible_position + 1. The client's per-frame consumer at
+    -- FFXIMain 0x01B02909 reads this as (flag - 1) = the picked
+    -- visible option, then dispatches its own per-NPC option lookup.
+    --
+    -- DO NOT use widget +0x2C as the flag value. Earlier exploration
+    -- found the widget node has a uint8 at +0x2C that varies per
+    -- widget and tracked closely with master indices on the items
+    -- list / Republic Signet staff test, suggesting it was the
+    -- "right" submit value. But cross-menu testing shows it's
+    -- actually a UI sequence number / row-id that doesn't map to
+    -- the per-frame consumer's option-lookup index. For the main
+    -- conversation menu the +0x2C values are [11, 12, 14, 15, 16]
+    -- and writing those values either no-ops or closes the dialog;
+    -- only flag = visible+1 (i.e. [1, 2, 3, 4, 5]) advances correctly.
+    --
+    -- Useful range: 1..0xFE. 0xFF crashes the client (special path).
+    --
+    -- For HIDDEN options (rank-locked items, etc.) that aren't in
+    -- the visible widget list, the flag has to be hand-picked from
+    -- the option_array indices - that path is exposed via
+    -- /interact pickraw <hex_flag> for testing.
+    local flag = (tonumber(index) or 0) + 1
     flag = math.max(1, math.min(0xFE, flag))
 
     return pcall(function()

@@ -1,0 +1,2105 @@
+{
+  "lsb_source": "/home/chris/workspace/lsb-server",
+  "zones": {
+    "0": {
+      "enum_name": "UNKNOWN",
+      "name": "unknown",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 0
+    },
+    "1": {
+      "enum_name": "PHANAUET_CHANNEL",
+      "name": "Phanauet_Channel",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 1
+    },
+    "10": {
+      "enum_name": "THE_SHROUDED_MAW",
+      "name": "The_Shrouded_Maw",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 10
+    },
+    "100": {
+      "enum_name": "WEST_RONFAURE",
+      "name": "West_Ronfaure",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 100
+    },
+    "101": {
+      "enum_name": "EAST_RONFAURE",
+      "name": "East_Ronfaure",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 101
+    },
+    "102": {
+      "enum_name": "LA_THEINE_PLATEAU",
+      "name": "La_Theine_Plateau",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 102
+    },
+    "103": {
+      "enum_name": "VALKURM_DUNES",
+      "name": "Valkurm_Dunes",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 103
+    },
+    "104": {
+      "enum_name": "JUGNER_FOREST",
+      "name": "Jugner_Forest",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 104
+    },
+    "105": {
+      "enum_name": "BATALLIA_DOWNS",
+      "name": "Batallia_Downs",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 105
+    },
+    "106": {
+      "enum_name": "NORTH_GUSTABERG",
+      "name": "North_Gustaberg",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 106
+    },
+    "107": {
+      "enum_name": "SOUTH_GUSTABERG",
+      "name": "South_Gustaberg",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 107
+    },
+    "108": {
+      "enum_name": "KONSCHTAT_HIGHLANDS",
+      "name": "Konschtat_Highlands",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 108
+    },
+    "109": {
+      "enum_name": "PASHHOW_MARSHLANDS",
+      "name": "Pashhow_Marshlands",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 109
+    },
+    "11": {
+      "enum_name": "OLDTON_MOVALPOLOS",
+      "name": "Oldton_Movalpolos",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 11
+    },
+    "110": {
+      "enum_name": "ROLANBERRY_FIELDS",
+      "name": "Rolanberry_Fields",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 110
+    },
+    "111": {
+      "enum_name": "BEAUCEDINE_GLACIER",
+      "name": "Beaucedine_Glacier",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 111
+    },
+    "112": {
+      "enum_name": "XARCABARD",
+      "name": "Xarcabard",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 112
+    },
+    "113": {
+      "enum_name": "CAPE_TERIGGAN",
+      "name": "Cape_Teriggan",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 113
+    },
+    "114": {
+      "enum_name": "EASTERN_ALTEPA_DESERT",
+      "name": "Eastern_Altepa_Desert",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 114
+    },
+    "115": {
+      "enum_name": "WEST_SARUTABARUTA",
+      "name": "West_Sarutabaruta",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 115
+    },
+    "116": {
+      "enum_name": "EAST_SARUTABARUTA",
+      "name": "East_Sarutabaruta",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 116
+    },
+    "117": {
+      "enum_name": "TAHRONGI_CANYON",
+      "name": "Tahrongi_Canyon",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 117
+    },
+    "118": {
+      "enum_name": "BUBURIMU_PENINSULA",
+      "name": "Buburimu_Peninsula",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 118
+    },
+    "119": {
+      "enum_name": "MERIPHATAUD_MOUNTAINS",
+      "name": "Meriphataud_Mountains",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 119
+    },
+    "12": {
+      "enum_name": "NEWTON_MOVALPOLOS",
+      "name": "Newton_Movalpolos",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 12
+    },
+    "120": {
+      "enum_name": "SAUROMUGUE_CHAMPAIGN",
+      "name": "Sauromugue_Champaign",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 120
+    },
+    "121": {
+      "enum_name": "THE_SANCTUARY_OF_ZITAH",
+      "name": "The_Sanctuary_of_ZiTah",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 121
+    },
+    "122": {
+      "enum_name": "ROMAEVE",
+      "name": "RoMaeve",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 122
+    },
+    "123": {
+      "enum_name": "YUHTUNGA_JUNGLE",
+      "name": "Yuhtunga_Jungle",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 123
+    },
+    "124": {
+      "enum_name": "YHOATOR_JUNGLE",
+      "name": "Yhoator_Jungle",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 124
+    },
+    "125": {
+      "enum_name": "WESTERN_ALTEPA_DESERT",
+      "name": "Western_Altepa_Desert",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 125
+    },
+    "126": {
+      "enum_name": "QUFIM_ISLAND",
+      "name": "Qufim_Island",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 126
+    },
+    "127": {
+      "enum_name": "BEHEMOTHS_DOMINION",
+      "name": "Behemoths_Dominion",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 127
+    },
+    "128": {
+      "enum_name": "VALLEY_OF_SORROWS",
+      "name": "Valley_of_Sorrows",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 128
+    },
+    "129": {
+      "enum_name": "GHOYUS_REVERIE",
+      "name": "Ghoyus_Reverie",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 129
+    },
+    "13": {
+      "enum_name": "MINE_SHAFT_2716",
+      "name": "Mine_Shaft_2716",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 13
+    },
+    "130": {
+      "enum_name": "RUAUN_GARDENS",
+      "name": "RuAun_Gardens",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 130
+    },
+    "131": {
+      "enum_name": "MORDION_GAOL",
+      "name": "Mordion_Gaol",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 131
+    },
+    "132": {
+      "enum_name": "ABYSSEA_LA_THEINE",
+      "name": "Abyssea-La_Theine",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 132
+    },
+    "133": {
+      "enum_name": "OUTER_RAKAZNAR_U2",
+      "name": "Outer_RaKaznar_[U2]",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 133
+    },
+    "134": {
+      "enum_name": "DYNAMIS_BEAUCEDINE",
+      "name": "Dynamis-Beaucedine",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 134
+    },
+    "135": {
+      "enum_name": "DYNAMIS_XARCABARD",
+      "name": "Dynamis-Xarcabard",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 135
+    },
+    "136": {
+      "enum_name": "BEAUCEDINE_GLACIER_S",
+      "name": "Beaucedine_Glacier_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 136
+    },
+    "137": {
+      "enum_name": "XARCABARD_S",
+      "name": "Xarcabard_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 137
+    },
+    "138": {
+      "enum_name": "CASTLE_ZVAHL_BAILEYS_S",
+      "name": "Castle_Zvahl_Baileys_[S]",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 138
+    },
+    "139": {
+      "enum_name": "HORLAIS_PEAK",
+      "name": "Horlais_Peak",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 139
+    },
+    "14": {
+      "enum_name": "HALL_OF_TRANSFERENCE",
+      "name": "Hall_of_Transference",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 14
+    },
+    "140": {
+      "enum_name": "GHELSBA_OUTPOST",
+      "name": "Ghelsba_Outpost",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 140
+    },
+    "141": {
+      "enum_name": "FORT_GHELSBA",
+      "name": "Fort_Ghelsba",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 141
+    },
+    "142": {
+      "enum_name": "YUGHOTT_GROTTO",
+      "name": "Yughott_Grotto",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 142
+    },
+    "143": {
+      "enum_name": "PALBOROUGH_MINES",
+      "name": "Palborough_Mines",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 143
+    },
+    "144": {
+      "enum_name": "WAUGHROON_SHRINE",
+      "name": "Waughroon_Shrine",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 144
+    },
+    "145": {
+      "enum_name": "GIDDEUS",
+      "name": "Giddeus",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 145
+    },
+    "146": {
+      "enum_name": "BALGAS_DAIS",
+      "name": "Balgas_Dais",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 146
+    },
+    "147": {
+      "enum_name": "BEADEAUX",
+      "name": "Beadeaux",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 147
+    },
+    "148": {
+      "enum_name": "QULUN_DOME",
+      "name": "Qulun_Dome",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 148
+    },
+    "149": {
+      "enum_name": "DAVOI",
+      "name": "Davoi",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 149
+    },
+    "15": {
+      "enum_name": "ABYSSEA_KONSCHTAT",
+      "name": "Abyssea-Konschtat",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 15
+    },
+    "150": {
+      "enum_name": "MONASTIC_CAVERN",
+      "name": "Monastic_Cavern",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 150
+    },
+    "151": {
+      "enum_name": "CASTLE_OZTROJA",
+      "name": "Castle_Oztroja",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 151
+    },
+    "152": {
+      "enum_name": "ALTAR_ROOM",
+      "name": "Altar_Room",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 152
+    },
+    "153": {
+      "enum_name": "THE_BOYAHDA_TREE",
+      "name": "The_Boyahda_Tree",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 153
+    },
+    "154": {
+      "enum_name": "DRAGONS_AERY",
+      "name": "Dragons_Aery",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 154
+    },
+    "155": {
+      "enum_name": "CASTLE_ZVAHL_KEEP_S",
+      "name": "Castle_Zvahl_Keep_[S]",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 155
+    },
+    "156": {
+      "enum_name": "THRONE_ROOM_S",
+      "name": "Throne_Room_[S]",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 156
+    },
+    "157": {
+      "enum_name": "MIDDLE_DELKFUTTS_TOWER",
+      "name": "Middle_Delkfutts_Tower",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 157
+    },
+    "158": {
+      "enum_name": "UPPER_DELKFUTTS_TOWER",
+      "name": "Upper_Delkfutts_Tower",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 158
+    },
+    "159": {
+      "enum_name": "TEMPLE_OF_UGGALEPIH",
+      "name": "Temple_of_Uggalepih",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 159
+    },
+    "16": {
+      "enum_name": "PROMYVION_HOLLA",
+      "name": "Promyvion-Holla",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 16
+    },
+    "160": {
+      "enum_name": "DEN_OF_RANCOR",
+      "name": "Den_of_Rancor",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 160
+    },
+    "161": {
+      "enum_name": "CASTLE_ZVAHL_BAILEYS",
+      "name": "Castle_Zvahl_Baileys",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 161
+    },
+    "162": {
+      "enum_name": "CASTLE_ZVAHL_KEEP",
+      "name": "Castle_Zvahl_Keep",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 162
+    },
+    "163": {
+      "enum_name": "SACRIFICIAL_CHAMBER",
+      "name": "Sacrificial_Chamber",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 163
+    },
+    "164": {
+      "enum_name": "GARLAIGE_CITADEL_S",
+      "name": "Garlaige_Citadel_[S]",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 164
+    },
+    "165": {
+      "enum_name": "THRONE_ROOM",
+      "name": "Throne_Room",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 165
+    },
+    "166": {
+      "enum_name": "RANGUEMONT_PASS",
+      "name": "Ranguemont_Pass",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 166
+    },
+    "167": {
+      "enum_name": "BOSTAUNIEUX_OUBLIETTE",
+      "name": "Bostaunieux_Oubliette",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 167
+    },
+    "168": {
+      "enum_name": "CHAMBER_OF_ORACLES",
+      "name": "Chamber_of_Oracles",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 168
+    },
+    "169": {
+      "enum_name": "TORAIMARAI_CANAL",
+      "name": "Toraimarai_Canal",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 169
+    },
+    "17": {
+      "enum_name": "SPIRE_OF_HOLLA",
+      "name": "Spire_of_Holla",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 17
+    },
+    "170": {
+      "enum_name": "FULL_MOON_FOUNTAIN",
+      "name": "Full_Moon_Fountain",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 170
+    },
+    "171": {
+      "enum_name": "CRAWLERS_NEST_S",
+      "name": "Crawlers_Nest_[S]",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 171
+    },
+    "172": {
+      "enum_name": "ZERUHN_MINES",
+      "name": "Zeruhn_Mines",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 172
+    },
+    "173": {
+      "enum_name": "KORROLOKA_TUNNEL",
+      "name": "Korroloka_Tunnel",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 173
+    },
+    "174": {
+      "enum_name": "KUFTAL_TUNNEL",
+      "name": "Kuftal_Tunnel",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 174
+    },
+    "175": {
+      "enum_name": "THE_ELDIEME_NECROPOLIS_S",
+      "name": "The_Eldieme_Necropolis_[S]",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 175
+    },
+    "176": {
+      "enum_name": "SEA_SERPENT_GROTTO",
+      "name": "Sea_Serpent_Grotto",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 176
+    },
+    "177": {
+      "enum_name": "VELUGANNON_PALACE",
+      "name": "VeLugannon_Palace",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 177
+    },
+    "178": {
+      "enum_name": "THE_SHRINE_OF_RUAVITAU",
+      "name": "The_Shrine_of_RuAvitau",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 178
+    },
+    "179": {
+      "enum_name": "STELLAR_FULCRUM",
+      "name": "Stellar_Fulcrum",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 179
+    },
+    "18": {
+      "enum_name": "PROMYVION_DEM",
+      "name": "Promyvion-Dem",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 18
+    },
+    "180": {
+      "enum_name": "LALOFF_AMPHITHEATER",
+      "name": "LaLoff_Amphitheater",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 180
+    },
+    "181": {
+      "enum_name": "THE_CELESTIAL_NEXUS",
+      "name": "The_Celestial_Nexus",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 181
+    },
+    "182": {
+      "enum_name": "WALK_OF_ECHOES",
+      "name": "Walk_of_Echoes",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 182
+    },
+    "183": {
+      "enum_name": "MAQUETTE_ABDHALJS_LEGION_A",
+      "name": "Maquette_Abdhaljs-Legion_A",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 183
+    },
+    "184": {
+      "enum_name": "LOWER_DELKFUTTS_TOWER",
+      "name": "Lower_Delkfutts_Tower",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 184
+    },
+    "185": {
+      "enum_name": "DYNAMIS_SAN_DORIA",
+      "name": "Dynamis-San_dOria",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 185
+    },
+    "186": {
+      "enum_name": "DYNAMIS_BASTOK",
+      "name": "Dynamis-Bastok",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 186
+    },
+    "187": {
+      "enum_name": "DYNAMIS_WINDURST",
+      "name": "Dynamis-Windurst",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 187
+    },
+    "188": {
+      "enum_name": "DYNAMIS_JEUNO",
+      "name": "Dynamis-Jeuno",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 188
+    },
+    "189": {
+      "enum_name": "OUTER_RAKAZNAR_U3",
+      "name": "Outer_RaKaznar_[U3]",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 189
+    },
+    "19": {
+      "enum_name": "SPIRE_OF_DEM",
+      "name": "Spire_of_Dem",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 19
+    },
+    "190": {
+      "enum_name": "KING_RANPERRES_TOMB",
+      "name": "King_Ranperres_Tomb",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 190
+    },
+    "191": {
+      "enum_name": "DANGRUF_WADI",
+      "name": "Dangruf_Wadi",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 191
+    },
+    "192": {
+      "enum_name": "INNER_HORUTOTO_RUINS",
+      "name": "Inner_Horutoto_Ruins",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 192
+    },
+    "193": {
+      "enum_name": "ORDELLES_CAVES",
+      "name": "Ordelles_Caves",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 193
+    },
+    "194": {
+      "enum_name": "OUTER_HORUTOTO_RUINS",
+      "name": "Outer_Horutoto_Ruins",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 194
+    },
+    "195": {
+      "enum_name": "THE_ELDIEME_NECROPOLIS",
+      "name": "The_Eldieme_Necropolis",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 195
+    },
+    "196": {
+      "enum_name": "GUSGEN_MINES",
+      "name": "Gusgen_Mines",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 196
+    },
+    "197": {
+      "enum_name": "CRAWLERS_NEST",
+      "name": "Crawlers_Nest",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 197
+    },
+    "198": {
+      "enum_name": "MAZE_OF_SHAKHRAMI",
+      "name": "Maze_of_Shakhrami",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 198
+    },
+    "199": {
+      "enum_name": null,
+      "name": "Residential_Area",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 199
+    },
+    "2": {
+      "enum_name": "CARPENTERS_LANDING",
+      "name": "Carpenters_Landing",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 2
+    },
+    "20": {
+      "enum_name": "PROMYVION_MEA",
+      "name": "Promyvion-Mea",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 20
+    },
+    "200": {
+      "enum_name": "GARLAIGE_CITADEL",
+      "name": "Garlaige_Citadel",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 200
+    },
+    "201": {
+      "enum_name": "CLOISTER_OF_GALES",
+      "name": "Cloister_of_Gales",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 201
+    },
+    "202": {
+      "enum_name": "CLOISTER_OF_STORMS",
+      "name": "Cloister_of_Storms",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 202
+    },
+    "203": {
+      "enum_name": "CLOISTER_OF_FROST",
+      "name": "Cloister_of_Frost",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 203
+    },
+    "204": {
+      "enum_name": "FEIYIN",
+      "name": "FeiYin",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 204
+    },
+    "205": {
+      "enum_name": "IFRITS_CAULDRON",
+      "name": "Ifrits_Cauldron",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 205
+    },
+    "206": {
+      "enum_name": "QUBIA_ARENA",
+      "name": "QuBia_Arena",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 206
+    },
+    "207": {
+      "enum_name": "CLOISTER_OF_FLAMES",
+      "name": "Cloister_of_Flames",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 207
+    },
+    "208": {
+      "enum_name": "QUICKSAND_CAVES",
+      "name": "Quicksand_Caves",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 208
+    },
+    "209": {
+      "enum_name": "CLOISTER_OF_TREMORS",
+      "name": "Cloister_of_Tremors",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 209
+    },
+    "21": {
+      "enum_name": "SPIRE_OF_MEA",
+      "name": "Spire_of_Mea",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 21
+    },
+    "210": {
+      "enum_name": "GM_HOME",
+      "name": "GM_Home",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 210
+    },
+    "211": {
+      "enum_name": "CLOISTER_OF_TIDES",
+      "name": "Cloister_of_Tides",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 211
+    },
+    "212": {
+      "enum_name": "GUSTAV_TUNNEL",
+      "name": "Gustav_Tunnel",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 212
+    },
+    "213": {
+      "enum_name": "LABYRINTH_OF_ONZOZO",
+      "name": "Labyrinth_of_Onzozo",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 213
+    },
+    "214": {
+      "enum_name": null,
+      "name": "Residential_Area",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 214
+    },
+    "215": {
+      "enum_name": "ABYSSEA_ATTOHWA",
+      "name": "Abyssea-Attohwa",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 215
+    },
+    "216": {
+      "enum_name": "ABYSSEA_MISAREAUX",
+      "name": "Abyssea-Misareaux",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 216
+    },
+    "217": {
+      "enum_name": "ABYSSEA_VUNKERL",
+      "name": "Abyssea-Vunkerl",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 217
+    },
+    "218": {
+      "enum_name": "ABYSSEA_ALTEPA",
+      "name": "Abyssea-Altepa",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 218
+    },
+    "219": {
+      "enum_name": "RESIDENTIAL_AREA",
+      "name": "Residential_Area",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 219
+    },
+    "22": {
+      "enum_name": "PROMYVION_VAHZL",
+      "name": "Promyvion-Vahzl",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 22
+    },
+    "220": {
+      "enum_name": "SHIP_BOUND_FOR_SELBINA",
+      "name": "Ship_bound_for_Selbina",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 220
+    },
+    "221": {
+      "enum_name": "SHIP_BOUND_FOR_MHAURA",
+      "name": "Ship_bound_for_Mhaura",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 221
+    },
+    "222": {
+      "enum_name": "PROVENANCE",
+      "name": "Provenance",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 222
+    },
+    "223": {
+      "enum_name": "SAN_DORIA_JEUNO_AIRSHIP",
+      "name": "San_dOria-Jeuno_Airship",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 223
+    },
+    "224": {
+      "enum_name": "BASTOK_JEUNO_AIRSHIP",
+      "name": "Bastok-Jeuno_Airship",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 224
+    },
+    "225": {
+      "enum_name": "WINDURST_JEUNO_AIRSHIP",
+      "name": "Windurst-Jeuno_Airship",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 225
+    },
+    "226": {
+      "enum_name": "KAZHAM_JEUNO_AIRSHIP",
+      "name": "Kazham-Jeuno_Airship",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 226
+    },
+    "227": {
+      "enum_name": "SHIP_BOUND_FOR_SELBINA_PIRATES",
+      "name": "Ship_bound_for_Selbina_Pirates",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 227
+    },
+    "228": {
+      "enum_name": "SHIP_BOUND_FOR_MHAURA_PIRATES",
+      "name": "Ship_bound_for_Mhaura_Pirates",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 228
+    },
+    "229": {
+      "enum_name": "THRONE_ROOM_V",
+      "name": "Throne_Room_[V]",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 229
+    },
+    "23": {
+      "enum_name": "SPIRE_OF_VAHZL",
+      "name": "Spire_of_Vahzl",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 23
+    },
+    "230": {
+      "enum_name": "SOUTHERN_SAN_DORIA",
+      "name": "Southern_San_dOria",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 230
+    },
+    "231": {
+      "enum_name": "NORTHERN_SAN_DORIA",
+      "name": "Northern_San_dOria",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 231
+    },
+    "232": {
+      "enum_name": "PORT_SAN_DORIA",
+      "name": "Port_San_dOria",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 232
+    },
+    "233": {
+      "enum_name": "CHATEAU_DORAGUILLE",
+      "name": "Chateau_dOraguille",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 233
+    },
+    "234": {
+      "enum_name": "BASTOK_MINES",
+      "name": "Bastok_Mines",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 234
+    },
+    "235": {
+      "enum_name": "BASTOK_MARKETS",
+      "name": "Bastok_Markets",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 235
+    },
+    "236": {
+      "enum_name": "PORT_BASTOK",
+      "name": "Port_Bastok",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 236
+    },
+    "237": {
+      "enum_name": "METALWORKS",
+      "name": "Metalworks",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 237
+    },
+    "238": {
+      "enum_name": "WINDURST_WATERS",
+      "name": "Windurst_Waters",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 238
+    },
+    "239": {
+      "enum_name": "WINDURST_WALLS",
+      "name": "Windurst_Walls",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 239
+    },
+    "24": {
+      "enum_name": "LUFAISE_MEADOWS",
+      "name": "Lufaise_Meadows",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 24
+    },
+    "240": {
+      "enum_name": "PORT_WINDURST",
+      "name": "Port_Windurst",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 240
+    },
+    "241": {
+      "enum_name": "WINDURST_WOODS",
+      "name": "Windurst_Woods",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 241
+    },
+    "242": {
+      "enum_name": "HEAVENS_TOWER",
+      "name": "Heavens_Tower",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 242
+    },
+    "243": {
+      "enum_name": "RULUDE_GARDENS",
+      "name": "RuLude_Gardens",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 243
+    },
+    "244": {
+      "enum_name": "UPPER_JEUNO",
+      "name": "Upper_Jeuno",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 244
+    },
+    "245": {
+      "enum_name": "LOWER_JEUNO",
+      "name": "Lower_Jeuno",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 245
+    },
+    "246": {
+      "enum_name": "PORT_JEUNO",
+      "name": "Port_Jeuno",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 246
+    },
+    "247": {
+      "enum_name": "RABAO",
+      "name": "Rabao",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 247
+    },
+    "248": {
+      "enum_name": "SELBINA",
+      "name": "Selbina",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 248
+    },
+    "249": {
+      "enum_name": "MHAURA",
+      "name": "Mhaura",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 249
+    },
+    "25": {
+      "enum_name": "MISAREAUX_COAST",
+      "name": "Misareaux_Coast",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 25
+    },
+    "250": {
+      "enum_name": "KAZHAM",
+      "name": "Kazham",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 250
+    },
+    "251": {
+      "enum_name": "HALL_OF_THE_GODS",
+      "name": "Hall_of_the_Gods",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 251
+    },
+    "252": {
+      "enum_name": "NORG",
+      "name": "Norg",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 252
+    },
+    "253": {
+      "enum_name": "ABYSSEA_ULEGUERAND",
+      "name": "Abyssea-Uleguerand",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 253
+    },
+    "254": {
+      "enum_name": "ABYSSEA_GRAUBERG",
+      "name": "Abyssea-Grauberg",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 254
+    },
+    "255": {
+      "enum_name": "ABYSSEA_EMPYREAL_PARADOX",
+      "name": "Abyssea-Empyreal_Paradox",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 255
+    },
+    "256": {
+      "enum_name": "WESTERN_ADOULIN",
+      "name": "Western_Adoulin",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 256
+    },
+    "257": {
+      "enum_name": "EASTERN_ADOULIN",
+      "name": "Eastern_Adoulin",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 257
+    },
+    "258": {
+      "enum_name": "RALA_WATERWAYS",
+      "name": "Rala_Waterways",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 258
+    },
+    "259": {
+      "enum_name": "RALA_WATERWAYS_U",
+      "name": "Rala_Waterways_U",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 259
+    },
+    "26": {
+      "enum_name": "TAVNAZIAN_SAFEHOLD",
+      "name": "Tavnazian_Safehold",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 26
+    },
+    "260": {
+      "enum_name": "YAHSE_HUNTING_GROUNDS",
+      "name": "Yahse_Hunting_Grounds",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 260
+    },
+    "261": {
+      "enum_name": "CEIZAK_BATTLEGROUNDS",
+      "name": "Ceizak_Battlegrounds",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 261
+    },
+    "262": {
+      "enum_name": "FORET_DE_HENNETIEL",
+      "name": "Foret_de_Hennetiel",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 262
+    },
+    "263": {
+      "enum_name": "YORCIA_WEALD",
+      "name": "Yorcia_Weald",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 263
+    },
+    "264": {
+      "enum_name": "YORCIA_WEALD_U",
+      "name": "Yorcia_Weald_U",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 264
+    },
+    "265": {
+      "enum_name": "MORIMAR_BASALT_FIELDS",
+      "name": "Morimar_Basalt_Fields",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 265
+    },
+    "266": {
+      "enum_name": "MARJAMI_RAVINE",
+      "name": "Marjami_Ravine",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 266
+    },
+    "267": {
+      "enum_name": "KAMIHR_DRIFTS",
+      "name": "Kamihr_Drifts",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 267
+    },
+    "268": {
+      "enum_name": "SIH_GATES",
+      "name": "Sih_Gates",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 268
+    },
+    "269": {
+      "enum_name": "MOH_GATES",
+      "name": "Moh_Gates",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 269
+    },
+    "27": {
+      "enum_name": "PHOMIUNA_AQUEDUCTS",
+      "name": "Phomiuna_Aqueducts",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 27
+    },
+    "270": {
+      "enum_name": "CIRDAS_CAVERNS",
+      "name": "Cirdas_Caverns",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 270
+    },
+    "271": {
+      "enum_name": "CIRDAS_CAVERNS_U",
+      "name": "Cirdas_Caverns_U",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 271
+    },
+    "272": {
+      "enum_name": "DHO_GATES",
+      "name": "Dho_Gates",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 272
+    },
+    "273": {
+      "enum_name": "WOH_GATES",
+      "name": "Woh_Gates",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 273
+    },
+    "274": {
+      "enum_name": "OUTER_RAKAZNAR",
+      "name": "Outer_RaKaznar",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 274
+    },
+    "275": {
+      "enum_name": "OUTER_RAKAZNAR_U1",
+      "name": "Outer_RaKaznar_[U1]",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 275
+    },
+    "276": {
+      "enum_name": "RAKAZNAR_INNER_COURT",
+      "name": "RaKaznar_Inner_Court",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 276
+    },
+    "277": {
+      "enum_name": "RAKAZNAR_TURRIS",
+      "name": "RaKaznar_Turris",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 277
+    },
+    "278": {
+      "enum_name": "GWORA_CORRIDOR",
+      "name": "Gwora-Corridor",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 278
+    },
+    "279": {
+      "enum_name": "WALK_OF_ECHOES_P2",
+      "name": "Walk_of_Echoes_[P2]",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 279
+    },
+    "28": {
+      "enum_name": "SACRARIUM",
+      "name": "Sacrarium",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 28
+    },
+    "280": {
+      "enum_name": "MOG_GARDEN",
+      "name": "Mog_Garden",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 280
+    },
+    "281": {
+      "enum_name": "LEAFALLIA",
+      "name": "Leafallia",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 281
+    },
+    "282": {
+      "enum_name": "MOUNT_KAMIHR",
+      "name": "Mount_Kamihr",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 282
+    },
+    "283": {
+      "enum_name": "SILVER_KNIFE",
+      "name": "Silver_Knife",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 283
+    },
+    "284": {
+      "enum_name": "CELENNIA_MEMORIAL_LIBRARY",
+      "name": "Celennia_Memorial_Library",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 284
+    },
+    "285": {
+      "enum_name": "FERETORY",
+      "name": "Feretory",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 285
+    },
+    "286": {
+      "enum_name": null,
+      "name": "286",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 286
+    },
+    "287": {
+      "enum_name": "MAQUETTE_ABDHALJS_LEGION_B",
+      "name": "Maquette_Abdhaljs-Legion_B",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 287
+    },
+    "288": {
+      "enum_name": "ESCHA_ZITAH",
+      "name": "Escha_ZiTah",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 288
+    },
+    "289": {
+      "enum_name": "ESCHA_RUAUN",
+      "name": "Escha_RuAun",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 289
+    },
+    "29": {
+      "enum_name": "RIVERNE_SITE_B01",
+      "name": "Riverne-Site_B01",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 29
+    },
+    "290": {
+      "enum_name": "DESUETIA_EMPYREAL_PARADOX",
+      "name": "Desuetia_Empyreal_Paradox",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 290
+    },
+    "291": {
+      "enum_name": "REISENJIMA",
+      "name": "Reisenjima",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 291
+    },
+    "292": {
+      "enum_name": "REISENJIMA_HENGE",
+      "name": "Reisenjima_Henge",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 292
+    },
+    "293": {
+      "enum_name": "REISENJIMA_SANCTORIUM",
+      "name": "Reisenjima_Sanctorium",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 293
+    },
+    "294": {
+      "enum_name": "DYNAMIS_SAN_DORIA_D",
+      "name": "Dynamis-San_dOria_[D]",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 294
+    },
+    "295": {
+      "enum_name": "DYNAMIS_BASTOK_D",
+      "name": "Dynamis-Bastok_[D]",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 295
+    },
+    "296": {
+      "enum_name": "DYNAMIS_WINDURST_D",
+      "name": "Dynamis-Windurst_[D]",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 296
+    },
+    "297": {
+      "enum_name": "DYNAMIS_JEUNO_D",
+      "name": "Dynamis-Jeuno_[D]",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 297
+    },
+    "298": {
+      "enum_name": "WALK_OF_ECHOES_P1",
+      "name": "Walk_of_Echoes_[P1]",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 298
+    },
+    "299": {
+      "enum_name": "GWORA_THRONE_ROOM",
+      "name": "Gwora-Throne_Room",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 299
+    },
+    "3": {
+      "enum_name": "MANACLIPPER",
+      "name": "Manaclipper",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 3
+    },
+    "30": {
+      "enum_name": "RIVERNE_SITE_A01",
+      "name": "Riverne-Site_A01",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 30
+    },
+    "31": {
+      "enum_name": "MONARCH_LINN",
+      "name": "Monarch_Linn",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 31
+    },
+    "32": {
+      "enum_name": "SEALIONS_DEN",
+      "name": "Sealions_Den",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 32
+    },
+    "33": {
+      "enum_name": "ALTAIEU",
+      "name": "AlTaieu",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 33
+    },
+    "34": {
+      "enum_name": "GRAND_PALACE_OF_HUXZOI",
+      "name": "Grand_Palace_of_HuXzoi",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 34
+    },
+    "35": {
+      "enum_name": "THE_GARDEN_OF_RUHMET",
+      "name": "The_Garden_of_RuHmet",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 35
+    },
+    "36": {
+      "enum_name": "EMPYREAL_PARADOX",
+      "name": "Empyreal_Paradox",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 36
+    },
+    "37": {
+      "enum_name": "TEMENOS",
+      "name": "Temenos",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 37
+    },
+    "38": {
+      "enum_name": "APOLLYON",
+      "name": "Apollyon",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 38
+    },
+    "39": {
+      "enum_name": "DYNAMIS_VALKURM",
+      "name": "Dynamis-Valkurm",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 39
+    },
+    "4": {
+      "enum_name": "BIBIKI_BAY",
+      "name": "Bibiki_Bay",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 4
+    },
+    "40": {
+      "enum_name": "DYNAMIS_BUBURIMU",
+      "name": "Dynamis-Buburimu",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 40
+    },
+    "41": {
+      "enum_name": "DYNAMIS_QUFIM",
+      "name": "Dynamis-Qufim",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 41
+    },
+    "42": {
+      "enum_name": "DYNAMIS_TAVNAZIA",
+      "name": "Dynamis-Tavnazia",
+      "type_id": 128,
+      "type_name": "DYNAMIS",
+      "zone_id": 42
+    },
+    "43": {
+      "enum_name": "DIORAMA_ABDHALJS_GHELSBA",
+      "name": "Diorama_Abdhaljs-Ghelsba",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 43
+    },
+    "44": {
+      "enum_name": "ABDHALJS_ISLE_PURGONORGO",
+      "name": "Abdhaljs_Isle-Purgonorgo",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 44
+    },
+    "45": {
+      "enum_name": "ABYSSEA_TAHRONGI",
+      "name": "Abyssea-Tahrongi",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 45
+    },
+    "46": {
+      "enum_name": "OPEN_SEA_ROUTE_TO_AL_ZAHBI",
+      "name": "Open_sea_route_to_Al_Zahbi",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 46
+    },
+    "47": {
+      "enum_name": "OPEN_SEA_ROUTE_TO_MHAURA",
+      "name": "Open_sea_route_to_Mhaura",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 47
+    },
+    "48": {
+      "enum_name": "AL_ZAHBI",
+      "name": "Al_Zahbi",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 48
+    },
+    "49": {
+      "enum_name": "NONE",
+      "name": "none",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 49
+    },
+    "5": {
+      "enum_name": "ULEGUERAND_RANGE",
+      "name": "Uleguerand_Range",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 5
+    },
+    "50": {
+      "enum_name": "AHT_URHGAN_WHITEGATE",
+      "name": "Aht_Urhgan_Whitegate",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 50
+    },
+    "51": {
+      "enum_name": "WAJAOM_WOODLANDS",
+      "name": "Wajaom_Woodlands",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 51
+    },
+    "52": {
+      "enum_name": "BHAFLAU_THICKETS",
+      "name": "Bhaflau_Thickets",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 52
+    },
+    "53": {
+      "enum_name": "NASHMAU",
+      "name": "Nashmau",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 53
+    },
+    "54": {
+      "enum_name": "ARRAPAGO_REEF",
+      "name": "Arrapago_Reef",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 54
+    },
+    "55": {
+      "enum_name": "ILRUSI_ATOLL",
+      "name": "Ilrusi_Atoll",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 55
+    },
+    "56": {
+      "enum_name": "PERIQIA",
+      "name": "Periqia",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 56
+    },
+    "57": {
+      "enum_name": "TALACCA_COVE",
+      "name": "Talacca_Cove",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 57
+    },
+    "58": {
+      "enum_name": "SILVER_SEA_ROUTE_TO_NASHMAU",
+      "name": "Silver_Sea_route_to_Nashmau",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 58
+    },
+    "59": {
+      "enum_name": "SILVER_SEA_ROUTE_TO_AL_ZAHBI",
+      "name": "Silver_Sea_route_to_Al_Zahbi",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 59
+    },
+    "6": {
+      "enum_name": "BEARCLAW_PINNACLE",
+      "name": "Bearclaw_Pinnacle",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 6
+    },
+    "60": {
+      "enum_name": "THE_ASHU_TALIF",
+      "name": "The_Ashu_Talif",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 60
+    },
+    "61": {
+      "enum_name": "MOUNT_ZHAYOLM",
+      "name": "Mount_Zhayolm",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 61
+    },
+    "62": {
+      "enum_name": "HALVUNG",
+      "name": "Halvung",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 62
+    },
+    "63": {
+      "enum_name": "LEBROS_CAVERN",
+      "name": "Lebros_Cavern",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 63
+    },
+    "64": {
+      "enum_name": "NAVUKGO_EXECUTION_CHAMBER",
+      "name": "Navukgo_Execution_Chamber",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 64
+    },
+    "65": {
+      "enum_name": "MAMOOK",
+      "name": "Mamook",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 65
+    },
+    "66": {
+      "enum_name": "MAMOOL_JA_TRAINING_GROUNDS",
+      "name": "Mamool_Ja_Training_Grounds",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 66
+    },
+    "67": {
+      "enum_name": "JADE_SEPULCHER",
+      "name": "Jade_Sepulcher",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 67
+    },
+    "68": {
+      "enum_name": "AYDEEWA_SUBTERRANE",
+      "name": "Aydeewa_Subterrane",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 68
+    },
+    "69": {
+      "enum_name": "LEUJAOAM_SANCTUM",
+      "name": "Leujaoam_Sanctum",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 69
+    },
+    "7": {
+      "enum_name": "ATTOHWA_CHASM",
+      "name": "Attohwa_Chasm",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 7
+    },
+    "70": {
+      "enum_name": "CHOCOBO_CIRCUIT",
+      "name": "Chocobo_Circuit",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 70
+    },
+    "71": {
+      "enum_name": "THE_COLOSSEUM",
+      "name": "The_Colosseum",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 71
+    },
+    "72": {
+      "enum_name": "ALZADAAL_UNDERSEA_RUINS",
+      "name": "Alzadaal_Undersea_Ruins",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 72
+    },
+    "73": {
+      "enum_name": "ZHAYOLM_REMNANTS",
+      "name": "Zhayolm_Remnants",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 73
+    },
+    "74": {
+      "enum_name": "ARRAPAGO_REMNANTS",
+      "name": "Arrapago_Remnants",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 74
+    },
+    "75": {
+      "enum_name": "BHAFLAU_REMNANTS",
+      "name": "Bhaflau_Remnants",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 75
+    },
+    "76": {
+      "enum_name": "SILVER_SEA_REMNANTS",
+      "name": "Silver_Sea_Remnants",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 76
+    },
+    "77": {
+      "enum_name": "NYZUL_ISLE",
+      "name": "Nyzul_Isle",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 77
+    },
+    "78": {
+      "enum_name": "HAZHALM_TESTING_GROUNDS",
+      "name": "Hazhalm_Testing_Grounds",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 78
+    },
+    "79": {
+      "enum_name": "CAEDARVA_MIRE",
+      "name": "Caedarva_Mire",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 79
+    },
+    "8": {
+      "enum_name": "BONEYARD_GULLY",
+      "name": "Boneyard_Gully",
+      "type_id": 0,
+      "type_name": "UNKNOWN",
+      "zone_id": 8
+    },
+    "80": {
+      "enum_name": "SOUTHERN_SAN_DORIA_S",
+      "name": "Southern_San_dOria_[S]",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 80
+    },
+    "81": {
+      "enum_name": "EAST_RONFAURE_S",
+      "name": "East_Ronfaure_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 81
+    },
+    "82": {
+      "enum_name": "JUGNER_FOREST_S",
+      "name": "Jugner_Forest_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 82
+    },
+    "83": {
+      "enum_name": "VUNKERL_INLET_S",
+      "name": "Vunkerl_Inlet_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 83
+    },
+    "84": {
+      "enum_name": "BATALLIA_DOWNS_S",
+      "name": "Batallia_Downs_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 84
+    },
+    "85": {
+      "enum_name": "LA_VAULE_S",
+      "name": "La_Vaule_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 85
+    },
+    "86": {
+      "enum_name": "EVERBLOOM_HOLLOW",
+      "name": "Everbloom_Hollow",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 86
+    },
+    "87": {
+      "enum_name": "BASTOK_MARKETS_S",
+      "name": "Bastok_Markets_[S]",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 87
+    },
+    "88": {
+      "enum_name": "NORTH_GUSTABERG_S",
+      "name": "North_Gustaberg_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 88
+    },
+    "89": {
+      "enum_name": "GRAUBERG_S",
+      "name": "Grauberg_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 89
+    },
+    "9": {
+      "enum_name": "PSOXJA",
+      "name": "PsoXja",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 9
+    },
+    "90": {
+      "enum_name": "PASHHOW_MARSHLANDS_S",
+      "name": "Pashhow_Marshlands_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 90
+    },
+    "91": {
+      "enum_name": "ROLANBERRY_FIELDS_S",
+      "name": "Rolanberry_Fields_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 91
+    },
+    "92": {
+      "enum_name": "BEADEAUX_S",
+      "name": "Beadeaux_[S]",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 92
+    },
+    "93": {
+      "enum_name": "RUHOTZ_SILVERMINES",
+      "name": "Ruhotz_Silvermines",
+      "type_id": 256,
+      "type_name": "INSTANCED",
+      "zone_id": 93
+    },
+    "94": {
+      "enum_name": "WINDURST_WATERS_S",
+      "name": "Windurst_Waters_[S]",
+      "type_id": 1,
+      "type_name": "CITY",
+      "zone_id": 94
+    },
+    "95": {
+      "enum_name": "WEST_SARUTABARUTA_S",
+      "name": "West_Sarutabaruta_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 95
+    },
+    "96": {
+      "enum_name": "FORT_KARUGO_NARUGO_S",
+      "name": "Fort_Karugo-Narugo_[S]",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 96
+    },
+    "97": {
+      "enum_name": "MERIPHATAUD_MOUNTAINS_S",
+      "name": "Meriphataud_Mountains_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 97
+    },
+    "98": {
+      "enum_name": "SAUROMUGUE_CHAMPAIGN_S",
+      "name": "Sauromugue_Champaign_[S]",
+      "type_id": 2,
+      "type_name": "OUTDOORS",
+      "zone_id": 98
+    },
+    "99": {
+      "enum_name": "CASTLE_OZTROJA_S",
+      "name": "Castle_Oztroja_[S]",
+      "type_id": 4,
+      "type_name": "DUNGEON",
+      "zone_id": 99
+    }
+  }
+}

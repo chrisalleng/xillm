@@ -92,6 +92,13 @@ class Paths:
     obstacle_dir: Path = REPO_ROOT / 'nav' / 'data' / 'obstacles'
     dropoff_dir: Path = REPO_ROOT / 'nav' / 'data' / 'dropoffs'
     transitions_file: Path = REPO_ROOT / 'nav' / 'data' / 'zone_transitions.json'
+    # LSB-extracted catalogs (build-time, see agent_core/lsb_extract.py).
+    # zone_meta.json maps zone_id -> name + type (CITY/OUTDOORS/DUNGEON/...)
+    # which feeds safety-weighted routing. npcs.json lists every NPC the
+    # server knows about with world coords + role tags so the planner can
+    # find_npc(role=) and closest_npc(...) without live exploration.
+    zone_meta_file: Path = REPO_ROOT / 'nav' / 'data' / 'zone_meta.json'
+    npcs_file: Path = REPO_ROOT / 'nav' / 'data' / 'npcs.json'
 
     def state_dir(self, character: str) -> Path:
         return self.ipc_base / 'state' / character

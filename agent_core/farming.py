@@ -40,6 +40,7 @@ from . import echo as _echo
 from . import entities as _entities
 from . import events as _events
 from . import fight_history as _fight_history
+from . import zone_safety as _zone_safety
 
 
 # How long /ta has to bring the requested mob into the combat addon's
@@ -621,6 +622,43 @@ class FarmingDirector:
                     kills_at_death=self.kills,
                     died_to=died_to,
                 )
+                # Zone safety reflex: dying in an OUTDOORS / SIGNET
+                # zone tells the planner to avoid routing through it
+                # next time. zone_safety.auto_mark_on_death checks the
+                # zone type and skips CITY / DUNGEON / instance deaths
+                # (those don't change cross-zone travel weighting -
+                # cities should never be marked dangerous, dungeons are
+                # already 100x cost, instances are unreachable for
+                # transit). Also no-ops when an explicit `safe`
+                # override exists - the planner's deliberate verdict
+                # beats a single-data-point death.
+                try:
+                    from . import nav_router as _nr_for_type
+                    meta = _nr_for_type.Router(
+                        self.cfg.paths.transitions_file,
+                        self.cfg.paths.zone_meta_file,
+                    )._meta
+                    type_name = (meta.get(snap.zone_id) or {}).get('type_name', 'UNKNOWN')
+                    rec = _zone_safety.auto_mark_on_death(
+                        self.cfg.paths.persistent_dir(self.cfg.character),
+                        snap.zone_id,
+                        type_name,
+                        died_to,
+                        snap.self_lvl,
+                    )
+                    if rec:
+                        _events.append(
+                            self.cfg.paths.events_file(),
+                            character=self.cfg.character,
+                            source='zone_safety',
+                            type_='auto_mark',
+                            zone_id=snap.zone_id,
+                            zone_type=type_name,
+                            verdict=rec.get('verdict'),
+                            reason=rec.get('reason'),
+                        )
+                except Exception as e:
+                    print(f'  farming: zone_safety auto-mark failed: {e}')
                 # First-person reflection echo. Templated rather than
                 # LLM-generated because death is a moment for fast
                 # observability, not a 10s deliberative call. Uses the
