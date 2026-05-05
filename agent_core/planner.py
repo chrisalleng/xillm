@@ -256,7 +256,9 @@ Goal types you can emit:
                     npc_zone:   <int>,
                     title:      <str>,
                     completion: { type: "menu_closed" },
-                    hints:      <str>? }
+                    hints:      <str>?,
+                    sell_item:  <str>?,
+                    sell_qty:   <int>? }
                   Open dialog with the named NPC and walk every menu
                   the server presents. The interact director paths to
                   the NPC's coords from the LSB-derived NPC catalog
@@ -271,6 +273,17 @@ Goal types you can emit:
                   validates against what's actually on screen. Use
                   this for: signet, conquest item purchases, home-point
                   registration, vendor buys with simple branching.
+
+                  Vendor SELL: when targeting a standard NPC vendor
+                  to OFFLOAD an item from inventory, set `sell_item`
+                  to the exact display name from the inventory
+                  payload (e.g. "Rabbit Hide", "Bronze Sword") and
+                  optional `sell_qty` (default 1). The director
+                  short-circuits the LLM judge - it looks the item up
+                  in inventory.json by name, finds the slot, and
+                  fires 0x084+0x085 directly. Only works against
+                  NPCs with the `vendor` role; the goal fails fast
+                  if the menu kind isn't vendor.
 
 Auction house (no goal type yet - do NOT emit ah_buy / ah_sell goals;
 they will be silently dropped):

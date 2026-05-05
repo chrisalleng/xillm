@@ -35,6 +35,7 @@ type bridges to FarmingDirector; `interact_npc` to this).
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Callable
 
@@ -248,6 +249,27 @@ class InteractDirector:
         dx = snap.x - x
         dy = snap.y - y
         return (dx * dx + dy * dy) ** 0.5
+
+    def _find_inventory_slot(self, name: str) -> tuple[int | None, int]:
+        """Look up `name` in the player's main inventory and return
+        (slot, item_id). Slot is the server-side inventory slot
+        (1..30); item_id is the FFXI item id needed for the 0x084
+        body. Match is case-insensitive on the inventory addon's
+        name field. Returns (None, 0) if not found."""
+        path = self.cfg.paths.state_dir(self.cfg.character) / 'inventory.json'
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None, 0
+        items = (d.get('containers', {})
+                 .get('inventory', {})
+                 .get('items') or [])
+        target = name.strip().lower()
+        for item in items:
+            if (item.get('name') or '').strip().lower() == target:
+                return int(item.get('slot') or 0), int(item.get('id') or 0)
+        return None, 0
 
     # ---- tick -------------------------------------------------------
 
@@ -502,6 +524,36 @@ class InteractDirector:
         # Menu closed - we're done with the dialog phase.
         if not self.interact.is_menu_open():
             self._complete_or_continue()
+            return
+
+        # Vendor sell short-circuit. When the directive carries a
+        # `sell_item`, we don't need the LLM judge - the planner has
+        # already decided what to sell. Find the inventory slot, fire
+        # the two-step 0x084+0x085 via interact.sell, mark complete.
+        # Gated on kind=='vendor' so a directive that lands at a non-
+        # vendor NPC fails loudly rather than silently sending sell
+        # packets at the wrong server state.
+        directive = self.directive or {}
+        sell_item = directive.get('sell_item')
+        if sell_item:
+            menu = self.interact.current_menu() or {}
+            if menu.get('kind') != 'vendor':
+                self._fail(
+                    f'sell_item directive but menu kind is '
+                    f'{menu.get("kind")!r} (need vendor)')
+                return
+            slot, item_id = self._find_inventory_slot(str(sell_item))
+            if slot is None:
+                self._fail(
+                    f'sell_item "{sell_item}" not found in inventory')
+                return
+            qty = int(directive.get('sell_qty') or 1)
+            self.interact.sell(slot, item_id, qty)
+            _echo.to_chat(
+                self.cfg, 'interact',
+                f'sell {sell_item} (slot={slot}, qty={qty})')
+            self._last_action_at = time.time()
+            self._enter('completed')
             return
 
         # Throttle: don't fire actions faster than ACTION_GAP_S. The
